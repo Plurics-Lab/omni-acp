@@ -1,4 +1,61 @@
-import { OmniError, type Daemon } from "@omni-acp/protocol";
+import {
+  DaemonConfig,
+  HEADER,
+  OmniError,
+  hashSecret,
+  type AgentDescriptor,
+  type AuthContext,
+  type Catalog,
+  type ClientRef,
+  type Daemon,
+  type DaemonInfo,
+  type SpawnSpec,
+  type WhoAmIResponse,
+  type WorkerRegistry,
+} from "@omni-acp/protocol";
+import { fakeSupervisor } from "./fake-supervisor.js";
+import { seqIds } from "./seq-ids.js";
+
+interface Call {
+  method: string;
+  args: unknown[];
+}
+
+/** Everything a route needs and nothing a route decides. */
+function stubAuthContext(tokenId: string, clientId: string | null): AuthContext {
+  return {
+    tokenId,
+    role: "admin",
+    clientId,
+    agents: "*",
+    cwdRoots: [],
+    maxWorkers: 16,
+    assertAgent: () => {},
+    assertCwd: (cwd: string) => Promise.resolve(cwd),
+    canSee: () => true,
+    asClientRef: (): ClientRef => ({ tokenId, clientId }),
+  };
+}
+
+/**
+ * Wraps every own method of `target` so that calling it is recorded. Overrides are applied
+ * BEFORE wrapping, so a caller's own implementation is recorded too — which is what makes
+ * `calls` usable as "did this route call exactly one registry method?" (WP-5 acceptance 2).
+ */
+function recording<T extends object>(target: T, prefix: string, calls: Call[]): T {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(target)) {
+    const value = (target as Record<string, unknown>)[key];
+    out[key] =
+      typeof value === "function"
+        ? (...args: unknown[]) => {
+            calls.push({ method: `${prefix}${key}`, args });
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          }
+        : value;
+  }
+  return out as T;
+}
 
 /**
  * A Daemon whose methods are recorded stubs — for pure HTTP routing tests.
@@ -6,9 +63,113 @@ import { OmniError, type Daemon } from "@omni-acp/protocol";
  * This is why `Daemon` lives in `@omni-acp/protocol/contracts` rather than in
  * `@omni-acp/daemon`: testkit must be able to produce one without importing the package
  * whose tests consume testkit (CONTRACTS.md §4).
+ *
+ * The default is a daemon that knows no workers: every id-addressed registry method throws
+ * `worker_not_found`, which is the honest answer and the one that keeps route tests to their
+ * subject. Override what a test is actually about.
  */
 export function stubDaemon(
   overrides?: Partial<Daemon>,
 ): Daemon & { readonly calls: readonly { method: string; args: unknown[] }[] } {
-  throw new OmniError("internal", "unimplemented: WP-1 (testkit.stubDaemon)");
+  const calls: Call[] = [];
+  const ids = seqIds();
+  const daemonId = ids.daemon();
+  const startedAt = new Date(0).toISOString();
+  const supervisor = fakeSupervisor();
+
+  const notFound = (id: string): never => {
+    throw new OmniError("worker_not_found", `no worker ${id}`);
+  };
+
+  const workers: WorkerRegistry = {
+    size: 0,
+    create: () => {
+      throw new OmniError("internal", "stubDaemon: override `workers.create` to use it");
+    },
+    get: (id) => notFound(id),
+    list: () => [],
+    delete: (id) => Promise.resolve(notFound(id)),
+    closeAll: () => Promise.resolve(),
+    snapshot: (id) => notFound(id),
+    prompt: (id) => Promise.resolve(notFound(id)),
+    cancel: (id) => Promise.resolve(notFound(id)),
+    turn: (id) => notFound(id),
+    logFor: (id) => notFound(id),
+  };
+
+  const catalog: Catalog = {
+    list: () => [],
+    get: (id) => {
+      throw new OmniError("bad_request", `unknown agent "${id}"`);
+    },
+    toSpawnSpec: (d: AgentDescriptor, o: { cwd: string }): SpawnSpec => ({
+      command: d.command,
+      args: d.args,
+      cwd: o.cwd,
+      env: { ...d.env },
+      label: d.id,
+    }),
+  };
+
+  const info: DaemonInfo = {
+    daemonId,
+    version: "0.0.0-stub",
+    platform: process.platform,
+    arch: process.arch,
+    nodeVersion: process.version,
+    protocolVersions: [1],
+    startedAt,
+    ownership: supervisor.platform.ownership,
+  };
+
+  const base: Daemon = {
+    id: daemonId,
+    config: DaemonConfig.parse({
+      tokens: [{ id: "stub", secretSha256: hashSecret("stub-daemon-secret") }],
+    }),
+    info,
+    url: null,
+    workers,
+    catalog,
+    supervisor,
+    authContextFor: (tokenId, clientId) => stubAuthContext(tokenId, clientId ?? null),
+    authenticate: (headers: Headers) => {
+      const header = headers.get(HEADER.auth);
+      const secret = header?.startsWith("Bearer ") === true ? header.slice(7) : "";
+      if (secret === "") throw new OmniError("unauthorized", "missing bearer token");
+      return stubAuthContext("stub", headers.get(HEADER.clientId));
+    },
+    whoami: (auth): WhoAmIResponse => ({
+      tokenId: auth.tokenId,
+      role: auth.role,
+      daemonId,
+      agents: auth.agents,
+      cwdRoots: auth.cwdRoots,
+      maxWorkers: auth.maxWorkers,
+      policyCeiling: null,
+    }),
+    fetch: () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({ code: "internal", message: "stubDaemon: override `fetch` to use it" }),
+          { status: 500, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    on: () => () => {},
+    start: () => Promise.resolve(),
+    stop: () => Promise.resolve(),
+  };
+
+  const merged: Daemon = { ...base, ...overrides };
+  const daemon = recording(
+    {
+      ...merged,
+      workers: recording(merged.workers, "workers.", calls),
+      catalog: recording(merged.catalog, "catalog.", calls),
+    },
+    "",
+    calls,
+  );
+
+  return Object.assign(daemon, { calls }) as Daemon & { readonly calls: readonly Call[] };
 }
