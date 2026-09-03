@@ -4,6 +4,7 @@ import {
   type Clock,
   type Logger,
   type PlatformOps,
+  type RunUtility,
   type SpawnSpec,
 } from "@omni-acp/protocol";
 
@@ -33,3 +34,30 @@ export function spawnAgentProcess(
 ): Promise<AgentProcess> {
   throw new OmniError("internal", "unimplemented: WP-2 (process.spawnAgentProcess)");
 }
+
+/**
+ * The second — and last — spawn site in the repository: a short-lived utility process whose
+ * stdout is read to completion and whose exit code is returned (CONTRACTS.md §6.4, review R8).
+ *
+ * `taskkill /PID <pid> /T /F` and `tasklist /FI "PID eq <pid>" /NH` are the only M0 callers.
+ * They cannot go through `Supervisor.spawn()`, which wires an ACP ndJSON stream, a frame
+ * limiter and a stderr tail around a long-lived agent — the wrong shape entirely.
+ *
+ * `platform-windows.ts` receives this by injection (`createPlatformOps(platform, { runUtility })`)
+ * rather than importing this module, because this module consumes `PlatformOps` and the import
+ * would be a cycle. The `no-direct-spawn` guard's allowlist is this file, and this file only.
+ *
+ * Never throws for a non-zero exit: the code comes back in the result. It rejects only when the
+ * process cannot be started at all, or when `timeoutMs` elapses (the child is then killed).
+ */
+export function runUtility(
+  file: string,
+  args: readonly string[],
+  o: { timeoutMs: number },
+): Promise<{ code: number | null; stdout: string }> {
+  throw new OmniError("internal", "unimplemented: WP-2 (process.runUtility)");
+}
+
+/** The declaration above IS `RunUtility`; this assignment is the compile-time proof. */
+const _runUtilityMatchesContract: RunUtility = runUtility;
+void _runUtilityMatchesContract;

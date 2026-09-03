@@ -47,15 +47,16 @@ jobs:
 
       - run: pnpm -r test
 
+      # Every vitest config writes vitest-report/junit.xml (CONTRACTS.md §10.3), so this glob
+      # actually matches on a red run. `warn` rather than `ignore`: a silently empty artifact is
+      # how a windows-only failure becomes unreproducible.
       - name: Upload test output
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-output-${{ matrix.os }}-node${{ matrix.node }}
-          path: |
-            **/vitest-report/**
-            **/*.log
-          if-no-files-found: ignore
+          path: "**/vitest-report/**"
+          if-no-files-found: warn
           retention-days: 7
 
   static:

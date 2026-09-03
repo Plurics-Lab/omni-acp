@@ -22,6 +22,7 @@ import type {
   CreateWorkerRequest,
   DaemonInfo,
   PromptAccepted,
+  PromptRequestBody,
   WhoAmIResponse,
 } from "./control-plane.js";
 import type { AgentDescriptor, ResolvedDaemonConfig } from "./config.js";
@@ -145,6 +146,23 @@ export interface PlatformOwnership {
   readonly caveat: string | null;
 }
 
+/**
+ * A short-lived utility process whose stdout we read to completion — `taskkill /PID <pid> /T /F`
+ * and `tasklist /FI "PID eq <pid>" /NH` on Windows (CONTRACTS.md §6.4).
+ *
+ * It exists because §6.1 makes `core/src/process/spawn.ts` the ONLY file allowed to call
+ * `node:child_process`, while `platform-windows.ts` needs those two commands, and
+ * `Supervisor.spawn()` is the wrong shape for them (it wires an ACP ndJSON stream, a frame
+ * limiter and a stderr tail). `platform-windows.ts` receives this by INJECTION rather than
+ * importing `spawn.ts`, because `spawn.ts` consumes `PlatformOps` and the import would be a
+ * cycle (review R8). `spawn.ts` exports the real implementation.
+ */
+export type RunUtility = (
+  file: string,
+  args: readonly string[],
+  o: { timeoutMs: number },
+) => Promise<{ code: number | null; stdout: string }>;
+
 /** Platform-specific operations. Chosen ONCE, at Supervisor construction — never at kill time. */
 export interface PlatformOps {
   readonly ownership: PlatformOwnership;
@@ -209,7 +227,11 @@ export interface EventLog {
   ): Subscription;
   /** Closes every subscription. Idempotent. */
   close(): void;
-  /** Called once, right after session/new, so replayed envelopes carry the sessionId. */
+  /**
+   * Called once, right after `session/new`; envelopes appended FROM THIS POINT carry the
+   * sessionId. Earlier envelopes stay frozen with `sessionId: null` — they precede the session's
+   * existence, and back-filling them would contradict CONTRACTS.md §8.2 rule 3 (review R16).
+   */
   setSessionId(id: SessionId): void;
 }
 
@@ -324,6 +346,24 @@ export interface WorkerRegistry {
   list(auth: AuthContext): readonly WorkerSnapshot[];
   delete(id: WorkerId, auth: AuthContext): Promise<CloseResult>;
   closeAll(reason: WorkerCloseReason, opts?: { timeoutMs?: number }): Promise<void>;
+
+  // ── result-returning façade (review R11) ──────────────────────────────────
+  //
+  // Each of these is `get(id, auth)` followed by one call on the handle. They exist so that an
+  // HTTP route really is "parse -> call ONE daemon method -> serialize" (D15 constraint 1)
+  // instead of a get-then-act orchestration in the adapter, which is the one place that
+  // constraint genuinely leaked. In-process callers may still use `get()` and hold the handle.
+
+  /** H7: `200 WorkerSnapshot`. Throws worker_not_found when absent or invisible. */
+  snapshot(id: WorkerId, auth: AuthContext): WorkerSnapshot;
+  /** H8: `202 PromptAccepted`. */
+  prompt(id: WorkerId, auth: AuthContext, body: PromptRequestBody): Promise<PromptAccepted>;
+  /** H9: `202 {}`. Idempotent; a no-op when the worker is not running. */
+  cancel(id: WorkerId, auth: AuthContext): Promise<void>;
+  /** H11: `200 TurnStatus`. An unknown turn is `state:"unknown"`, never a 404 (D29). */
+  turn(id: WorkerId, auth: AuthContext, turnId: TurnId): TurnStatus;
+  /** H10: the log the SSE writer subscribes to. Visibility is checked here, not in `http/`. */
+  logFor(id: WorkerId, auth: AuthContext): EventLog;
 }
 
 export interface Catalog {
@@ -351,6 +391,14 @@ export interface Daemon {
   readonly workers: WorkerRegistry;
   readonly catalog: Catalog;
   readonly supervisor: Supervisor;
+
+  /**
+   * The in-process entry to everything `AuthContext` gates (D15's library-first path).
+   * Throws `unauthorized` for an unknown token id. `authenticate(headers)` is the HTTP
+   * adapter's thin wrapper over this — an embedder running with `listen: null` must not have to
+   * forge a `Bearer` header to reach `workers.create()` (review R10).
+   */
+  authContextFor(tokenId: TokenId, clientId?: ClientId | null): AuthContext;
 
   /** Throws unauthorized. Re-evaluated every call; no decision cache (DESIGN §8). */
   authenticate(headers: Headers): AuthContext;

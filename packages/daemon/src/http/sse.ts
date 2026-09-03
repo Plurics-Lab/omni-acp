@@ -18,6 +18,13 @@ export interface SseOptions {
  *
  * The request's AbortSignal must close the `Subscription`; a leaked subscription per reconnect
  * is the classic SSE memory leak, and a test asserts `log.subscriberCount` returns to 0.
+ *
+ * This file is the ONE file under `src/http/**` that the `http-has-no-logic` guard exempts, and
+ * for exactly two things (CONTRACTS.md §10.2, review R7): the `heartbeatMs` interval, and the
+ * stream-terminal predicate — recognising `kind === "omni.worker_state"` with a closed state in
+ * order to write `omni.stream_end`. Both are transport concerns that D15 constraint 1 was never
+ * about. Everything else the guard forbids still applies here: no `@omni-acp/core` import, no
+ * `node:child_process`, and no decision about what a worker may do.
  */
 export function sseResponse(log: EventLog, o: SseOptions): Response {
   throw new OmniError("internal", "unimplemented: WP-5 (http.sseResponse)");

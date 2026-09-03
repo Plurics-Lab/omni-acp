@@ -3,6 +3,7 @@ dist/
 *.tsbuildinfo
 .pnpm-store/
 coverage/
+vitest-report/
 *.log
 .DS_Store
 .omni-acp/

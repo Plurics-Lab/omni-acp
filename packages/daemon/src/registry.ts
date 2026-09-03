@@ -29,6 +29,11 @@ export interface WorkerRegistryOptions {
  *
  * `get()` throws `worker_not_found` both when the worker is absent and when it is invisible to
  * this token (D13) — a `403` would leak that the id exists.
+ *
+ * `snapshot` / `prompt` / `cancel` / `turn` / `logFor` are the result-returning façade (review
+ * R11): each is `get(id, auth)` plus one call on the handle, and they exist so that an HTTP
+ * route is one daemon call rather than a get-then-act orchestration in the adapter — the one
+ * place D15 constraint 1 otherwise leaks. In-process callers keep using `get()`.
  */
 export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
   throw new OmniError("internal", "unimplemented: WP-5 (daemon.createWorkerRegistry)");

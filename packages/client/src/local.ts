@@ -2,7 +2,13 @@ import { OmniError, type DaemonConfig } from "@omni-acp/protocol";
 import type { Server } from "./server.js";
 
 export interface LocalOptions {
-  /** M0 implements "never". "prefer" | "require" throw until M3. */
+  /**
+   * M0 default: `"never"` — a bare `OmniACP.local()` always starts a fresh embedded daemon.
+   *
+   * DESIGN D14's canonical example writes `adopt: "prefer"`; discovery and reuse of a running
+   * daemon through `~/.omni-acp/daemon.json` arrives with the other adopt modes in M3, and until
+   * then `"prefer"` and `"require"` throw `bad_request` naming M3 (review R13, CONTRACTS.md L11).
+   */
   readonly adopt?: "prefer" | "never" | "require";
   /** M0: true throws until M3. */
   readonly detach?: boolean;

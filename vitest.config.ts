@@ -12,5 +12,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     projects: ["packages/*", "tests/*"],
+    /**
+     * Root-only options: in `projects` mode vitest takes `reporters`/`outputFile` from here and
+     * ignores the per-project ones, so the root run writes its own junit file for CI's
+     * failure-artifact step (review R2).
+     */
+    reporters: ["default", ["junit", { outputFile: "vitest-report/junit.xml" }]],
   },
 });

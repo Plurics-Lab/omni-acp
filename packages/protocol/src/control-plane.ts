@@ -23,8 +23,26 @@ export const CreateWorkerRequest = z.strictObject({
 });
 export type CreateWorkerRequest = z.infer<typeof CreateWorkerRequest>;
 
+/**
+ * M0 accepts ONLY `type: "text"` blocks (CONTRACTS.md §2.3, review R12).
+ *
+ * DESIGN §5.1 requires that `resource_link` and embedded-resource paths be absolute and
+ * realpath into the token's `cwdRoots`; that containment check is M2. Under D3 the agent reads
+ * and writes the disk itself, so forwarding an unvalidated absolute path is exactly the
+ * cwd-containment escape D18 calls arbitrary code execution. M0 therefore closes the hole with a
+ * whitelist rather than shipping an unchecked path surface — and text is all the M0 fixture
+ * needs. The zod failure is what produces H8's `400 bad_request`.
+ *
+ * The blocks themselves are still NOT re-modelled: only `type` is inspected, and the array is
+ * forwarded verbatim, so M1 relaxing this to the full `ContentBlock` union is additive.
+ */
 export const PromptRequestBody = z.strictObject({
-  content: z.array(ContentBlockLoose).min(1),
+  content: z
+    .array(ContentBlockLoose)
+    .min(1)
+    .refine((blocks) => blocks.every((b) => b.type === "text"), {
+      message: 'M0 accepts only content blocks with type "text" (resource paths are M2)',
+    }),
 });
 export type PromptRequestBody = z.infer<typeof PromptRequestBody>;
 

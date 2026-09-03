@@ -23,6 +23,7 @@ tsconfig.base.json  tsconfig.json  vitest.config.ts
 .github/workflows/ci.yml
 packages/*/package.json      packages/*/tsconfig.json      packages/*/vitest.config.ts
 packages/*/src/index.ts                     ← re-export barrels, re-export-only
+packages/core/test/*.ts                     ← the one cross-WP scaffold test; shape assertions only
 packages/protocol/src/contracts.ts          ← the cross-package seam (types only)
 packages/protocol/src/acp.ts                ← the single ACP-SDK re-export point (types only)
 packages/protocol/schema/{v1.schema.json, v2.schema.unstable.json, PROVENANCE.md}
@@ -54,7 +55,9 @@ packages ever touch the same file.**
 4. `ERROR_STATUS` is total over `OmniErrorCode` at **compile** time (a `Record`, not a `Partial`).
 5. The dependency DAG of `CONTRACTS.md` §3.1 holds.
 6. The CI workflow has been shown red once on a deliberately failing branch, so the failure path
-   (artifact upload) is known to work.
+   (artifact upload) is known to work — and the uploaded artifact is **non-empty**. Every
+   `vitest.config.ts` writes `vitest-report/junit.xml`, which is the file the workflow's glob
+   names; before that the step collected nothing on every failure (review R2).
 
 ---
 
@@ -87,12 +90,10 @@ suites need the graph resolved.
 ```
 packages/protocol/src/{ids,errors,events,worker,turn,control-plane,config}.ts
 packages/protocol/test/**
-packages/testkit/src/**
-packages/testkit/fixtures/**
-packages/testkit/test/**
+packages/testkit/{src,fixtures,test}/**        ← minus src/index.ts, which is frozen
 ```
 
-(`protocol/src/{contracts,acp}.ts` and every `index.ts` remain frozen.)
+(`protocol/src/{contracts,acp}.ts` and every `index.ts` — `testkit`'s included — remain frozen.)
 
 **Depends on** nothing but the scaffold.
 
@@ -122,7 +123,9 @@ per-OS `isAlive`/`waitGone`, `sdkExampleAgentPath()`, the six `.mjs` fixture age
 5. **`reduceTurn` golden tests, ≥8 recorded transcripts**: text concatenation in seq order; tool-call upsert
    by `toolCallId` keeping the last status; `changes` extracted from `ToolCallContent{type:"diff"}` with
    `oldText ?? null` (F5); `usage` sourced from the **last `usage_update`**, never from `idle.usage` (F4);
-   `interactions` collected from `omni.policy_decision`; `patch === null`; a turn terminated by
+   `interactions` collected from `omni.policy_decision` alone — `title` rides on that payload
+   (review R9), `at` is the envelope's `ts` — so the fold reads one envelope kind;
+   `patch === null`; a turn terminated by
    `worker_state{closed}` yields `stopReason: null` and a non-null `error`; a turn id never seen yields
    `turnStatus.state === "unknown"` with `result: null`.
 6. `reduceTurn` is pure: the same envelopes twice produce deep-equal results, and it **never reads
@@ -132,8 +135,9 @@ per-OS `isAlive`/`waitGone`, `sdkExampleAgentPath()`, the six `.mjs` fixture age
 8. `sdkExampleAgentPath()` resolves and `stat`s successfully on all three OSes, derived from the SDK's main
    entry — **not** from an unexported subpath (F8) and not via `URL.pathname`.
 9. `fakeClock().advance()` fires timers deterministically; `seqIds()` produces `d_…001`, `w_…001`, `t_…001`.
-10. Architecture guards land and pass: `sdk-version-pinned`, `dependency-direction`, `exports-are-stable`,
-    `no-message-id`.
+10. Architecture guards land and pass: `sdk-version-pinned`, `dependency-direction`,
+    `no-message-id`. (`exports-are-stable` is WP‑6's: it must import all six barrels, which
+    `protocol`/`testkit` may not do — review R15.)
 
 ---
 
@@ -149,8 +153,10 @@ packages/core/test/process/**
 
 **Depends on** WP‑1 (`@omni-acp/protocol` types + testkit fixture agents). Nothing from WP‑3/4/5/6.
 
-**Description.** The OS layer of `CONTRACTS.md` §6: `createPlatformOps()` chosen once at construction,
-`createSupervisor()` as the single `node:child_process` entry point, `resolveLaunch` with PATH/PATHEXT and
+**Description.** The OS layer of `CONTRACTS.md` §6: `createPlatformOps(platform?, deps?)` chosen once
+at construction, `createSupervisor()` as the single `node:child_process` entry point plus
+`runUtility()` in the same file for the one-shot `taskkill` / `tasklist` commands
+`platform-windows.ts` needs — injected into it, never imported by it (review R8), `resolveLaunch` with PATH/PATHEXT and
 the `.cmd`/`.bat` refusal, the escalation ladder with tree-gone confirmation, the frame-limiting
 `TransformStream`, and the UTF‑8-safe stderr tail ring.
 
@@ -297,7 +303,8 @@ packages/daemon/test/**
 
 **Description.** `createDaemon()`: config resolution, persistent `daemonId` in `dataDir`, `TokenStore` with
 per-request SHA‑256 verification, `AuthContext` with the D13 visibility rule and the `realpath`+containment
-`cwdRoots` check, `Catalog` as the only producer of `SpawnSpec`, `WorkerRegistry` with per-token and global
+`cwdRoots` check — reachable in-process as `daemon.authContextFor(tokenId)`, with
+`authenticate(headers)` as the HTTP adapter's thin wrapper over it (review R10) — `Catalog` as the only producer of `SpawnSpec`, `WorkerRegistry` with per-token and global
 `maxWorkers`, `stop()` teardown ordering, and the `on("worker.state"|"worker.event")` emitter.
 
 Then the HTTP adapter: **every route is parse (zod) → call one `daemon` method → serialize**, with a single
@@ -307,10 +314,18 @@ primary entry; binding a socket is what `listen != null` adds.
 **Acceptance**
 
 1. **`createDaemon({ listen: null })`** runs the entire worker lifecycle — create, prompt, events, turn,
-   delete — with `daemon.url === null` and **no socket bound** (D15 constraint 1, proven at runtime).
-2. **`http-has-no-logic` guard passes**: nothing under `src/http/**` imports `@omni-acp/core`, spawns, sets a
-   timer, or mentions a `WorkerState` literal. A companion test with a recording `stubDaemon()` asserts each
-   route calls **exactly one** daemon method.
+   delete — with `daemon.url === null` and **no socket bound** (D15 constraint 1, proven at runtime),
+   taking its `AuthContext` from `daemon.authContextFor("local")` and forging no `Bearer` header
+   (review R10).
+2. **`http-has-no-logic` guard passes**: nothing under `src/http/**` **imports** `@omni-acp/core` or
+   `node:child_process`, and nothing there branches on domain state (no `WorkerState` literal, no
+   status decision of its own). `sse.ts` is exempt for exactly two things — the heartbeat interval
+   and the closed-worker predicate that triggers `omni.stream_end` — both mandated by
+   `CONTRACTS.md` §8.4 (review R7). A companion test with a recording `stubDaemon()` asserts each
+   route calls **exactly one** `WorkerRegistry` method and makes no decision of its own; that is
+   literally satisfiable because of the façade (`snapshot` / `prompt` / `cancel` / `turn` /
+   `logFor`, review R11), with `POST /v1/workers` the single exception — it serializes `snapshot()`
+   on the handle `create()` just returned, a pure accessor.
 3. Every route H1–H15 of `CONTRACTS.md` §2.1 exists with the stated status codes, and **every route test
    drives `daemon.fetch(new Request(...))` — zero `listen`, zero ports**.
 4. Auth: missing / malformed / unknown / right-prefix-wrong-secret all → `401 {code:"unauthorized"}`;
@@ -382,9 +397,15 @@ Then the integration suite of §4.
 5. `409` surfaces as a thrown `OmniError("worker_busy")` when `{queue:false}`; with the default
    `{queue:true}`, two back-to-back `prompt()` calls both succeed in order.
 6. `stream()` yields `text` deltas in seq order and a terminal `done` whose result deep-equals `prompt()`'s.
-7. **`client-has-no-daemon-import` guard passes**; importing the built `@omni-acp/client` with
-   `@omni-acp/daemon` absent from `node_modules` works, and `local()` then throws an error whose message
-   contains `npm i @omni-acp/daemon` — not a module-not-found stack (D14).
+7. **`client-has-no-daemon-import` guard passes** (an import scan, not a substring scan — the name
+   appears legally in doc comments); importing the built `@omni-acp/client` with `@omni-acp/daemon`
+   absent from `node_modules` works, and `local()` then throws an error whose message contains
+   `npm i @omni-acp/daemon` — not a module-not-found stack (D14). **The absence is synthesized, not
+   arranged in the tree**: `packages/client` keeps `@omni-acp/daemon` as a devDependency (the
+   dependency freeze, §1.2), so pnpm always links it there. `mkdtemp` a directory, copy
+   `packages/client/dist` plus a minimal `package.json` into it, and `import()` from there with no
+   `@omni-acp/daemon` present, asserting the message matches `/npm i @omni-acp\/daemon/`
+   (review R3).
 8. `local({adopt:"never"})` starts an embedded daemon on `127.0.0.1:0`, `server.url` matches
    `http://127.0.0.1:\d+`, a raw `fetch` with a bad token gets `401` (proving it is real loopback HTTP, not
    an in-memory shortcut), and `server.close()` stops the daemon and reclaims the trees.
@@ -393,7 +414,10 @@ Then the integration suite of §4.
 10. `omni-acp start --port 0` as a **real child process** on all three OSes: `/v1/health` returns 200; SIGINT
     (POSIX) / SIGINT + SIGBREAK (Windows) calls `daemon.stop({graceful:true})` exactly once, exits 0, and
     leaves no orphan processes.
-11. The integration suite of §4 is green on all three OSes.
+11. **`exports-are-stable` guard lands in `tests/integration/src/`**: every name in each frozen
+    `index.ts` resolves and is typed. It lives here because only `tests/integration` may import all
+    six barrels (review R15).
+12. The integration suite of §4 is green on all three OSes.
 
 ---
 
@@ -402,7 +426,8 @@ Then the integration suite of §4.
 | Path                                                                                                                                                               | Owner                 |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
 | root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `protocol/src/{contracts,acp}.ts`, `protocol/schema/**` | **scaffold (frozen)** |
-| `packages/protocol/src/{ids,errors,events,worker,turn,control-plane,config}.ts`, `packages/protocol/test/**`, `packages/testkit/**`                                | WP‑1                  |
+| `packages/protocol/src/{ids,errors,events,worker,turn,control-plane,config}.ts`, `packages/protocol/test/**`, `packages/testkit/{src,fixtures,test}/**` (minus `src/index.ts`)                    | WP‑1                  |
+| `packages/core/test/*.ts` (the cross-WP scaffold test: export-shape assertions only, never `throws unimplemented`, so the first work package to land a body cannot redden a file it may not edit — review R1) | **scaffold (frozen)** |
 | `packages/core/src/process/**`, `packages/core/test/process/**`                                                                                                    | WP‑2                  |
 | `packages/core/src/{event-log,normalizer}/**`, `packages/core/test/{event-log,normalizer}/**`                                                                      | WP‑3                  |
 | `packages/core/src/{acp,worker,lease}/**`, `packages/core/test/{acp,worker,lease}/**`                                                                              | WP‑4                  |
@@ -410,8 +435,9 @@ Then the integration suite of §4.
 | `packages/client/src/**` (minus `index.ts`), `packages/client/test/**`, `packages/cli/src/**`, `packages/cli/test/**`, `tests/integration/src/**`                  | WP‑6                  |
 
 Guard tests live with their owner: `no-direct-spawn` → WP‑2, `seq-single-writer` → WP‑3,
-`http-has-no-logic` → WP‑5, `client-has-no-daemon-import` → WP‑6, and
-`sdk-version-pinned` / `dependency-direction` / `exports-are-stable` / `no-message-id` → WP‑1.
+`http-has-no-logic` → WP‑5, `client-has-no-daemon-import` **and `exports-are-stable`** → WP‑6
+(the latter in `tests/integration/src/`, the only place that may import all six barrels), and
+`sdk-version-pinned` / `dependency-direction` / `no-message-id` → WP‑1.
 
 ---
 
@@ -426,14 +452,18 @@ Tier‑3 fixture: the SDK's own unmodified `dist/examples/agent.js`, launched as
 `OmniACP.connect({ url: daemon.url, token })`.
 
 **Act.** Create both workers concurrently (`Promise.all`), then prompt both concurrently:
-`Promise.all([w1.prompt("who are you?"), w2.prompt("who are you?")])`.
+`Promise.all([w1.prompt("who are you?"), w2.prompt("who are you?")])` — a bare string becomes a
+single `type:"text"` block, which is all M0 accepts (`CONTRACTS.md` §2.3, review R12).
 
 **Assert — identity and isolation**
 
 - `w1.id !== w2.id`, `w1.sessionId !== w2.sessionId`, `w1.snapshot.process.pid !== w2.snapshot.process.pid`.
 - `r1.turnId !== r2.turnId`.
-- Each worker's full event log contains **only** its own `workerId` and `sessionId`, and its `seq` sequence
-  is exactly `1..n` with no gaps — the non-interference claim proven on the logs, not on vibes.
+- Every envelope in each worker's log carries that worker's `workerId`, and every envelope with a
+  **non-null** `sessionId` carries that worker's `sessionId` — the pre-handshake prefix (seq 1's
+  `omni.worker_state{starting}` and the handshake envelopes) is frozen with `sessionId: null` and is
+  never back-filled (`CONTRACTS.md` §8.2 rule 3, review R16). The `seq` sequence is exactly `1..n`
+  with no gaps — the non-interference claim proven on the logs, not on vibes.
 
 **Assert — the turn actually ran to completion**
 
@@ -441,7 +471,11 @@ Tier‑3 fixture: the SDK's own unmodified `dist/examples/agent.js`, launched as
 - `text` contains _"I'll help you with that"_ **and** _"I'll skip the configuration update"_ — the second
   string is only produced by the agent's `reject` branch, so it proves the permission request was genuinely
   answered (F1). This is a stronger assertion than the allow branch.
-- `toolCalls.map(t => t.toolCallId)` is `["call_1", "call_2"]`, both terminal.
+- `toolCalls.map(t => t.toolCallId)` is `["call_1", "call_2"]`, with `call_1.status === "completed"`
+  and `call_2.status === "pending"`. `call_2` is **never terminalised**: the fixture only sends its
+  `tool_call_update{status:"completed"}` on the `allow` branch, and CONTRACTS §7.4's fixed auto-DENY
+  responder always takes `reject`. The pending status is therefore itself proof that the reject
+  branch ran (review R6, verified against `dist/examples/agent.js` L118‑197).
 - `interactions` contains exactly one record with `{decision:"deny", rule:"m0:auto-deny", optionId:"reject"}`.
 - `changes` and `patch` are `[]` and `null` (M0, D8).
 - Each log contains exactly one `state_update{running}` and one `state_update{idle}` for that turn, with
@@ -460,14 +494,14 @@ Tier‑3 fixture: the SDK's own unmodified `dist/examples/agent.js`, launched as
 | File                          | Proves                                                                                                                                                      |
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `curl-shapes.itest.ts`        | M0's own milestone wording — raw `fetch` against every route, asserting the literal JSON shapes of §2.1 with no SDK in the loop                             |
-| `library-only.itest.ts`       | `createDaemon({listen:null})` runs the full lifecycle with `url === null` (D15 constraint 1, at runtime)                                                    |
+| `library-only.itest.ts`       | `createDaemon({listen:null})` runs the full lifecycle with `url === null`, authorising through `daemon.authContextFor("local")` rather than a forged `Bearer` header (D15 constraint 1, at runtime; review R10) |
 | `sse-resume.itest.ts`         | drop the stream mid-turn, reconnect with `?since=`, union is gap-free and equals a full-replay reference                                                    |
 | `crash.itest.ts`              | `crash.mjs`: `prompt()` settles rather than hangs; `worker_state{closed, agent_crashed}`; **no `state_update{idle}`**; tree reclaimed                       |
 | `cancel.itest.ts`             | `session/cancel` → `stopReason:"cancelled"`, process still alive, a second prompt succeeds; `slow.mjs` drives the `cancelGraceMs` escalation to a tree kill |
 | `tree-kill.itest.ts`          | `orphan.mjs` marker-file oracle — the grandchild stops writing within 2 s of `DELETE`, on all three OSes                                                    |
 | `handshake-failures.itest.ts` | `502` and `504` paths, with no orphan process in either case                                                                                                |
 | `local-mode.itest.ts`         | `OmniACP.local({adopt:"never"})` end-to-end against the SDK example agent, plus the bad-token `401` proving real loopback HTTP                              |
-| `cli-start.itest.ts`          | `omni-acp start --port 0` as a real child; health 200; clean signal shutdown; no orphans                                                                    |
+| `cli-start.itest.ts`          | `omni-acp start --port 0` as a real child — launched as `process.execPath <packages/cli/dist/bin.js>`, never through `node_modules/.bin` (the bin symlink does not exist until the first build, and the direct-module form is what `CONTRACTS.md` §6.3 wants anyway); health 200; clean signal shutdown; no orphans |
 
 **Budget.** The SDK example agent costs ~5 s per turn (5 × 1 000 ms of simulated latency); two in parallel
 ≈ 6 s. Integration `testTimeout: 60_000`, `retry: 1`, whole suite comfortably under 3 minutes per OS.

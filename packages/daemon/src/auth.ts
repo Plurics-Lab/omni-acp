@@ -9,6 +9,12 @@ export interface TokenStore {
    * and dropped.
    */
   verify(headers: Headers): AuthContext;
+  /**
+   * The in-process half: an `AuthContext` for a token id with no header in sight, which is what
+   * `Daemon.authContextFor()` returns and what `verify()` produces once it has matched a secret
+   * (review R10, D15). Throws `unauthorized` for an unknown token id.
+   */
+  contextFor(tokenId: TokenId, clientId?: string | null): AuthContext;
   has(tokenId: TokenId): boolean;
 }
 

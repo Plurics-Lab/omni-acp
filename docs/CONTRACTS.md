@@ -41,7 +41,7 @@ These are the load-bearing observations. Each one changes a contract below.
 | Node                         | `>=22` (`engines`), CI pins `22.x` on all three OSes                                                                                                          |
 | Package manager              | pnpm 11.25 workspaces, `workspace:*` for internal deps                                                                                                        |
 | Build                        | `tsc -b` project references. No bundler. `rootDir: src`, `outDir: dist`, `composite`, `declaration`, `declarationMap`, `sourceMap`                            |
-| Test                         | vitest. **Tests run against built `dist`, after `pnpm -r build`** (see §11 D25)                                                                               |
+| Test                         | vitest. **Tests run against built `dist`, after `pnpm -r build`** (see §11 D25). Root `test` script is `tsc -b && vitest run` so a fresh clone cannot answer with a module-resolution error instead of a test result (review R5)                                                                               |
 | Validation                   | zod v4 for anything crossing a wire or a config file                                                                                                          |
 | ACP SDK                      | `@agentclientprotocol/sdk` pinned to exactly `1.4.0` (no caret) in every package that uses it, asserted by a test                                             |
 | ids                          | ULID, Crockford base32, 26 chars, prefixed: `d_` daemon, `w_` worker, `t_` turn. `sessionId` is agent-assigned and **opaque — never parsed**                  |
@@ -67,7 +67,7 @@ for audit and future lease attribution; it is **not** a visibility boundary (D13
 | H5  | `POST /v1/workers`                         | **Synchronously ready**: spawn → `initialize` → `session/new` → `201 WorkerSnapshot{state:"ready"}` with the real handshake `capabilities`. Handshake JSON‑RPC error → `502 agent_error`; budget exceeded → `504 agent_timeout`. **Both reclaim the process tree before responding.** |
 | H6  | `GET /v1/workers`                          | `200 { workers: WorkerSnapshot[] }`, filtered by D13 visibility.                                                                                                                                                                                                                      |
 | H7  | `GET /v1/workers/{wid}`                    | `200 WorkerSnapshot`, or `404 worker_not_found` (also when invisible — never leak existence).                                                                                                                                                                                         |
-| H8  | `POST /v1/workers/{wid}/prompt`            | `202 PromptAccepted { turnId, seq }`. `409 worker_busy` unless state is `ready`; `410 worker_closed`; content pre-checked against the handshake `promptCapabilities` → `400 bad_request`.                                                                                             |
+| H8  | `POST /v1/workers/{wid}/prompt`            | `202 PromptAccepted { turnId, seq }`. `409 worker_busy` unless state is `ready`; `410 worker_closed`; content pre-checked against the handshake `promptCapabilities` → `400 bad_request`. **M0 accepts only blocks whose `type` is `"text"`**; any other block is `400 bad_request` (§2.3, review R12).                                                                                             |
 | H9  | `POST /v1/workers/{wid}/cancel`            | `202 {}`. ACP `session/cancel` notification, then bounded escalation (§6.5). Idempotent; a no-op when not `running`.                                                                                                                                                                  |
 | H10 | `GET /v1/workers/{wid}/events?since=<seq>` | SSE. Synchronous backlog replay then live tail (§8).                                                                                                                                                                                                                                  |
 | H11 | `GET /v1/workers/{wid}/turns/{turnId}`     | `200 TurnStatus`. Unknown turn → `state:"unknown", result:null` (**not** a 404 — §11 D29).                                                                                                                                                                                            |
@@ -80,7 +80,7 @@ for audit and future lease attribution; it is **not** a visibility boundary (D13
 
 | #   | Item                                                                                                                                                                                                                                                                                                                                  |
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| L1  | `createDaemon(config, deps?)` — every capability reachable **in-process**; `listen: null` ⇒ no socket, `daemon.url === null`, full worker lifecycle still works (D15 constraint 1, proven at runtime).                                                                                                                                |
+| L1  | `createDaemon(config, deps?)` — every capability reachable **in-process**; `listen: null` ⇒ no socket, `daemon.url === null`, full worker lifecycle still works (D15 constraint 1, proven at runtime). An in-process caller takes its `AuthContext` from `daemon.authContextFor(tokenId)` — never by forging a `Bearer` header (review R10).                                                                                                                                |
 | L2  | `daemon.fetch(Request): Promise<Response>` — the HTTP adapter as a web-standard handler, usable with **no port bound**. Every route test uses it.                                                                                                                                                                                     |
 | L3  | **Supervisor**: one `spawn()` entry point (test-enforced, F10), platform ops chosen at construction, escalation ladder, tree-gone confirmation, stderr tail ring, crash detection.                                                                                                                                                    |
 | L4  | **Worker Registry**: create/get/list/delete, D13 visibility, id allocation, teardown on `daemon.stop()`.                                                                                                                                                                                                                              |
@@ -90,7 +90,7 @@ for audit and future lease attribution; it is **not** a visibility boundary (D13
 | L8  | **Lease**: interface present, `alwaysGrantedLease` implementation. D5 enforcement is M1.                                                                                                                                                                                                                                              |
 | L9  | **`reduceTurn`** — one pure aggregator in `@omni-acp/protocol`, used by the daemon for H11 **and** by the client SDK for `prompt()`. DESIGN §5.5 by construction, not by convention.                                                                                                                                                  |
 | L10 | **`@omni-acp/client`**: `OmniACP.connect()`, `Server.createAgent/attach/workers/agents/close`, `Worker.prompt/stream/events/cancel/close/on`.                                                                                                                                                                                         |
-| L11 | **`OmniACP.local({adopt:"never", detach:false})` implemented** — dynamic `import("@omni-acp/daemon")` → `createDaemon` → `start` on `127.0.0.1:0` → generated admin token → ordinary `connect()` over loopback. Other `adopt` modes and `detach:true` throw. This is the M0 e2e harness, so D14+D15 share one code path from day one. |
+| L11 | **`OmniACP.local({adopt:"never", detach:false})` implemented**, and `adopt` **defaults to `"never"` in M0** — dynamic `import("@omni-acp/daemon")` → `createDaemon` → `start` on `127.0.0.1:0` → generated admin token → ordinary `connect()` over loopback. Other `adopt` modes and `detach:true` throw. This is the M0 e2e harness, so D14+D15 share one code path from day one. |
 | L12 | **`@omni-acp/cli`**: `omni-acp start [--config f.yaml] [--host] [--port] [--data-dir]`, `--version`, `--help`; SIGINT/SIGTERM/SIGBREAK → `daemon.stop({graceful:true})` once.                                                                                                                                                         |
 | L13 | Three-OS CI matrix, green, from the first commit.                                                                                                                                                                                                                                                                                     |
 
@@ -105,6 +105,8 @@ for audit and future lease attribution; it is **not** a visibility boundary (D13
 | Turn close-out beyond the quiet window (close stdin → drain with grace → cancel)                                                                                                                                                    | M1 (DESIGN §6.2)        |
 | Vendor extension registry (`session/set_model`, `session/notification` alias), Runtime descriptors, quirk table                                                                                                                     | M1/M2 (DESIGN §6.2, L1) |
 | Policy rule engine, `onUnresolved: park\|fail`, `policyCeiling` enforcement, `POST …/interactions/{reqId}`, `requires_action`                                                                                                       | M2 (D4/D10)             |
+| `resource_link` / embedded-resource path containment inside prompt content (DESIGN §5.1) — M0 accepts only `type:"text"` blocks, so there is no unchecked path surface to contain (review R12) | M2 (DESIGN §5.1) |
+| `adopt: "prefer" \| "require"` — `daemon.json` discovery/reuse. M0's default is `adopt: "never"`; the other modes throw `bad_request` naming M3 (review R13) | M3 (D14) |
 | `mcpServers` presets + `mcpCapabilities` filtering — M0 **always sends `mcpServers: []`**                                                                                                                                           | M2 (DESIGN §8)          |
 | Per-request `CreateWorkerRequest.env` + blacklist, credential store                                                                                                                                                                 | M2                      |
 | Webhooks, `POST /v1/runs`, Run API, idle watchdog dual budget                                                                                                                                                                       | M2 (D9, L8)             |
@@ -118,8 +120,9 @@ for audit and future lease attribution; it is **not** a visibility boundary (D13
 **Acceptance (DESIGN §11, made mechanical):** against `dist/examples/agent.js`, create two workers with
 different `cwd`s, prompt each once **concurrently**, both return `stopReason:"end_turn"`, both texts contain
 the reject-branch sentence (proving the permission was actually answered), the two `sessionId`s and pids
-differ, each worker's event log contains only its own `workerId`/`sessionId` with a gap-free `seq` starting
-at 1, and both process trees are reaped after `close()`. Full script in `docs/M0-PLAN.md` §4.
+differ, every envelope in each worker's log carries that worker's `workerId` and — where `sessionId` is
+non-null — that worker's `sessionId` (the pre-handshake prefix is frozen at `null`, §8.2 rule 3), the `seq`
+is gap-free from 1, and both process trees are reaped after `close()`. Full script in `docs/M0-PLAN.md` §4.
 
 ---
 
@@ -187,7 +190,7 @@ closure; `@omni-acp/daemon` never appears in `client`'s `dependencies` — only 
 | `@omni-acp/protocol`                    | `@agentclientprotocol/sdk@1.4.0`, `zod@^4`                                                                        |
 | `@omni-acp/testkit` (private)           | `@omni-acp/protocol@workspace:*`, `@agentclientprotocol/sdk@1.4.0`                                                |
 | `@omni-acp/core`                        | `@omni-acp/protocol@workspace:*`, `@agentclientprotocol/sdk@1.4.0` · dev: `@omni-acp/testkit`                     |
-| `@omni-acp/daemon`                      | `@omni-acp/protocol`, `@omni-acp/core`, `hono@^4`, `@hono/node-server@^1` · dev: `@omni-acp/testkit`              |
+| `@omni-acp/daemon`                      | `@omni-acp/protocol`, `@omni-acp/core`, `hono@^4`, `@hono/node-server@^2` · dev: `@omni-acp/testkit`              |
 | `@omni-acp/client`                      | `@omni-acp/protocol` **only** · peer(optional): `@omni-acp/daemon` · dev: `@omni-acp/testkit`, `@omni-acp/daemon` |
 | `@omni-acp/cli`                         | `@omni-acp/protocol`, `@omni-acp/daemon`, `yaml@^2`                                                               |
 | `@omni-acp/integration-tests` (private) | all of the above + `@agentclientprotocol/sdk@1.4.0`                                                               |
@@ -195,6 +198,21 @@ closure; `@omni-acp/daemon` never appears in `client`'s `dependencies` — only 
 Every package: `"type":"module"`, `"engines":{"node":">=22"}`,
 `"exports":{".":{"types":"./dist/index.d.ts","import":"./dist/index.js"}}`,
 `"scripts":{"build":"tsc -b","test":"vitest run","clean":"tsc -b --clean"}`.
+
+**`files` and build info (review R4).** Every published package ships `["dist", "src"]` (protocol
+adds `"schema"`). `src` is published because `tsconfig.base.json` sets `declarationMap` and
+`sourceMap`: without the sources, every `.d.ts.map` / `.js.map` in the tarball points at a path
+that does not exist, and a consumer's go-to-definition and stack frames resolve to nothing. For
+the same reason the incremental build state moved out of the published directory —
+`"tsBuildInfoFile": ".tsbuildinfo"` in each `packages/*/tsconfig.json`, covered by the root
+`.gitignore`'s `*.tsbuildinfo` — instead of being published as `dist/.tsbuildinfo`.
+
+**Pinned versions (scaffold's choice, amendment A5).** `typescript@^6.0.3` (not 7.x: the native
+port's build-mode/composite behaviour is unvalidated for this layout), `vitest@^4.1.11`,
+`zod@^4.5.4`, `hono@^4.13.5`, `@hono/node-server@^2.1.1`, `@types/node@^22.20.1` (matched to the
+Node 22 runtime, so a test cannot type-check against an API Node 22 lacks), `yaml@^2.9.0`,
+eslint 10 + typescript-eslint 8 + prettier 3. `@agentclientprotocol/sdk` is exactly `1.4.0`, no
+caret, asserted by `sdk-version-pinned`.
 
 **Dependency freeze.** Every runtime and dev dependency is declared by the scaffold step. No work package
 adds, removes or bumps a dependency, or touches `pnpm-lock.yaml`. A needed dependency is a request to the
@@ -256,7 +274,13 @@ export function assertTurnId(s: string): TurnId;
 export function workerRef(d: DaemonId, w: WorkerId): WorkerRef;
 export function parseWorkerRef(ref: string): { daemonId: DaemonId; workerId: WorkerId };
 
-/** Monotonic ULID factory. Injected everywhere so tests are deterministic. */
+/**
+ * Monotonic ULID factory. Injected everywhere so tests are deterministic.
+ *
+ * Hand-rolled, no `ulid` package (amendment A7): §3.2 pins protocol's dependencies to the SDK
+ * and zod, and the injection points here need `now`/`random` replaceable — which `ulid`'s
+ * monotonicFactory does not cleanly allow.
+ */
 export function createIdGen(opts?: { now?: () => number; random?: () => number }): IdGen; // IdGen is declared in contracts.ts
 ```
 
@@ -451,6 +475,13 @@ export interface InteractionPayload {
 
 export interface PolicyDecisionPayload {
   readonly requestId: string;
+  /**
+   * `request.toolCall.title ?? ""`, captured when the decision is made. It lives here so that
+   * `reduceTurn` stays a fold over ONE envelope kind and still produces a well-typed
+   * `InteractionRecord`: v1 `RequestPermissionRequest` has no top-level `title`, and the
+   * responder already holds the request when it decides, so this is free (review R9).
+   */
+  readonly title: string;
   readonly decision: "allow" | "deny" | "error";
   readonly rule: string; // M0 is always "m0:auto-deny"
   readonly optionId: string | null;
@@ -622,8 +653,21 @@ export const CreateWorkerRequest = z.strictObject({
 });
 export type CreateWorkerRequest = z.infer<typeof CreateWorkerRequest>;
 
+/**
+ * M0 accepts ONLY `type:"text"` blocks (§2.3, review R12). DESIGN §5.1 requires `resource_link`
+ * and embedded-resource paths to be absolute and to realpath into the token's `cwdRoots`; that
+ * containment check is M2, and under D3 the agent reads the disk itself, so forwarding an
+ * unvalidated absolute path is the cwd escape D18 calls arbitrary code execution. A whitelist
+ * closes it; the zod failure is H8's `400`. The blocks are still not re-modelled — only `type`
+ * is inspected — so M1 relaxing this is additive.
+ */
 export const PromptRequestBody = z.strictObject({
-  content: z.array(ContentBlockLoose).min(1),
+  content: z
+    .array(ContentBlockLoose)
+    .min(1)
+    .refine((blocks) => blocks.every((b) => b.type === "text"), {
+      message: 'M0 accepts only content blocks with type "text" (resource paths are M2)',
+    }),
 });
 export type PromptRequestBody = z.infer<typeof PromptRequestBody>;
 
@@ -727,7 +771,7 @@ export const AgentDescriptor = z.object({
       signal: z.string().default("SIGTERM"),
       graceMs: z.number().int().min(0).default(5_000),
     })
-    .default({}),
+    .prefault({}), // zod 4: `.default()` takes the OUTPUT type, so `{}` is rejected here (A4)
 });
 export type AgentDescriptor = z.infer<typeof AgentDescriptor>;
 
@@ -758,11 +802,21 @@ export const SupervisorConfig = z.object({
   windowsHide: z.boolean().default(true),
 });
 
+/**
+ * Resolved (post-parse) views of the nested blocks. They exist so a package downstream of
+ * `protocol` can name a fully-defaulted config without a zod dependency of its own — §3.2 pins
+ * zod to `protocol`, and a bare `z.output<typeof SupervisorConfig>` at a `core` call site would
+ * quietly break that (amendment A3). Structurally identical to the inline form.
+ */
+export type ResolvedSupervisorConfig = z.output<typeof SupervisorConfig>;
+
 export const TurnConfig = z.object({
   quietMs: z.number().int().nonnegative().default(250),
   hardMs: z.number().int().positive().default(5_000),
   cancelGraceMs: z.number().int().positive().default(10_000),
 });
+export type ResolvedTurnConfig = z.output<typeof TurnConfig>;
+export type ResolvedListenConfig = z.output<typeof ListenConfig>;
 
 export const DaemonConfig = z.strictObject({
   daemonId: z.string().optional(), // else generated + persisted to dataDir
@@ -781,10 +835,10 @@ export const DaemonConfig = z.strictObject({
       subscriberQueueSize: z.number().int().positive().default(1_024),
       sseHeartbeatMs: z.number().int().positive().default(15_000),
     })
-    .default({}),
+    .prefault({}),
   handshakeTimeoutMs: z.number().int().positive().default(60_000),
-  supervisor: SupervisorConfig.default({}),
-  turn: TurnConfig.default({}),
+  supervisor: SupervisorConfig.prefault({}),
+  turn: TurnConfig.prefault({}),
   logLevel: z.enum(["silent", "error", "warn", "info", "debug"]).default("info"),
 });
 export type DaemonConfig = z.input<typeof DaemonConfig>;
@@ -915,7 +969,23 @@ export interface PlatformOps {
   /** POSIX: kill(pid,0). Windows: tasklist /FI. */
   isLeaderGone(p: AgentProcess): Promise<boolean>;
 }
-export function createPlatformOps(platform?: NodeJS.Platform): PlatformOps;
+
+/**
+ * A short-lived utility process whose stdout is read to completion — `taskkill` and `tasklist`
+ * on Windows (§6.4). It exists because §6.1 makes `spawn.ts` the only file allowed to call
+ * `node:child_process`, and `Supervisor.spawn()` (ACP stream + frame limiter + stderr tail) is
+ * the wrong shape for a one-shot command. `platform-windows.ts` receives it by INJECTION, since
+ * importing `spawn.ts` — which itself consumes `PlatformOps` — would be a cycle (review R8).
+ * The implementation is `runUtility` in `core/src/process/spawn.ts` (§5.3).
+ */
+export type RunUtility = (
+  file: string,
+  args: readonly string[],
+  o: { timeoutMs: number },
+) => Promise<{ code: number | null; stdout: string }>;
+
+// `createPlatformOps` is NOT declared here: contracts.ts is types-only (M0-PLAN §1.1) and
+// platform behaviour is core's job. Its signature lives in §5.3 (amendment A2).
 
 export interface Supervisor {
   readonly platform: PlatformOps;
@@ -963,7 +1033,11 @@ export interface EventLog {
   ): Subscription;
   /** Closes every subscription. Idempotent. */
   close(): void;
-  /** Called once, right after session/new, so replayed envelopes carry the sessionId. */
+  /**
+   * Called once, right after `session/new`; envelopes appended from this point carry the
+   * sessionId. Earlier envelopes stay frozen with `sessionId: null` — they precede the session's
+   * existence, and back-filling them would contradict §8.2 rule 3 (review R16).
+   */
   setSessionId(id: SessionId): void;
 }
 
@@ -1142,9 +1216,30 @@ export function runEventLogConformance(name: string, make: () => EventLog): void
 `src/index.ts` (frozen barrel) re-exports every contract type by name plus these factories:
 
 ```ts
+// process/platform.ts — WP-2
+/**
+ * Chosen ONCE, at Supervisor construction; no call site downstream branches on
+ * `process.platform` (§6.1). Declared here rather than in `contracts.ts`, which is types-only
+ * (amendment A2). `deps.runUtility` defaults to `spawn.ts`'s implementation and is what
+ * `platform-windows.ts` uses for `taskkill` / `tasklist` — injected, not imported, because
+ * `spawn.ts` consumes `PlatformOps` (review R8).
+ */
+export function createPlatformOps(
+  platform?: NodeJS.Platform,
+  deps?: { runUtility: RunUtility },
+): PlatformOps;
+
+// process/spawn.ts — WP-2. The second and last spawn site in the repository; see §6.1.
+export function runUtility(
+  file: string,
+  args: readonly string[],
+  o: { timeoutMs: number },
+): Promise<{ code: number | null; stdout: string }>;
+
 // process/supervisor.ts  — WP-2
 export interface SupervisorOptions {
-  readonly config: z.output<typeof SupervisorConfig>;
+  /** `ResolvedSupervisorConfig` from protocol, so `core` takes no zod dependency (A3). */
+  readonly config: ResolvedSupervisorConfig;
   readonly clock: Clock;
   readonly logger: Logger;
   readonly platform?: PlatformOps; // injectable for tests
@@ -1239,10 +1334,12 @@ export function createWorker(deps: CreateWorkerDeps, signal?: AbortSignal): Prom
 ```ts
 // src/index.ts (frozen barrel)
 export { createDaemon } from "./create-daemon.js";
-export type { Daemon, DaemonDeps, AuthContext, WorkerRegistry, Catalog } from "./types.js";
+export type { AuthContext, Catalog, Daemon, DaemonDeps, DaemonEvent, WorkerRegistry } from "./types.js";
 export { createHttpApp } from "./http/app.js";
 
-// src/types.ts
+// declared in protocol/src/contracts.ts; re-exported unchanged from daemon/src/types.ts
+// (amendment A1 — §4's rule, and the only way testkit's `stubDaemon(): Daemon` avoids the
+//  testkit -> daemon -> testkit cycle). The import path every consumer uses is `./types.js`.
 export interface AuthContext {
   readonly tokenId: TokenId;
   readonly role: "user" | "admin";
@@ -1268,6 +1365,21 @@ export interface WorkerRegistry {
   list(auth: AuthContext): readonly WorkerSnapshot[];
   delete(id: WorkerId, auth: AuthContext): Promise<CloseResult>;
   closeAll(reason: WorkerCloseReason, opts?: { timeoutMs?: number }): Promise<void>;
+
+  // ── result-returning façade (review R11) ──────────────────────────────────
+  // Each is `get(id, auth)` plus one call on the handle. They exist so an HTTP route really is
+  // "parse → call ONE daemon method → serialize" instead of a get-then-act orchestration in the
+  // adapter — the one place D15 constraint 1 leaked. In-process callers still use `get()`.
+  /** H7. Throws worker_not_found when absent or invisible. */
+  snapshot(id: WorkerId, auth: AuthContext): WorkerSnapshot;
+  /** H8. */
+  prompt(id: WorkerId, auth: AuthContext, body: PromptRequestBody): Promise<PromptAccepted>;
+  /** H9. Idempotent; a no-op when the worker is not running. */
+  cancel(id: WorkerId, auth: AuthContext): Promise<void>;
+  /** H11. An unknown turn is `state:"unknown"`, never a 404 (D29). */
+  turn(id: WorkerId, auth: AuthContext, turnId: TurnId): TurnStatus;
+  /** H10: the log the SSE writer subscribes to; visibility is checked here, not in `http/`. */
+  logFor(id: WorkerId, auth: AuthContext): EventLog;
 }
 
 export interface Catalog {
@@ -1296,6 +1408,14 @@ export interface Daemon {
   readonly catalog: Catalog;
   readonly supervisor: Supervisor;
 
+  /**
+   * The in-process entry to everything `AuthContext` gates (D15's library-first path, review
+   * R10). Throws `unauthorized` for an unknown token id. `authenticate(headers)` is the HTTP
+   * adapter's thin wrapper over this, so an embedder running with `listen: null` never has to
+   * forge a `Bearer` header to reach `workers.create()`.
+   */
+  authContextFor(tokenId: TokenId, clientId?: ClientId | null): AuthContext;
+
   /** Throws unauthorized. Re-evaluated every call; no decision cache (DESIGN §8). */
   authenticate(headers: Headers): AuthContext;
   whoami(auth: AuthContext): WhoAmIResponse;
@@ -1321,7 +1441,12 @@ export interface DaemonDeps {
 export function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Promise<Daemon>;
 
 // src/http/app.ts — ZERO business logic (D15 constraint 1)
-/** Every route: parse (zod) → call ONE daemon method → serialize. No branching on domain state. */
+/**
+ * Every route: parse (zod) → call ONE daemon method → serialize. No branching on domain state.
+ * Literally satisfiable because of the `WorkerRegistry` façade above; the single exception is
+ * `POST /v1/workers`, which serializes `snapshot()` on the handle `create()` just returned — a
+ * pure accessor, not a decision (review R11).
+ */
 export function createHttpApp(daemon: Daemon): Hono;
 ```
 
@@ -1338,7 +1463,12 @@ export interface ConnectOptions {
 }
 
 export interface LocalOptions {
-  /** M0 implements "never". "prefer" | "require" throw until M3. */
+  /**
+   * M0 default: "never" — a bare `OmniACP.local()` always starts a fresh embedded daemon.
+   * DESIGN D14's example writes "prefer"; `daemon.json` discovery/reuse arrives with the other
+   * adopt modes in M3, and until then "prefer" | "require" throw `bad_request` naming M3
+   * (review R13, §2.3).
+   */
   readonly adopt?: "prefer" | "never" | "require";
   /** M0: true throws until M3. */
   readonly detach?: boolean;
@@ -1474,6 +1604,18 @@ export function main(argv: readonly string[], env: NodeJS.ProcessEnv, io?: {
 separately on any `spawn(` / `exec(` / `execFile(` / `fork(` call site outside it. The test must be
 demonstrated failing on a deliberately planted violation during review.
 
+It matches **imports and call sites**, not raw substrings: `SupervisorOptions.spawnFn?: typeof
+import("node:child_process").spawn` (§5.3) is a type position that emits nothing and is exempt, and
+the module name also appears in doc comments in `agent-process.ts` and `contracts.ts` (amendment
+A8). The same is true of `client-has-no-daemon-import`: `@omni-acp/daemon` appears in prose in
+`client/src/{local,index}.ts`, and only a static **import** is a violation.
+
+The file has exactly two exports that reach the OS: `spawnAgentProcess()` for long-lived agents,
+and `runUtility()` for the one-shot `taskkill` / `tasklist` commands `platform-windows.ts` needs
+(§5.3, review R8). `platform-windows.ts` receives `runUtility` by injection through
+`createPlatformOps(platform, { runUtility })`, because importing `spawn.ts` — which consumes
+`PlatformOps` — would be a cycle. The guard's allowlist is this one file.
+
 This is multica's `TestOnlyLaunchGoSpawnsRuntimeProcesses`, ported. It exists because per-backend opt-in
 left 19 of 27 spawn sites without a process group (GH #7522, F10). Adding the test on day one is cheaper
 than the incident.
@@ -1520,7 +1662,7 @@ Since the CVE‑2024‑27980 fix (Node ≥18.20.2), `spawn()` throws `EINVAL` fo
 | why not `detached` on Windows | —                                                                                                                                                                            | —                                              | libuv maps it to `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP`. `DETACHED_PROCESS` means **no console**, so every console-subsystem grandchild allocates its **own visible** window (multica #1521), and it defeats `windowsHide`. `CREATE_NEW_PROCESS_GROUP` buys nothing because Node cannot send `GenerateConsoleCtrlEvent`. |
 | tree identity                 | pgid == pid                                                                                                                                                                  | same                                           | **none addressable from Node**                                                                                                                                                                                                                                                                                                   |
 | cooperative stop              | `closeStdin()` → `kill(-pgid, SIGTERM)`                                                                                                                                      | same                                           | `closeStdin()` only — Windows has no signal we can send                                                                                                                                                                                                                                                                          |
-| force kill                    | `kill(-pgid, SIGKILL)`                                                                                                                                                       | same                                           | `taskkill /PID <pid> /T /F`, spawned through the same `spawn.ts`                                                                                                                                                                                                                                                                 |
+| force kill                    | `kill(-pgid, SIGKILL)`                                                                                                                                                       | same                                           | `taskkill /PID <pid> /T /F`, run through `spawn.ts`'s injected `runUtility` (§6.1)                                                                                                                                                                                                                                                                 |
 | "tree is gone" proof          | `kill(-pgid, 0) === ESRCH`, polled 10 ms up to `killConfirmMs`                                                                                                               | same                                           | **unprovable** → `treeGone: false`, always, in M0                                                                                                                                                                                                                                                                                |
 | "leader is gone" proof        | `kill(pid, 0)`                                                                                                                                                               | same                                           | `tasklist /FI "PID eq <pid>" /NH`                                                                                                                                                                                                                                                                                                |
 | grandchild reached?           | yes, proven                                                                                                                                                                  | yes, proven                                    | best effort — `/T` walks the **live** PPID chain; a grandchild whose parent already exited is missed (Windows does not reparent), and PID reuse can hit an unrelated process                                                                                                                                                     |
@@ -1655,7 +1797,9 @@ worker returns to `ready`.
 `session/request_permission` is answered inline by `createBaselineResponder("deny", clock)`, which implements
 D4's hard rules 1/3/4/5/6 with no rule engine. Two envelopes are appended per request:
 `acp.interaction{status:"answered", answer:{optionId, by:"baseline"}}` and
-`omni.policy_decision{decision:"deny", rule:"m0:auto-deny", optionId, offered}`.
+`omni.policy_decision{title, decision:"deny", rule:"m0:auto-deny", optionId, offered}`. `title` is
+`request.toolCall.title ?? ""`, captured by the responder while it still holds the request — which
+is what lets `reduceTurn` build an `InteractionRecord` from this one envelope kind (review R9).
 
 M0 wires only `mode: "deny"`. The `"allow"` branch (rule 2: session-grant id → `allow_once`, never
 `allow_always`) is implemented and unit-tested but unreachable from the wire — this keeps the first thing we
@@ -1777,7 +1921,7 @@ verbatim, never reshaped**. One mapper, one table, no other status logic anywher
 
 | HTTP | code                     | M0 trigger                                                                                                                                                                                                  |
 | ---- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 400  | `bad_request`            | zod failure; unknown agent id; malformed/absent JSON body; content type outside the handshake `promptCapabilities`; non-empty `mcp`; `onUnresolved` other than `"deny"`; a path or id that fails validation |
+| 400  | `bad_request`            | zod failure; unknown agent id; malformed/absent JSON body; a prompt content block whose `type` is not `"text"` (review R12) or a type outside the handshake `promptCapabilities`; non-empty `mcp`; `onUnresolved` other than `"deny"`; a malformed worker/turn id. `cwd` containment failure is `403`, not `400` |
 | 401  | `unauthorized`           | header missing / malformed / unknown secret                                                                                                                                                                 |
 | 403  | `forbidden`              | agent not in the token's allowlist; `realpath(cwd)` outside `cwdRoots`                                                                                                                                      |
 | 403  | `policy_exceeds_ceiling` | **reserved** — never returned in M0 (M2)                                                                                                                                                                    |
@@ -1820,14 +1964,14 @@ test needs to avoid real agents.
 
 | Test                          | Rule                                                                                                                                                |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `no-direct-spawn`             | one spawn entry point (§6.1, F10). Must be shown failing on a planted violation.                                                                    |
+| `no-direct-spawn`             | one spawn entry point (§6.1, F10) — matched on imports and call sites, never as a substring scan (a type position and doc comments name the module legally). Must be shown failing on a planted violation. |
 | `seq-single-writer`           | `seq` assigned only inside `packages/core/src/event-log/` (§7.6).                                                                                   |
-| `http-has-no-logic`           | nothing under `packages/daemon/src/http/**` imports `@omni-acp/core`, spawns, sets a timer, or mentions a `WorkerState` literal (D15 constraint 1). |
-| `client-has-no-daemon-import` | no static `@omni-acp/daemon` import anywhere in `packages/client/src` (D14).                                                                        |
+| `http-has-no-logic`           | nothing under `packages/daemon/src/http/**` **imports** `@omni-acp/core` or `node:child_process`, and nothing there branches on domain state — no `WorkerState` literal, no status decision of its own; every route is parse → one daemon call → serialize (D15 constraint 1). **`sse.ts` is exempt for exactly two things** (review R7): the `heartbeatMs` interval, and the stream-terminal predicate that recognises a closed-worker envelope in order to write `omni.stream_end`. Both are transport concerns §8.4 mandates and neither is a policy decision; M1 may move the predicate into `protocol` as `isWorkerClosedEnvelope(e)` and inject a `Clock` into `SseOptions`, at which point the exemption can go. |
+| `client-has-no-daemon-import` | no static `@omni-acp/daemon` **import** anywhere in `packages/client/src` (D14) — the name appears legally in doc comments, so this is an import scan, not a substring scan. |
 | `sdk-version-pinned`          | every manifest pins `@agentclientprotocol/sdk` to exactly `1.4.0` (D7).                                                                             |
 | `dependency-direction`        | the §3.1 DAG holds; `hono`/`yaml` never appear in `client`'s runtime closure.                                                                       |
 | `no-message-id`               | no source file outside `packages/protocol/src/acp.ts` reads `messageId` (F3).                                                                       |
-| `exports-are-stable`          | every name in each frozen `index.ts` resolves and is typed.                                                                                         |
+| `exports-are-stable`          | every name in each frozen `index.ts` resolves and is typed. Lives in `tests/integration/src/` and is owned by WP‑6: it is the only place that may import all six barrels (review R15). |
 
 ### 10.3 CI matrix
 
@@ -1842,8 +1986,16 @@ steps:
   - pnpm install --frozen-lockfile
   - pnpm -r build
   - pnpm -r test
-  - if: failure() → upload test reports as an artifact
+  - if: failure() → upload `**/vitest-report/**` as an artifact
 ```
+
+Every `vitest.config.ts` (per package, `tests/integration`, and the root runner) sets
+`reporters: ["default", ["junit", { outputFile: "vitest-report/junit.xml" }]]`, so the
+failure-artifact step has a file to collect. Before that it silently uploaded nothing on every red
+run — worst on windows-latest, which is precisely the failure class the three-OS matrix exists to
+catch and the one nobody can reproduce locally (review R2). The root runner's copy is not
+redundant: in `projects` mode vitest takes `reporters` from the root config and ignores the
+per-project ones.
 
 Platform differences live in `describe.skipIf(process.platform === "win32")` **inside** the suites, where the
 reason sits next to the code — never as `if: runner.os == …` branches in the workflow.
@@ -1906,6 +2058,25 @@ Grade first, then the rulings. Each proposal's strongest idea is grafted and nam
 | D30 | SDK-side prompt queueing                                                   | **IN, default `queue: true`** — a 5-line per-worker promise chain. DESIGN §9.1 specifies it, so it is not scope creep; `{queue:false}` lets the daemon's `409` surface as `OmniError("worker_busy")`.                                                                                                                                                                           |
 | D31 | `server.workers()` returns snapshots or live handles?                      | **Snapshots.** Returning handles would open N SSE streams for a listing. `server.attach(id)` returns the live handle.                                                                                                                                                                                                                                                           |
 | D32 | `DELETE` response                                                          | **`200 CloseResult`**, idempotent — not `204`. The body is where `treeGone`/`leaderExited` reach the operator (§6.6).                                                                                                                                                                                                                                                           |
+
+**Amendments — the 2026-09-03 contract + scaffold review.** The rulings above stand. These eight
+rows record where the scaffold deviated from this document with a sound reason and the document
+was changed to match the code, so that "every signature in §5 becomes a scaffold stub verbatim"
+is true again. The review's numbered findings R1–R16 were applied in place, in this file, in
+`docs/M0-PLAN.md` and in the stubs; the record is `docs/review/2026-09-03-m0-contract-review.md`.
+
+| #   | Amendment                                                                                                                                                                                                                                                                                                                                                                    |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1  | `Daemon` / `DaemonDeps` / `AuthContext` / `WorkerRegistry` / `Catalog` / `DaemonEvent` are **declared in `protocol/src/contracts.ts`** and re-exported unchanged from `daemon/src/types.ts`. §5.4 previously declared them in the daemon; §4's rule and testkit's `stubDaemon(): Daemon` (which would otherwise force `testkit → daemon → testkit`) both require the protocol home. The documented import path `./types.js` is unchanged. |
+| A2  | `createPlatformOps` is a **`@omni-acp/core` factory (`process/platform.ts`)**, not a `contracts.ts` declaration: that file is types-only (M0-PLAN §1.1). Signature unchanged apart from R8's `deps`.                                                                                                                                                                          |
+| A3  | `ResolvedSupervisorConfig` / `ResolvedTurnConfig` / `ResolvedListenConfig` aliases added to `protocol/src/config.ts`; `SupervisorOptions.config` is `ResolvedSupervisorConfig`, not `z.output<typeof SupervisorConfig>`, so `core` takes no zod dependency §3.2 never granted it. Structurally identical.                                                                     |
+| A4  | zod 4's `.default()` takes the **output** type, so the literal `.default({})` of §5.1 is rejected for an object schema whose fields all have defaults. `shutdown`, `eventLog`, `supervisor` and `turn` use **`.prefault({})`**, zod 4's exact equivalent of v3's behaviour. `DaemonConfig.parse({tokens:[…]})` yields every documented default.                              |
+| A5  | Dependency **versions** were unpinned by this document and are now recorded in §3.2: typescript ^6.0.3 (not 7.x), vitest ^4.1.11, zod ^4.5.4, hono ^4.13.5, @types/node ^22.20.1, yaml ^2.9.0, eslint 10 / typescript-eslint 8 / prettier 3.                                                                                                                                |
+| A6  | **`@hono/node-server@^2`**, not `^1`: v2 is the current pairing for hono 4 and what a fresh install resolves; the `serve()` surface WP‑5 needs is unchanged.                                                                                                                                                                                                                 |
+| A7  | **No `ulid` package.** §3.2 pins protocol to the SDK + zod, and `createIdGen({now, random})` must be injectable for `seqIds()` and the clock-controlled suites, which `ulid`'s monotonicFactory does not cleanly allow. Hand-rolled in `ids.ts`.                                                                                                                            |
+| A8  | The `no-direct-spawn` and `client-has-no-daemon-import` guards are **import/call-site scans, not substring scans**: `SupervisorOptions.spawnFn`'s type position emits nothing, and both module names appear legally in doc comments (§6.1, §10.2).                                                                                                                          |
+
+---
 
 ### 11.3 Risks accepted, with their mitigation
 

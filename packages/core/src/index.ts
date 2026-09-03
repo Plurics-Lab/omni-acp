@@ -22,6 +22,7 @@ export type {
   PlatformOps,
   PlatformOwnership,
   ProcessExit,
+  RunUtility,
   SettleReason,
   SpawnSpec,
   StderrTail,
@@ -36,6 +37,7 @@ export type {
 
 // ── process layer (WP-2) ────────────────────────────────────────────────────
 export { createPlatformOps } from "./process/platform.js";
+export { runUtility } from "./process/spawn.js";
 export { createSupervisor, type SupervisorOptions } from "./process/supervisor.js";
 
 // ── event log (WP-3) ────────────────────────────────────────────────────────

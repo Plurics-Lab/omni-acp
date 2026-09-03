@@ -87,6 +87,15 @@ export interface InteractionPayload {
 
 export interface PolicyDecisionPayload {
   readonly requestId: string;
+  /**
+   * The human-readable title of what was asked, taken from
+   * `request.toolCall.title ?? ""` when the decision is recorded. It is carried here — and not
+   * joined in later from `acp.interaction` — so that `reduceTurn` stays a fold over ONE envelope
+   * kind while still producing a well-typed `InteractionRecord` (review R9). v1
+   * `RequestPermissionRequest` has no top-level `title`, so this is the only place it is
+   * recoverable, and the responder already holds the request when it decides.
+   */
+  readonly title: string;
   readonly decision: "allow" | "deny" | "error";
   /** M0 is always "m0:auto-deny". */
   readonly rule: string;
