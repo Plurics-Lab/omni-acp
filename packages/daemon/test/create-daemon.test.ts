@@ -364,4 +364,19 @@ describe("createDaemon with a socket (D15's other half)", () => {
     expect(daemon.url).toBeNull();
     await expect(fetch(`${url}/v1/health`)).rejects.toThrow();
   });
+
+  it("REJECTS start() when the bind fails instead of dying of an uncaught error event", async () => {
+    // A failed listen is reported asynchronously as an `error` event on the http server. With no
+    // listener Node re-raises it as an uncaught exception, which kills the daemon process with a
+    // stack trace and makes the CLI's "failed to start" path unreachable — the operator sees a
+    // crash instead of one line naming the port. `192.0.2.1` is TEST-NET-1 (RFC 5737): no machine
+    // on any of the three OSes owns it, so the bind fails with EADDRNOTAVAIL and never depends on
+    // what else is listening on this box.
+    const { daemon } = await build({ listen: { host: "192.0.2.1", port: 0 } });
+
+    await expect(daemon.start()).rejects.toThrow(/EADDRNOTAVAIL|EACCES|EINVAL|ENOTFOUND/);
+    // A failed bind is not remembered as "started": url stays null and stop() is still clean.
+    expect(daemon.url).toBeNull();
+    await daemon.stop();
+  });
 });

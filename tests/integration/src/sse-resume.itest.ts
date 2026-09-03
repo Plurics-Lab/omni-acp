@@ -132,28 +132,45 @@ describe("SSE resume", () => {
     expect(replay.control).toEqual([]);
   }, 30_000);
 
-  it("returns log.subscriberCount to 0 when the client aborts", async () => {
+  it("returns log.subscriberCount to its baseline when the client aborts", async () => {
+    // A worker of its own, created here: the shared one has had four streams opened against it
+    // by the tests above, and a server notices a dropped connection asynchronously, so its count
+    // is still draining. On a fresh log the only subscriber is the daemon's own.
+    const mine = (await (
+      await http("/v1/workers", {
+        method: "POST",
+        body: JSON.stringify({ agent: "chatty", cwd: harness.roots[0] }),
+      })
+    ).json()) as WorkerSnapshot;
     const log = harness.daemon.workers.logFor(
-      worker.workerId,
+      mine.workerId,
       harness.daemon.authContextFor("local"),
     );
 
+    // The assembled daemon holds ONE long-lived subscription per worker — the fan-out that feeds
+    // `daemon.on(...)`, attached before the handshake so a listener sees a worker's whole life —
+    // so `subscriberCount` has a baseline of 1 while the daemon is running, and it is the DELTA
+    // a client's stream adds that must come back. (`daemon.stop()` closes that one too, which is
+    // what `create-daemon.test.ts` asserts as an absolute 0.)
+    const baseline = log.subscriberCount;
+    expect(baseline).toBe(1);
+
     const controller = new AbortController();
     const res = await fetch(
-      `${harness.daemon.url ?? ""}/v1/workers/${worker.workerId}/events?since=0`,
+      `${harness.daemon.url ?? ""}/v1/workers/${mine.workerId}/events?since=0`,
       {
         headers: { authorization: `Bearer ${harness.token}` },
         signal: controller.signal,
       },
     );
     expect(res.status).toBe(200);
-    expect(await until(() => log.subscriberCount === 1, 5_000)).toBe(true);
+    expect(await until(() => log.subscriberCount === baseline + 1, 5_000)).toBe(true);
 
     controller.abort();
 
     // A leaked subscription per reconnect is the classic SSE memory leak, and reconnects are
     // the normal path here, so it compounds.
-    expect(await until(() => log.subscriberCount === 0, 5_000)).toBe(true);
+    expect(await until(() => log.subscriberCount === baseline, 5_000)).toBe(true);
   }, 30_000);
 });
 

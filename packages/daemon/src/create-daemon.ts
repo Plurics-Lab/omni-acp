@@ -35,6 +35,9 @@ import type { AuthContext, Daemon, DaemonDeps, DaemonEvent } from "./types.js";
 interface BoundServer {
   close(cb?: (e?: Error) => void): void;
   closeAllConnections?: () => void;
+  /** All three are `EventEmitter`s; a failed bind arrives here, not as a throw from `serve()`. */
+  on(event: "error", listener: (e: Error) => void): void;
+  off(event: "error", listener: (e: Error) => void): void;
 }
 
 /**
@@ -229,8 +232,19 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     const { serve } = await import("@hono/node-server");
     app ??= createHttpApp(daemon);
     const bound = await new Promise<AddressInfo>((resolve, reject) => {
+      /**
+       * A bind that fails — `EADDRINUSE` on a configured port, `EADDRNOTAVAIL` on a host this
+       * machine does not own — is reported ASYNCHRONOUSLY as an `error` event on the server, not
+       * as a throw from `serve()`. With no listener Node re-raises it as an uncaught exception
+       * and the daemon dies with a stack trace, so `start()` never rejects and the CLI's
+       * "failed to start" path is unreachable. This is what makes the failure a rejection.
+       */
+      const onBindError = (e: Error): void => {
+        server = null;
+        reject(e);
+      };
       try {
-        server = serve(
+        const created = serve(
           {
             fetch: (request: Request) => daemon.fetch(request),
             hostname: listen.host,
@@ -240,9 +254,17 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
             serverOptions: { requestTimeout: 0, headersTimeout: 0 },
           },
           (address) => {
+            created.off("error", onBindError);
+            // Past the bind, an `error` event is a runtime fault on a socket that is already
+            // serving. Logging it keeps the daemon alive; leaving it unhandled would not.
+            created.on("error", (e: Error) => {
+              logger.error("http server error", { error: String(e), daemonId });
+            });
             resolve(address);
           },
         ) as unknown as BoundServer;
+        server = created;
+        created.on("error", onBindError);
       } catch (e) {
         reject(e instanceof Error ? e : new Error(String(e)));
       }

@@ -411,7 +411,20 @@ class Worker implements WorkerHandle {
     const envelopes = this.#deps.log.appendAll(out.emit);
     this.#rescheduleTick(out.scheduleTickAt);
     this.#afterStep(out);
-    return out.emit.map((e, i) => ({ input: e, seq: envelopes[i]?.seq ?? this.#deps.log.head }));
+    // `appendAll` returns exactly one envelope per input, in order (§8.2), so the pairing is
+    // positional and total. The seq is COPIED off the envelope the log just stamped —
+    // `EventLog.append` is its sole writer, and `seq-single-writer` wants that copy SPELLED, so
+    // a missing envelope is an internal invariant break rather than a fabricated number.
+    return out.emit.map((e, i) => {
+      const envelope = envelopes[i];
+      if (envelope === undefined) {
+        throw new OmniError(
+          "internal",
+          `EventLog.appendAll returned ${String(envelopes.length)} envelopes for ${String(out.emit.length)} inputs`,
+        );
+      }
+      return { input: e, seq: envelope.seq };
+    });
   }
 
   /** `#step` for the paths where a throw must not escape into a timer or the SDK's dispatcher. */

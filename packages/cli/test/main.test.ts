@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Writable } from "node:stream";
 import { main } from "@omni-acp/cli";
 import { describe, expect, it } from "vitest";
@@ -82,10 +85,29 @@ describe("main", () => {
   it("does not write the generated token to stdout unless asked", async () => {
     // The token is a credential. `--print-token` is opt-in precisely so that the common case —
     // a daemon started under a supervisor whose stdout goes to a log file — does not put one
-    // there. Proven here through the failing start path, which still reaches the token step.
-    const streams = io();
-    await main(["start", "--port", "0"], { OMNI_ACP_TOKEN: "sekrit-token-that-is-long" }, streams);
-    expect(streams.out()).not.toContain("sekrit-token-that-is-long");
-    expect(streams.err()).not.toContain("sekrit-token-that-is-long");
+    // there.
+    //
+    // Proven through a start that reaches the token step and then fails to BIND: `192.0.2.1` is
+    // TEST-NET-1 (RFC 5737), an address no machine on any of the three OSes owns, so `listen`
+    // fails with EADDRNOTAVAIL and `main()` returns 1 without ever holding a socket open. A
+    // successful start would block until a signal, which is `cli-start.itest.ts`'s job — this is
+    // a unit test and must not bind, wait, or write to a developer's `~/.omni-acp`, hence the
+    // temp `--data-dir` too.
+    const dataDir = await mkdtemp(join(tmpdir(), "omni-acp-cli-"));
+    try {
+      const streams = io();
+      const code = await main(
+        ["start", "--host", "192.0.2.1", "--port", "0", "--data-dir", dataDir],
+        { OMNI_ACP_TOKEN: "sekrit-token-that-is-long" },
+        streams,
+      );
+
+      expect(code).toBe(1);
+      expect(streams.err()).toContain("failed to start");
+      expect(streams.out()).not.toContain("sekrit-token-that-is-long");
+      expect(streams.err()).not.toContain("sekrit-token-that-is-long");
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 });

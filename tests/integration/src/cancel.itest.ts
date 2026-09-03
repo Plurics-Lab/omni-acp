@@ -34,10 +34,18 @@ describe("cancel", () => {
     // Cancelled, not crashed: the turn ended cleanly and there is no error body.
     expect(result.error).toBeNull();
 
-    // The process is STILL ALIVE. multica closes stdin at turn end because its processes are
-    // one-shot; copying that here would kill a Worker that is meant to outlive the turn
-    // (CONTRACTS.md §6.5, §11.3).
-    expect(worker.state).toBe("ready");
+    // The process is STILL ALIVE, and the worker is back to `ready`. multica closes stdin at
+    // turn end because its processes are one-shot; copying that here would kill a Worker that is
+    // meant to outlive the turn (CONTRACTS.md §6.5, §11.3).
+    //
+    // The state is read from the daemon, not off the handle: `Worker.state` is the last state
+    // THIS HANDLE OBSERVED, and `prompt()` stops reading at its own turn's `state_update{idle}`
+    // — one seq before the `omni.worker_state{ready, turn_end}` the daemon appends next. The
+    // handle therefore still holds `running`, by design (a property read must not become a
+    // network call), so the fresh read is spelled out. It is not racy: the daemon appends both
+    // envelopes in one synchronous step, so `idle` cannot reach a client before `ready` exists.
+    const fresh = (await server.workers()).find((w) => w.workerId === worker.id);
+    expect(fresh?.state).toBe("ready");
     expect(harness.daemon.supervisor.live.size).toBe(1);
 
     // And it takes another turn.
