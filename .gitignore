@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+coverage/
+*.log
+.DS_Store
+.omni-acp/
