@@ -115,9 +115,13 @@ describe("createDaemon — the library IS the product (D15, acceptance 1)", () =
     await daemon.stop();
   });
 
-  it("exposes fetch even though no port was ever bound (D27)", async () => {
+  it("exposes a WORKING fetch even though no port was ever bound (D27)", async () => {
     const { daemon } = await build();
-    expect(typeof daemon.fetch).toBe("function");
+    // Not `start()`ed, `listen: null`, no socket — and the adapter answers anyway. This is the
+    // property the entire route suite is built on.
+    const res = await daemon.fetch(new Request("http://daemon.invalid/v1/health"));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
     await daemon.stop();
   });
 
@@ -333,5 +337,31 @@ describe("daemon.stop (acceptance 12)", () => {
     expect(status.state).toBe("failed");
     expect(status.stopReason).toBeNull();
     expect(status.result?.error?.code).toBe("worker_closed");
+  });
+});
+
+describe("createDaemon with a socket (D15's other half)", () => {
+  it("binds an ephemeral port on start(), serves the app, and releases it on stop()", async () => {
+    // Port 0 everywhere: a fixed port is a suite that fails on somebody else's machine.
+    const { daemon } = await build({ listen: { host: "127.0.0.1", port: 0 } });
+    expect(daemon.url).toBeNull(); // null until start()
+
+    await daemon.start();
+    const url = daemon.url;
+    expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    await daemon.start(); // idempotent: no second bind, same url
+    expect(daemon.url).toBe(url);
+
+    const health = await fetch(`${url}/v1/health`);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true });
+    // Real loopback HTTP, not an in-memory shortcut: a bad token is refused over the wire.
+    expect(
+      (await fetch(`${url}/v1/info`, { headers: { authorization: "Bearer wrong" } })).status,
+    ).toBe(401);
+
+    await daemon.stop();
+    expect(daemon.url).toBeNull();
+    await expect(fetch(`${url}/v1/health`)).rejects.toThrow();
   });
 });

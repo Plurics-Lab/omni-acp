@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, realpath, symlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   DaemonConfig,
@@ -133,6 +135,24 @@ describe("TokenStore.verify (H13)", () => {
   it("rejects an Omni-Client-Id longer than the audit bound", () => {
     const store = createTokenStore(config());
     expect(() => store.verify(bearer(SECRET, "x".repeat(201)))).toThrow(/Omni-Client-Id/);
+  });
+
+  it("compares through the repository's ONE timing-safe comparison (H13)", () => {
+    // Behaviour cannot distinguish a constant-time comparison from `===`, and a timing
+    // measurement in a unit test is a flake generator. What IS checkable is that this file does
+    // its comparison through `verifySecret` — protocol's single `timingSafeEqual` call site,
+    // whose constant-time property WP-1 asserts — and never rolls its own.
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "src", "auth.ts"),
+      "utf8",
+    );
+    expect(source).toMatch(/\bverifySecret\(/);
+    // No hand-rolled digest comparison. Whitespace is collapsed first so the patterns below are
+    // exact; `sha256 === undefined` is a presence check and is the one allowed form.
+    const normalized = source.replace(/\s+/g, " ");
+    expect(normalized).not.toMatch(/sha256 [=!]== (?!undefined)/i);
+    expect(normalized).not.toMatch(/[=!]== \w*sha256\b/i);
+    expect(normalized).not.toMatch(/hashSecret\([^)]*\) [=!]==/);
   });
 
   it("refuses a config with two tokens sharing an id", () => {
