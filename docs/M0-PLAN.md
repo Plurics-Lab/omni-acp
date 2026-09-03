@@ -516,3 +516,47 @@ single `type:"text"` block, which is all M0 accepts (`CONTRACTS.md` §2.3, revie
 3. `two-workers-do-not-interfere.itest.ts` green against the unmodified SDK example agent on all three OSes.
 4. Zero orphan processes after any suite, on any OS.
 5. No file in the repository has two owners, and `pnpm-lock.yaml` has exactly one author.
+
+### Real-agent smoke (claude-acp 0.73.0)
+
+Not a CI test — a one-off observation, recorded because M0's whole claim is that the daemon drives a **real**
+ACP agent and not just the SDK's example. Run once at the WP-2…WP-6 integration merge, on Linux, against the
+logged-in Claude Code on that machine: `createDaemon` + `OmniACP.connect`, two workers created concurrently
+in two `mkdtemp` roots, both prompted concurrently with _"who are you? Answer in one short sentence."_, then
+closed. Agent command: `npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, launched with the daemon's own
+environment (the catalog's `toSpawnSpec`, §5.4) so the adapter finds the existing login.
+
+**Result: green.** Both turns returned `stopReason: "end_turn"` with `error: null` and real prose in
+`TurnResult.text` ("I'm Claude, an AI coding agent built by Anthropic…"). The two workers were genuinely
+independent — distinct `sessionId`s (`33d4bd06…` / `78a491e7…`) and distinct pids — and both closed with
+`{leaderExited: true, treeGone: true}`, leaving `supervisor.live.size === 0`.
+
+**Observed capabilities** (identical for both workers), which is what M1's probe will have to accommodate:
+
+```json
+{
+  "protocolVersion": 1,
+  "loadSession": true,
+  "promptCapabilities": { "image": true, "embeddedContext": true },
+  "supportsSessionClose": true,
+  "raw": {
+    "mcpCapabilities": { "http": true, "sse": true },
+    "auth": { "logout": {} },
+    "sessionCapabilities": {
+      "additionalDirectories": {}, "close": {}, "delete": {}, "fork": {},
+      "list": {}, "resume": {}, "subagents": {}
+    },
+    "_meta": { "claudeCode": { "promptQueueing": true } }
+  }
+}
+```
+
+**Latency** (warm `npx` cache; a cold cache adds the package download, which is why
+`handshakeTimeoutMs` defaults to 60 s): 1.56 s for both handshakes in parallel — `initialize` +
+`session/new`, well inside the ~7 s a cold adapter takes — 2.71 s for both turns in parallel, 5.13 s from
+`createDaemon` to both trees reclaimed.
+
+Two things this exercise did **not** reach, both expected in M0: no `toolCalls` and no `interactions`, because
+a one-sentence identity question needs neither a tool nor a permission. The auto-DENY responder (§7.4) is
+therefore still only proven against the SDK example agent's `reject` branch, which is where
+`two-workers-do-not-interfere.itest.ts` proves it deterministically.
