@@ -1,0 +1,39 @@
+{
+  "name": "@omni-acp/client",
+  "version": "0.0.0",
+  "description": "omni-acp client SDK: connect to a daemon, drive workers, stream turns",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@omni-acp/protocol": "workspace:*"
+  },
+  "peerDependencies": {
+    "@omni-acp/daemon": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@omni-acp/daemon": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@omni-acp/daemon": "workspace:*",
+    "@omni-acp/testkit": "workspace:*"
+  }
+}

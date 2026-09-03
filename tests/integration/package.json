@@ -1,0 +1,25 @@
+{
+  "name": "@omni-acp/integration-tests",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tier-3 integration suite: the real SDK example agent, real processes, real HTTP.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@omni-acp/cli": "workspace:*",
+    "@omni-acp/client": "workspace:*",
+    "@omni-acp/core": "workspace:*",
+    "@omni-acp/daemon": "workspace:*",
+    "@omni-acp/protocol": "workspace:*",
+    "@omni-acp/testkit": "workspace:*"
+  }
+}

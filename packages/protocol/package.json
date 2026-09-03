@@ -1,0 +1,29 @@
+{
+  "name": "@omni-acp/protocol",
+  "version": "0.0.0",
+  "description": "omni-acp wire types, ids, errors, config schemas and the shared turn aggregator",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "schema"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "zod": "^4.5.4"
+  }
+}

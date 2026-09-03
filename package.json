@@ -1,0 +1,32 @@
+{
+  "name": "omni-acp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Remote-ization and multi-agent management layer for ACP coding agents",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.1",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.6",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.69.0",
+    "vitest": "^4.1.11"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@omni-acp/daemon",
+  "version": "0.0.0",
+  "description": "omni-acp daemon: createDaemon() plus a zero-business-logic HTTP adapter",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "@omni-acp/core": "workspace:*",
+    "@omni-acp/protocol": "workspace:*",
+    "hono": "^4.13.5"
+  },
+  "devDependencies": {
+    "@omni-acp/testkit": "workspace:*"
+  }
+}

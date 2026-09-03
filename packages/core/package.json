@@ -1,0 +1,31 @@
+{
+  "name": "@omni-acp/core",
+  "version": "0.0.0",
+  "description": "omni-acp process supervision, event log, normalizer and worker kernel",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@omni-acp/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@omni-acp/testkit": "workspace:*"
+  }
+}

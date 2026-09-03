@@ -1,0 +1,35 @@
+{
+  "name": "@omni-acp/cli",
+  "version": "0.0.0",
+  "description": "omni-acp command line: omni-acp start",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "omni-acp": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@omni-acp/daemon": "workspace:*",
+    "@omni-acp/protocol": "workspace:*",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@omni-acp/testkit": "workspace:*"
+  }
+}
