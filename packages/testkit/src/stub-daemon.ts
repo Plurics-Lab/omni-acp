@@ -38,23 +38,100 @@ function stubAuthContext(tokenId: string, clientId: string | null): AuthContext 
 }
 
 /**
- * Wraps every own method of `target` so that calling it is recorded. Overrides are applied
- * BEFORE wrapping, so a caller's own implementation is recorded too — which is what makes
- * `calls` usable as "did this route call exactly one registry method?" (WP-5 acceptance 2).
+ * Every property name worth mirroring onto the recording facade: own enumerable keys PLUS
+ * every property declared up the prototype chain, stopping at `Object.prototype`.
+ *
+ * The prototype walk is the point. A test that hands `stubDaemon` a class instance —
+ * `workers: new FakeRegistry()` — has NO own function properties at all: `Object.keys` returns
+ * the fields and nothing else, so every method would be dropped from the facade and every call
+ * would go unrecorded. `calls` is load-bearing (WP-5 acceptance 2 asks "did this route call
+ * exactly one registry method?"), and a recorder that silently records nothing is worse than no
+ * recorder.
+ */
+function mirroredKeys(target: object): string[] {
+  const keys = new Set<string>(Object.keys(target));
+  for (
+    let proto: object | null = Object.getPrototypeOf(target) as object | null;
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto) as object | null
+  ) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key !== "constructor") keys.add(key);
+    }
+  }
+  return [...keys];
+}
+
+/**
+ * Copies one property of `source` onto `out`, wrapping functions so that calling them is
+ * recorded. Accessors are re-exposed as getters that delegate to `source`, so a class-based
+ * override whose `size` is a `get` accessor keeps reading live rather than freezing at merge
+ * time — and is never INVOKED here, since evaluating a getter for its own sake is a side effect
+ * this helper has no right to cause.
+ */
+function mirrorProperty(
+  out: Record<string, unknown>,
+  source: object,
+  key: string,
+  prefix: string,
+  calls: Call[] | null,
+): void {
+  let descriptor: PropertyDescriptor | undefined;
+  for (
+    let o: object | null = source;
+    o !== null && descriptor === undefined;
+    o = Object.getPrototypeOf(o) as object | null
+  ) {
+    descriptor = Object.getOwnPropertyDescriptor(o, key);
+  }
+  if (descriptor === undefined) return;
+
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    Object.defineProperty(out, key, {
+      enumerable: true,
+      configurable: true,
+      get: () => (source as Record<string, unknown>)[key],
+    });
+    return;
+  }
+
+  const value = descriptor.value as unknown;
+  if (typeof value !== "function") {
+    out[key] = value;
+    return;
+  }
+  const fn = value as (...a: unknown[]) => unknown;
+  // `apply(source, …)` — NOT `apply(out, …)`: a prototype method reaches its own fields
+  // through `this`, and the facade has none of them.
+  out[key] =
+    calls === null
+      ? (...args: unknown[]) => fn.apply(source, args)
+      : (...args: unknown[]) => {
+          calls.push({ method: `${prefix}${key}`, args });
+          return fn.apply(source, args);
+        };
+}
+
+/**
+ * Wraps every method of `target` — own or inherited — so that calling it is recorded. Overrides
+ * are applied BEFORE wrapping, so a caller's own implementation is recorded too, which is what
+ * makes `calls` usable as "did this route call exactly one registry method?" (WP-5 acceptance 2).
  */
 function recording<T extends object>(target: T, prefix: string, calls: Call[]): T {
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(target)) {
-    const value = (target as Record<string, unknown>)[key];
-    out[key] =
-      typeof value === "function"
-        ? (...args: unknown[]) => {
-            calls.push({ method: `${prefix}${key}`, args });
-            return (value as (...a: unknown[]) => unknown).apply(target, args);
-          }
-        : value;
-  }
+  for (const key of mirroredKeys(target)) mirrorProperty(out, target, key, prefix, calls);
   return out as T;
+}
+
+/**
+ * Spread (`{...base, ...overrides}`) would drop a class instance's prototype methods on the
+ * floor before `recording` ever saw them, so overrides are flattened the same descriptor-aware
+ * way — with methods still bound to the override object.
+ */
+function flatten<T extends object>(source: T): Partial<T> {
+  const out: Record<string, unknown> = {};
+  for (const key of mirroredKeys(source)) mirrorProperty(out, source, key, "", null);
+  return out as Partial<T>;
 }
 
 /**
@@ -160,7 +237,7 @@ export function stubDaemon(
     stop: () => Promise.resolve(),
   };
 
-  const merged: Daemon = { ...base, ...overrides };
+  const merged: Daemon = { ...base, ...(overrides === undefined ? {} : flatten(overrides)) };
   const daemon = recording(
     {
       ...merged,

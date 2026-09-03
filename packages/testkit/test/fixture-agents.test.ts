@@ -1,8 +1,9 @@
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { isAlive, waitGone } from "@omni-acp/testkit";
+import { fixtureAgentPath, isAlive, waitGone } from "@omni-acp/testkit";
 import { launchFixture, type LaunchedFixture } from "./support/launch-fixture.js";
 
 /**
@@ -70,6 +71,23 @@ describe("fixtures/agents/crash.mjs", () => {
     expect(await exit).toBe(1);
     expect(agent.updates.map(text)).toEqual(["about to crash"]);
     expect(agent.stderrText()).toContain("simulated fault");
+  });
+
+  it("honours CRASH_EXIT_CODE and CRASH_DELAY_MS", async () => {
+    // WP-2's crash classifier branches on the exit code, and WP-4's tests need a crash that
+    // lands after the chunk rather than racing it. Both knobs are documented in the fixture
+    // header, so both are pinned here.
+    const agent = launch("crash", { CRASH_EXIT_CODE: "42", CRASH_DELAY_MS: "150" });
+    const sessionId = await agent.handshake();
+    const startedAt = Date.now();
+    const exit = new Promise<number | null>((r) => agent.child.once("exit", r));
+    void agent.cx
+      .request("session/prompt", { sessionId, prompt: [{ type: "text", text: "go" }] })
+      .catch(() => {});
+
+    expect(await exit).toBe(42);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100);
+    expect(agent.updates.map(text)).toEqual(["about to crash"]);
   });
 });
 
@@ -158,6 +176,52 @@ describe("fixtures/agents/orphan.mjs", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("ORPHAN_EXIT_AFTER_MS: the leader leaves, the grandchild holds stdout open (the zombie)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omni-zombie-"));
+    const marker = join(dir, "marker.txt");
+    let grandchild = 0;
+    try {
+      const agent = launch("orphan", {
+        MARKER_FILE: marker,
+        ORPHAN_INTERVAL_MS: "50",
+        ORPHAN_EXIT_AFTER_MS: "400",
+      });
+      const sessionId = await agent.handshake();
+      const exit = new Promise<number | null>((r) => agent.child.once("exit", r));
+      await agent.cx.request("session/prompt", {
+        sessionId,
+        prompt: [{ type: "text", text: "go" }],
+      });
+      grandchild = Number(/grandchild pid (\d+)/.exec(agent.updates.map(text).join(""))?.[1]);
+      expect(Number.isInteger(grandchild)).toBe(true);
+
+      expect(await exit).toBe(0); // it left on its own — nobody killed it
+
+      // WP-2 acceptance 9: `exited` has fired, but the grandchild INHERITED stdout, so the pipe
+      // is still open and `stdoutEnded` has NOT. A close path that awaits EOF hangs right here,
+      // which is the hang this knob exists to reproduce.
+      expect(agent.child.stdout.readableEnded).toBe(false);
+      expect(await isAlive(grandchild)).toBe(true);
+
+      // ...and the descendant is still writing, so the marker file still grows after the death
+      // of the process that spawned it.
+      const first = statSync(marker).size;
+      expect(first).toBeGreaterThan(0);
+      await sleep(200);
+      expect(statSync(marker).size).toBeGreaterThan(first);
+    } finally {
+      if (grandchild > 0) {
+        try {
+          process.kill(grandchild, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+        await waitGone(grandchild, 3_000);
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("fixtures/agents/noisy.mjs", () => {
@@ -196,5 +260,61 @@ describe("fixtures/agents/noisy.mjs", () => {
     const exit = new Promise<number | null>((r) => agent.child.once("exit", r));
     await expect(prompt).rejects.toThrow();
     expect(await exit).toBe(3);
+  });
+});
+
+/**
+ * A raw spawn with NO ACP client attached. Two of the documented knobs are about what the agent
+ * puts on stdout or what it does with a bad environment — neither survives a client that parses
+ * every line as ndJSON, so those two are observed from outside.
+ *
+ * `node:child_process` here is fine: §6.1's single-spawn rule scopes to the packages' `src`
+ * directories, and this file is a test.
+ */
+function runRaw(
+  name: Parameters<typeof launchFixture>[0],
+  env: Record<string, string>,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [fixtureAgentPath(name)], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...env },
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (d: string) => (stdout += d));
+    child.stderr.on("data", (d: string) => (stderr += d));
+    child.on("error", () => {});
+    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+    // Nothing is written to stdin, and every agent here exits on EOF — except the ones that
+    // exit sooner, which is the point of both cases below.
+    child.stdin.end();
+  });
+}
+
+describe("the documented env knobs, pinned so downstream work packages can rely on them", () => {
+  it("noisy: NOISY_STDOUT_GARBAGE=1 puts a banner and a non-JSON line ahead of any frame", async () => {
+    const { stdout } = await runRaw("noisy", {
+      NOISY_STDOUT_GARBAGE: "1",
+      NOISY_STDERR_BYTES: "0",
+      NOISY_FRAME_BYTES: "16",
+    });
+    // WP-2's frame reader must skip these rather than treat them as a protocol_error; a reader
+    // that dies on line 1 never reaches the handshake.
+    expect(stdout.split("\n").slice(0, 2)).toEqual(["starting up...", "{not json"]);
+  });
+
+  it("noisy: the garbage is OFF by default, so no existing test changes behaviour", async () => {
+    const { stdout } = await runRaw("noisy", { NOISY_STDERR_BYTES: "0", NOISY_FRAME_BYTES: "16" });
+    expect(stdout).not.toContain("starting up...");
+  });
+
+  it("orphan: MARKER_FILE is required and its absence is EX_USAGE, not a silent no-op", async () => {
+    const { code, stderr } = await runRaw("orphan", { MARKER_FILE: "" });
+    expect(code).toBe(64);
+    expect(stderr).toContain("MARKER_FILE is required");
   });
 });

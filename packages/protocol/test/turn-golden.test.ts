@@ -89,6 +89,22 @@ describe("reduceTurn golden transcripts", () => {
         expect(turnStatus(expected.turnId, reversed).state).toBe(expected.status.state);
       });
 
+      it("folds each envelope ONCE however many times it is delivered", () => {
+        // The shape a caller actually produces: a `?since=` replay concatenated onto the tail
+        // it was already holding, so the overlap arrives twice. Both an interleaved repeat and
+        // a whole-buffer repeat must reduce to the same aggregate — otherwise `text`
+        // concatenates twice and `interactions` grows a phantom row.
+        const interleaved = envelopes.flatMap((e) => [e, structuredClone(e)]);
+        expect(reduceTurn(expected.turnId, interleaved)).toStrictEqual(expected.result);
+
+        const appended = [...envelopes, ...structuredClone(envelopes)];
+        expect(reduceTurn(expected.turnId, appended)).toStrictEqual(expected.result);
+        expect(turnStatus(expected.turnId, appended).state).toBe(expected.status.state);
+        expect(turnStatus(expected.turnId, appended).result).toStrictEqual(
+          expected.status.state === "unknown" ? null : expected.result,
+        );
+      });
+
       it("never reads `messageId` (F3): adding one to every chunk changes nothing", () => {
         const withIds = structuredClone(envelopes).map((e) => {
           if (e.kind !== "acp.session_update") return e;
@@ -190,6 +206,29 @@ describe("the corpus covers every acceptance clause", () => {
         (e.payload as unknown as Record<string, unknown>)["state"] === "idle",
     );
     expect(idle).toBe(false);
+  });
+
+  it("a duplicated envelope contributes once: (workerId, seq) is the identity", () => {
+    const { envelopes, expected } = load("no-message-id");
+    const chunk = envelopes.find(
+      (e) =>
+        e.kind === "acp.session_update" &&
+        (e.payload as unknown as Record<string, unknown>)["sessionUpdate"] ===
+          "agent_message_chunk",
+    );
+    if (chunk === undefined) throw new Error("fixture lost its agent_message_chunk");
+
+    // Same `(workerId, seq)`, redelivered — a deep clone, so this cannot be passing by
+    // reference identity — and `text` is not concatenated twice.
+    expect(reduceTurn(expected.turnId, [...envelopes, structuredClone(chunk)]).text).toBe(
+      "one two three",
+    );
+
+    // The identity is the PAIR. `seq` is 1-based and gap-free PER WORKER (ids.ts), so in a
+    // replay union the same number from a different worker is a different envelope, and
+    // dropping it would lose real content.
+    const foreign = { ...structuredClone(chunk), workerId: `w_${"1".repeat(26)}` } as const;
+    expect(reduceTurn(expected.turnId, [...envelopes, foreign]).text).not.toBe("one two three");
   });
 
   it("a turn id never seen is `unknown` with a null result", () => {

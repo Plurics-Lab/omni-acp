@@ -10,7 +10,7 @@ export interface SourceFile {
   readonly path: string;
   readonly absolute: string;
   readonly text: string;
-  /** `text` with comments and string/template literals blanked out (lengths preserved). */
+  /** `text` with comments, string/template and regex literals blanked (lengths preserved). */
   readonly code: string;
 }
 
@@ -55,8 +55,57 @@ export function packageSources(): SourceFile[] {
 }
 
 /**
- * Replaces the CONTENT of comments and string/template literals with spaces, keeping every
- * offset and line break, so a match in `code` is a real identifier at a real line number.
+ * A `/` starts a regex literal only where an OPERAND may begin. This is the standard
+ * lexer-level heuristic: after `(`, `,`, `=`, `:`, `[`, `!`, `&`, `|`, `?`, `{`, `;`, an
+ * arithmetic operator, or one of the keywords below, a `/` cannot be division. After an
+ * identifier, a literal, `)` or `]`, it must be.
+ */
+const REGEX_PRECEDERS = new Set("([{,;:=!&|?+-*%~^<>".split(""));
+const REGEX_KEYWORDS = new Set([
+  "return",
+  "typeof",
+  "instanceof",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "throw",
+  "case",
+  "do",
+  "else",
+  "yield",
+  "await",
+]);
+const IDENT = /[A-Za-z0-9_$]/;
+
+/** `scanned` is the partially blanked output, so a preceding comment already reads as spaces. */
+function startsRegex(scanned: readonly string[], at: number): boolean {
+  let j = at - 1;
+  while (j >= 0 && /\s/.test(scanned[j] ?? "")) j -= 1;
+  if (j < 0) return true;
+  const ch = scanned[j] ?? "";
+  if (REGEX_PRECEDERS.has(ch)) return true;
+  if (!IDENT.test(ch)) return false;
+  let k = j;
+  while (k >= 0 && IDENT.test(scanned[k] ?? "")) k -= 1;
+  return REGEX_KEYWORDS.has(scanned.slice(k + 1, j + 1).join(""));
+}
+
+/**
+ * Replaces the CONTENT of comments, string/template literals and regex literals with spaces,
+ * keeping every offset and line break, so a match in `code` is a real identifier at a real line
+ * number.
+ *
+ * Two rules keep this honest rather than merely convenient:
+ *
+ *  - An unterminated `'` or `"` FAILS CLOSED — it swallows the rest of its LINE and no more.
+ *    Scanning to EOF (which is what an unmatched apostrophe in `// don't` used to do before
+ *    comments were stripped first, and what any future stray quote would do) blanks the whole
+ *    remainder of the file, and every guard downstream then passes by finding nothing. A guard
+ *    that goes quiet on malformed input is the one failure mode a guard may not have.
+ *  - Regex literals are recognized, because `/^[^"]+$/` contains a quote that would otherwise
+ *    open a string and blank everything to the end of the line.
  */
 export function blankOutNonCode(source: string): string {
   const out = source.split("");
@@ -85,17 +134,55 @@ export function blankOutNonCode(source: string): string {
     }
     const ch = source[i];
     if (ch === '"' || ch === "'" || ch === "`") {
+      // Only a template literal may cross a newline; for the other two, the line end is a
+      // terminator that fails closed.
+      const multiline = ch === "`";
       let j = i + 1;
+      let closed = false;
       while (j < source.length) {
-        if (source[j] === "\\") {
+        const c = source[j];
+        if (c === "\\") {
           j += 2;
           continue;
         }
-        if (source[j] === ch) break;
+        if (!multiline && c === "\n") break;
+        if (c === ch) {
+          closed = true;
+          break;
+        }
         j += 1;
       }
       blank(i + 1, j);
-      i = Math.min(j + 1, source.length);
+      i = closed ? j + 1 : j; // unterminated: resume AT the newline, not past it
+      continue;
+    }
+    if (ch === "/" && startsRegex(out, i)) {
+      let j = i + 1;
+      let inClass = false;
+      let closed = false;
+      while (j < source.length) {
+        const c = source[j];
+        if (c === "\\") {
+          j += 2;
+          continue;
+        }
+        if (c === "\n") break; // a regex literal cannot span lines
+        if (c === "[") inClass = true;
+        else if (c === "]") inClass = false;
+        else if (c === "/" && !inClass) {
+          closed = true;
+          break;
+        }
+        j += 1;
+      }
+      if (closed) {
+        blank(i + 1, j);
+        i = j + 1;
+        continue;
+      }
+      // Not a regex after all — the heuristic guessed wrong, so leave the `/` as division and
+      // blank nothing.
+      i += 1;
       continue;
     }
     i += 1;

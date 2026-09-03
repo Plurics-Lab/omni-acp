@@ -252,9 +252,30 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
     error: null,
   };
 
+  // Identity first, then order.
+  //
+  // An envelope IS its `(workerId, seq)` pair: `seq` is 1-based, gap-free and strictly
+  // increasing PER WORKER (ids.ts), so the number alone is not an identity once a replay union
+  // carries two workers' logs in one buffer. Everything else — `ts`, `payload` — is derived.
+  //
+  // De-duplication is not defensive tidying, it is required for the "same envelopes in ⇒
+  // deep-equal result out" contract to survive the way callers actually build a buffer: a
+  // client that concatenates a `?since=` replay onto the live tail it was already holding
+  // overlaps by construction, and a twice-folded buffer concatenates `text` twice and grows a
+  // phantom `interactions` row. FIRST occurrence wins, so the fold is stable under any amount
+  // of re-delivery.
+  const seen = new Set<string>();
+  const unique: EventEnvelope[] = [];
+  for (const e of envelopes) {
+    const identity = `${e.workerId}\u0000${e.seq}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    unique.push(e);
+  }
+
   // Seq order, always — the caller may hand us a replay union or an out-of-order buffer, and
   // text concatenation and tool-call status are both order-dependent.
-  const ordered = [...envelopes].sort((a, b) => a.seq - b.seq);
+  const ordered = unique.sort((a, b) => a.seq - b.seq);
 
   for (const e of ordered) {
     const mine = e.turnId === turnId;
@@ -364,6 +385,9 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
  *
  * A turn is terminal on `state_update{idle}` for that turnId OR on any
  * `omni.worker_state{state:"closed"}` — see CONTRACTS.md §7.3.
+ *
+ * An envelope's identity is its `(workerId, seq)` pair, and repeats fold ONCE: handing in a
+ * `?since=` replay that overlaps a tail already held is a normal thing for a caller to do.
  *
  * MUST NOT read `messageId` (CONTRACTS.md F3).
  */

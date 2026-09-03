@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { HEADER, OmniError, type Daemon, type WorkerSnapshot } from "@omni-acp/protocol";
+import {
+  HEADER,
+  OmniError,
+  type Daemon,
+  type WorkerRegistry,
+  type WorkerSnapshot,
+} from "@omni-acp/protocol";
 import { stubDaemon } from "@omni-acp/testkit";
 
 const bearer = (secret: string): Headers => new Headers({ [HEADER.auth]: `Bearer ${secret}` });
@@ -64,6 +70,61 @@ describe("stubDaemon", () => {
     const auth = daemon.authContextFor("t");
     expect(daemon.workers.snapshot(`w_${"0".repeat(26)}`, auth)).toBe(snapshot);
     expect(daemon.calls.map((c) => c.method)).toEqual(["authContextFor", "workers.snapshot"]);
+  });
+
+  it("records a CLASS-based override, whose methods live on the prototype", () => {
+    // `Object.keys` on a class instance returns its FIELDS and nothing else, so a facade built
+    // from own enumerable keys alone drops every method and records zero calls — while the test
+    // it was written for still passes, because the override keeps working through the untouched
+    // reference. `calls` is the assertion WP-5 leans on, so it has to see this.
+    const snap = { workerId: `w_${"0".repeat(26)}`, state: "ready" } as unknown as WorkerSnapshot;
+
+    class FakeRegistry {
+      readonly seen: string[] = [];
+      /** A prototype ACCESSOR, not a field: the other thing `Object.keys` cannot see. */
+      get size(): number {
+        return this.seen.length;
+      }
+      snapshot(): WorkerSnapshot {
+        this.seen.push("snapshot");
+        return snap;
+      }
+      list(): WorkerSnapshot[] {
+        return [snap];
+      }
+    }
+
+    const registry = new FakeRegistry();
+    const daemon = stubDaemon({ workers: registry as unknown as WorkerRegistry });
+    const auth = daemon.authContextFor("t");
+
+    expect(daemon.workers.snapshot(`w_${"0".repeat(26)}`, auth)).toBe(snap);
+    expect(daemon.workers.list(auth)).toEqual([snap]);
+    expect(daemon.calls.map((c) => c.method)).toEqual([
+      "authContextFor",
+      "workers.snapshot",
+      "workers.list",
+    ]);
+    // `this` still resolves to the instance, so the override's own state is intact...
+    expect(registry.seen).toEqual(["snapshot"]);
+    // ...and the accessor reads LIVE rather than being frozen at construction time.
+    expect(daemon.workers.size).toBe(1);
+  });
+
+  it("keeps a class instance passed as the whole override, prototype methods and all", () => {
+    class FakeDaemon {
+      readonly stopped: boolean[] = [];
+      stop(opts?: { graceful?: boolean }): Promise<void> {
+        this.stopped.push(opts?.graceful === true);
+        return Promise.resolve();
+      }
+    }
+    const override = new FakeDaemon();
+    const daemon = stubDaemon(override as unknown as Partial<Daemon>);
+    return daemon.stop({ graceful: true }).then(() => {
+      expect(override.stopped).toEqual([true]);
+      expect(daemon.calls.map((c) => c.method)).toEqual(["stop"]);
+    });
   });
 
   it("authenticates a bearer header and rejects a missing one", () => {
