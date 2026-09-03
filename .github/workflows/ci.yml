@@ -45,7 +45,11 @@ jobs:
 
       - run: pnpm -r build
 
+      # CONTRACTS.md §10.3's macOS multiplier: the timing budgets in the suites read
+      # OMNI_TEST_SLOW_FACTOR, so the leg that needs it has to actually set it.
       - run: pnpm -r test
+        env:
+          OMNI_TEST_SLOW_FACTOR: ${{ matrix.os == 'macos-latest' && '2' || '1' }}
 
       # Every vitest config writes vitest-report/junit.xml (CONTRACTS.md §10.3), so this glob
       # actually matches on a red run. `warn` rather than `ignore`: a silently empty artifact is

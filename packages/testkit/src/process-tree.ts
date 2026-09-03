@@ -30,8 +30,11 @@ export async function waitGone(pid: number, timeoutMs = 5_000): Promise<boolean>
   for (;;) {
     if (!(await isAlive(pid))) return true;
     if (Date.now() >= deadline) return false;
+    // Deliberately NOT unref'd: an unref'd poll timer lets Node exit while a caller is still
+    // awaiting this promise ("Detected unsettled top-level await"). The loop is bounded by
+    // `timeoutMs`, so a ref'd timer extends process lifetime by at most one 25ms tick.
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 25).unref?.();
+      setTimeout(resolve, 25);
     });
   }
 }

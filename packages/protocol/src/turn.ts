@@ -268,6 +268,9 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
     // is what stops `prompt()` hanging forever.
     if (e.kind === "omni.worker_state" && e.payload.state === "closed") {
       if (f.startSeq === null) continue; // the close precedes this turn entirely
+      // ANY close from THIS turn's worker — but a replay union can carry another worker's log
+      // into the same buffer, and that worker's death says nothing about this turn.
+      if (f.workerId !== null && e.workerId !== f.workerId) continue;
       f.terminal = "closed";
       f.endSeq = e.seq;
       f.stopReason = null;

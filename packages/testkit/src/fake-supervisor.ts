@@ -36,8 +36,26 @@ const POSIX_OWNERSHIP: PlatformOwnership = {
 /** Obviously synthetic: a four-digit pid would be mistaken for a real one in a failure message. */
 let nextPid = 424_242;
 
-function fakeStderrTail(maxChars: number): StderrTail & { write(s: string): void } {
-  let buffered = "";
+/**
+ * Decodes a byte ring the way CONTRACTS.md contracts.ts:112 specifies: an incomplete rune at
+ * either end is hidden rather than surfaced as U+FFFD or a lone surrogate.
+ */
+function decodeTail(buf: Buffer): string {
+  let start = 0;
+  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start += 1; // dangling continuation
+  let end = buf.length;
+  for (let i = end - 1; i >= start && end - i <= 4; i -= 1) {
+    const b = buf[i]!;
+    if ((b & 0xc0) === 0x80) continue; // a continuation byte: keep walking back to its lead
+    const needed = b < 0x80 ? 1 : (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : 4;
+    if (needed > end - i) end = i; // the rune's tail bytes have not arrived
+    break;
+  }
+  return new TextDecoder("utf-8").decode(buf.subarray(start, end));
+}
+
+function fakeStderrTail(maxBytes: number): StderrTail & { write(s: string): void } {
+  let buffered = Buffer.alloc(0);
   let pendingLine = "";
   let finalized = false;
   const listeners = new Set<(line: string) => void>();
@@ -48,7 +66,10 @@ function fakeStderrTail(maxChars: number): StderrTail & { write(s: string): void
 
   return {
     write(s: string): void {
-      buffered = (buffered + s).slice(-maxChars);
+      // BYTES, not UTF-16 code units: `stderrTailBytes` is a byte budget, and slicing a string
+      // can also cut a surrogate pair in half.
+      const next = Buffer.concat([buffered, Buffer.from(s, "utf8")]);
+      buffered = next.length > maxBytes ? next.subarray(next.length - maxBytes) : next;
       pendingLine += s;
       for (;;) {
         const at = pendingLine.indexOf("\n");
@@ -57,7 +78,7 @@ function fakeStderrTail(maxChars: number): StderrTail & { write(s: string): void
         pendingLine = pendingLine.slice(at + 1);
       }
     },
-    snapshot: () => buffered,
+    snapshot: () => decodeTail(buffered),
     onLine(cb) {
       listeners.add(cb);
       return () => listeners.delete(cb);

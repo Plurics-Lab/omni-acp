@@ -94,7 +94,11 @@ export async function collectSse(
     while (!satisfied) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      // Normalize over the ACCUMULATED buffer, not the chunk: a \r\n split across a chunk
+      // boundary would otherwise survive and the frame terminator would never match. Lone \r is
+      // deliberately left alone here — collapsing it eagerly would turn a boundary-split \r into
+      // a spurious terminator.
+      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
       for (;;) {
         const at = buffer.indexOf("\n\n");
         if (at === -1) break;

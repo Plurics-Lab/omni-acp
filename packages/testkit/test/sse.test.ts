@@ -109,4 +109,21 @@ describe("collectSse", () => {
     const { envelopes } = await collectSse(new Response(stream), { count: 2 });
     expect(envelopes.map((e) => e.seq)).toEqual([1, 2]);
   });
+
+  it("collapses a CRLF terminator split across chunk boundaries", async () => {
+    const text = frame(envelope(1)).replace(/\n/g, "\r\n");
+    const encoder = new TextEncoder();
+    // The cut lands between the terminator's final \r and its \n: normalizing per chunk would
+    // leave "\n\r" + "\n" in the buffer and the frame would never be emitted.
+    const cut = text.length - 1;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(text.slice(0, cut)));
+        controller.enqueue(encoder.encode(text.slice(cut)));
+        controller.close();
+      },
+    });
+    const { envelopes } = await collectSse(new Response(stream), { count: 1 });
+    expect(envelopes.map((e) => e.seq)).toEqual([1]);
+  });
 });

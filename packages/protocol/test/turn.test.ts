@@ -92,6 +92,30 @@ describe("reduceTurn edge cases", () => {
     expect(status.result?.error).toBeNull();
   });
 
+  it("ignores a mid-turn close belonging to a DIFFERENT worker", () => {
+    const OTHER_W = `w_${"1".repeat(26)}` as WorkerId;
+    // Built in seq order: the close must land INSIDE the turn, not before its first envelope.
+    const start = running();
+    const foreignClose = {
+      ...env(
+        {
+          kind: "omni.worker_state",
+          payloadVersion: 2,
+          payload: { state: "closed", previous: "running", reason: "agent_crashed" },
+        },
+        null,
+      ),
+      workerId: OTHER_W,
+    } as EventEnvelope;
+    // The close is stamped with another worker's id: it ends THAT worker's turns, not this one.
+    const envelopes = [start, foreignClose, chunk("after"), idle("end_turn")];
+    const status = turnStatus(T, envelopes);
+    expect(status.state).toBe("completed");
+    expect(status.result?.text).toBe("after");
+    expect(status.result?.error).toBeNull();
+    expect(status.stopReason).toBe("end_turn");
+  });
+
   it("stops at the FIRST terminal envelope and ignores everything after it", () => {
     const envelopes = [
       running(),

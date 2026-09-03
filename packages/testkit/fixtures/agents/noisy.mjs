@@ -6,7 +6,8 @@
 // and the crash classifier.
 //
 // Env: NOISY_FRAME_BYTES (default 65536 — a test sets `maxFrameBytes` BELOW this),
-//      NOISY_STDERR_BYTES (default 1 MiB), NOISY_EXIT_MID_TURN=1 (exit 3 instead of answering).
+//      NOISY_STDERR_BYTES (default 1 MiB), NOISY_EXIT_MID_TURN=1 (exit 3 instead of answering),
+//      NOISY_STDOUT_GARBAGE=1 (a banner and a non-JSON line on stdout before any frame).
 import * as acp from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
 
@@ -52,3 +53,10 @@ acp
   })
   .onNotification("session/cancel", () => {})
   .connect(stream);
+
+// Opt-in, default off so no existing test changes behaviour: a startup banner and a stray
+// non-JSON line on stdout — the classic ndJSON-reader hazard. Not part of CONTRACTS.md line
+// 1212's noisy row; an affordance for WP-2's frame reader.
+if (process.env.NOISY_STDOUT_GARBAGE === "1") {
+  process.stdout.write("starting up...\n{not json\n\n");
+}

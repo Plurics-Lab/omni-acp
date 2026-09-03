@@ -139,6 +139,18 @@ describe("fakeSupervisor", () => {
     await p.terminate({ force: true });
   });
 
+  it("caps the stderr tail in BYTES and hides a partial leading rune", async () => {
+    const sup = fakeSupervisor();
+    const p = (await sup.spawn(spec({ stderrTailBytes: 16 }))) as FakeAgentProcess;
+    p.writeStderr("ノイズ".repeat(4)); // 12 runes, 36 bytes
+    const snap = p.stderr.snapshot();
+    expect(Buffer.byteLength(snap, "utf8")).toBeLessThanOrEqual(16);
+    // 16 bytes hold 5 whole 3-byte runes; the 6th is partial and must not surface as U+FFFD.
+    expect(snap).toBe("イズノイズ");
+    expect(snap).not.toContain("\uFFFD");
+    await p.terminate({ force: true });
+  });
+
   it("shutdown() reclaims every live tree", async () => {
     const sup = fakeSupervisor();
     await sup.spawn(spec());
