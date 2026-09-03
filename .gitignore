@@ -7,3 +7,4 @@ vitest-report/
 *.log
 .DS_Store
 .omni-acp/
+.claude/
