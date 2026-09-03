@@ -1,0 +1,213 @@
+[
+  {
+    "seq": 1,
+    "ts": "2026-09-03T12:00:00.100Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": null,
+    "turnId": null,
+    "payloadVersion": 2,
+    "kind": "omni.worker_state",
+    "payload": {
+      "state": "starting",
+      "previous": null,
+      "reason": "created"
+    }
+  },
+  {
+    "seq": 2,
+    "ts": "2026-09-03T12:00:00.200Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": null,
+    "turnId": null,
+    "payloadVersion": 2,
+    "kind": "omni.worker_state",
+    "payload": {
+      "state": "ready",
+      "previous": "starting",
+      "reason": "handshake_ok"
+    }
+  },
+  {
+    "seq": 3,
+    "ts": "2026-09-03T12:00:00.300Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "state_update",
+      "state": "running"
+    }
+  },
+  {
+    "seq": 4,
+    "ts": "2026-09-03T12:00:00.400Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+        "type": "text",
+        "text": "I'll help you with that."
+      }
+    }
+  },
+  {
+    "seq": 5,
+    "ts": "2026-09-03T12:00:00.500Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_2",
+      "title": "Modifying critical configuration file",
+      "kind": "edit",
+      "status": "pending"
+    }
+  },
+  {
+    "seq": 6,
+    "ts": "2026-09-03T12:00:00.600Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.interaction",
+    "payload": {
+      "requestId": "req-1",
+      "method": "session/request_permission",
+      "request": {
+        "sessionId": "sess-abc",
+        "toolCall": {
+          "toolCallId": "call_2",
+          "title": "Modifying critical configuration file"
+        },
+        "options": [
+          {
+            "kind": "allow_once",
+            "name": "Allow this change",
+            "optionId": "allow"
+          },
+          {
+            "kind": "reject_once",
+            "name": "Skip this change",
+            "optionId": "reject"
+          }
+        ]
+      },
+      "status": "pending"
+    }
+  },
+  {
+    "seq": 7,
+    "ts": "2026-09-03T12:00:00.700Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.interaction",
+    "payload": {
+      "requestId": "req-1",
+      "method": "session/request_permission",
+      "request": {
+        "sessionId": "sess-abc",
+        "toolCall": {
+          "toolCallId": "call_2",
+          "title": "Modifying critical configuration file"
+        },
+        "options": [
+          {
+            "kind": "allow_once",
+            "name": "Allow this change",
+            "optionId": "allow"
+          },
+          {
+            "kind": "reject_once",
+            "name": "Skip this change",
+            "optionId": "reject"
+          }
+        ]
+      },
+      "status": "answered",
+      "answer": {
+        "optionId": "reject",
+        "by": "baseline"
+      }
+    }
+  },
+  {
+    "seq": 8,
+    "ts": "2026-09-03T12:00:00.800Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "omni.policy_decision",
+    "payload": {
+      "requestId": "req-1",
+      "title": "Modifying critical configuration file",
+      "decision": "deny",
+      "rule": "m0:auto-deny",
+      "optionId": "reject",
+      "offered": [
+        {
+          "kind": "allow_once",
+          "name": "Allow this change",
+          "optionId": "allow"
+        },
+        {
+          "kind": "reject_once",
+          "name": "Skip this change",
+          "optionId": "reject"
+        }
+      ]
+    }
+  },
+  {
+    "seq": 9,
+    "ts": "2026-09-03T12:00:00.900Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "agent_message_chunk",
+      "content": {
+        "type": "text",
+        "text": " I'll skip the configuration update."
+      }
+    }
+  },
+  {
+    "seq": 10,
+    "ts": "2026-09-03T12:00:01.000Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "state_update",
+      "state": "idle",
+      "stopReason": "end_turn"
+    }
+  }
+]

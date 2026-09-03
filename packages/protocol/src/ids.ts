@@ -29,32 +29,89 @@ export const ID_PATTERN: {
 };
 
 export function isDaemonId(s: string): s is DaemonId {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.isDaemonId)");
+  return ID_PATTERN.daemon.test(s);
 }
 
 export function isWorkerId(s: string): s is WorkerId {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.isWorkerId)");
+  return ID_PATTERN.worker.test(s);
 }
 
 export function isTurnId(s: string): s is TurnId {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.isTurnId)");
+  return ID_PATTERN.turn.test(s);
 }
 
-/** Throws OmniError("bad_request") with the offending value elided from the message. */
+/**
+ * Throws OmniError("bad_request") with the offending value ELIDED from the message: the id
+ * arrives from the wire, and echoing it back is how a reflected-value log line is born. The
+ * value is kept in `detail`, which never crosses the wire (CONTRACTS.md §5.1 errors.ts).
+ */
 export function assertWorkerId(s: string): WorkerId {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.assertWorkerId)");
+  if (isWorkerId(s)) return s;
+  throw new OmniError("bad_request", "malformed worker id", { detail: { value: s } });
 }
 
 export function assertTurnId(s: string): TurnId {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.assertTurnId)");
+  if (isTurnId(s)) return s;
+  throw new OmniError("bad_request", "malformed turn id", { detail: { value: s } });
 }
 
 export function workerRef(d: DaemonId, w: WorkerId): WorkerRef {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.workerRef)");
+  return `${d}:${w}`;
 }
 
 export function parseWorkerRef(ref: string): { daemonId: DaemonId; workerId: WorkerId } {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.parseWorkerRef)");
+  const at = ref.indexOf(":");
+  const daemonId = at === -1 ? "" : ref.slice(0, at);
+  const workerId = at === -1 ? "" : ref.slice(at + 1);
+  if (!isDaemonId(daemonId) || !isWorkerId(workerId)) {
+    throw new OmniError("bad_request", "malformed worker ref", { detail: { value: ref } });
+  }
+  return { daemonId, workerId };
+}
+
+// ── ULID ─────────────────────────────────────────────────────────────────────
+//
+// Crockford base32, 26 characters: 10 of millisecond timestamp, 16 of randomness. Monotonic
+// within a millisecond by incrementing the random field, which is what makes ids sort in
+// creation order inside one process.
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const TIME_LEN = 10;
+const RANDOM_LEN = 16;
+
+function encodeTime(ms: number): string {
+  let n = Number.isFinite(ms) && ms > 0 ? Math.floor(ms) : 0;
+  const out = new Array<string>(TIME_LEN);
+  for (let i = TIME_LEN - 1; i >= 0; i--) {
+    const mod = n % 32;
+    out[i] = CROCKFORD[mod] ?? "0";
+    n = (n - mod) / 32;
+  }
+  return out.join("");
+}
+
+/** Uniform in [0, 1). Web Crypto is in Node's global scope from 19 onward, so no import. */
+function defaultRandom(): number {
+  const buf = new Uint32Array(1);
+  globalThis.crypto.getRandomValues(buf);
+  return (buf[0] ?? 0) / 2 ** 32;
+}
+
+function randomIndex(random: () => number): number {
+  const v = Math.floor(random() * 32);
+  return v < 0 ? 0 : v > 31 ? 31 : v;
+}
+
+/** Base-32 +1 with carry, in place. A full overflow wraps to all zeros; it needs 2^80 ids/ms. */
+function incrementRandom(digits: number[]): void {
+  for (let i = digits.length - 1; i >= 0; i--) {
+    const d = digits[i] ?? 0;
+    if (d < 31) {
+      digits[i] = d + 1;
+      return;
+    }
+    digits[i] = 0;
+  }
 }
 
 /**
@@ -66,5 +123,31 @@ export function parseWorkerRef(ref: string): { daemonId: DaemonId; workerId: Wor
  * SDK and zod, nothing else).
  */
 export function createIdGen(opts?: { now?: () => number; random?: () => number }): IdGen {
-  throw new OmniError("internal", "unimplemented: WP-1 (ids.createIdGen)");
+  const now = opts?.now ?? Date.now;
+  const random = opts?.random ?? defaultRandom;
+
+  let lastTime = -1;
+  let lastRandom: number[] = [];
+
+  const next = (): string => {
+    const t = Math.max(0, Math.floor(now()));
+    if (t <= lastTime && lastRandom.length === RANDOM_LEN) {
+      // Same millisecond (or a clock that stepped backwards): keep the timestamp and bump the
+      // random field, so ids stay strictly increasing as strings.
+      incrementRandom(lastRandom);
+    } else {
+      lastTime = t;
+      lastRandom = Array.from({ length: RANDOM_LEN }, () => randomIndex(random));
+    }
+    let body = encodeTime(lastTime);
+    for (const d of lastRandom) body += CROCKFORD[d] ?? "0";
+    return body;
+  };
+
+  return {
+    daemon: () => `d_${next()}`,
+    worker: () => `w_${next()}`,
+    turn: () => `t_${next()}`,
+    request: () => next(),
+  };
 }

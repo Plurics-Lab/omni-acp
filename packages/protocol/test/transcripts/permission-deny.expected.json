@@ -1,0 +1,38 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": "end_turn",
+    "text": "I'll help you with that. I'll skip the configuration update.",
+    "toolCalls": [
+      {
+        "toolCallId": "call_2",
+        "title": "Modifying critical configuration file",
+        "kind": "edit",
+        "status": "pending",
+        "locations": [],
+        "content": []
+      }
+    ],
+    "changes": [],
+    "patch": null,
+    "interactions": [
+      {
+        "requestId": "req-1",
+        "title": "Modifying critical configuration file",
+        "decision": "deny",
+        "optionId": "reject",
+        "rule": "m0:auto-deny",
+        "at": "2026-09-03T12:00:00.800Z"
+      }
+    ],
+    "error": null
+  },
+  "status": {
+    "state": "completed",
+    "startSeq": 3,
+    "endSeq": 10,
+    "stopReason": "end_turn"
+  }
+}

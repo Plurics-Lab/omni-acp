@@ -1,0 +1,29 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": null,
+    "text": "partial answer",
+    "toolCalls": [
+      {
+        "toolCallId": "call_1",
+        "title": "Working",
+        "kind": null,
+        "status": "in_progress",
+        "locations": [],
+        "content": []
+      }
+    ],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": null
+  },
+  "status": {
+    "state": "running",
+    "startSeq": 3,
+    "endSeq": null,
+    "stopReason": null
+  }
+}

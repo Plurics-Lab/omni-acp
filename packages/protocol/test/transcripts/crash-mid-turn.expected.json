@@ -1,0 +1,23 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": null,
+    "text": "starting work",
+    "toolCalls": [],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": {
+      "code": "agent_error",
+      "message": "agent exited during a turn"
+    }
+  },
+  "status": {
+    "state": "failed",
+    "startSeq": 3,
+    "endSeq": 6,
+    "stopReason": null
+  }
+}

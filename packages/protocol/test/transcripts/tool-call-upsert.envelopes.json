@@ -1,0 +1,141 @@
+[
+  {
+    "seq": 1,
+    "ts": "2026-09-03T12:00:00.100Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": null,
+    "turnId": null,
+    "payloadVersion": 2,
+    "kind": "omni.worker_state",
+    "payload": {
+      "state": "starting",
+      "previous": null,
+      "reason": "created"
+    }
+  },
+  {
+    "seq": 2,
+    "ts": "2026-09-03T12:00:00.200Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": null,
+    "turnId": null,
+    "payloadVersion": 2,
+    "kind": "omni.worker_state",
+    "payload": {
+      "state": "ready",
+      "previous": "starting",
+      "reason": "handshake_ok"
+    }
+  },
+  {
+    "seq": 3,
+    "ts": "2026-09-03T12:00:00.300Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "state_update",
+      "state": "running"
+    }
+  },
+  {
+    "seq": 4,
+    "ts": "2026-09-03T12:00:00.400Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_a",
+      "title": "First",
+      "kind": "read",
+      "status": "pending"
+    }
+  },
+  {
+    "seq": 5,
+    "ts": "2026-09-03T12:00:00.500Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_a",
+      "status": "in_progress"
+    }
+  },
+  {
+    "seq": 6,
+    "ts": "2026-09-03T12:00:00.600Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_a",
+      "status": null,
+      "title": null
+    }
+  },
+  {
+    "seq": 7,
+    "ts": "2026-09-03T12:00:00.700Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_a",
+      "status": "completed",
+      "title": "First, renamed"
+    }
+  },
+  {
+    "seq": 8,
+    "ts": "2026-09-03T12:00:00.800Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_b",
+      "status": "pending",
+      "title": "Introduced by an update"
+    }
+  },
+  {
+    "seq": 9,
+    "ts": "2026-09-03T12:00:00.900Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "state_update",
+      "state": "idle",
+      "stopReason": "end_turn"
+    }
+  }
+]

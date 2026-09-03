@@ -1,0 +1,47 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": "end_turn",
+    "text": "Hello, world.",
+    "toolCalls": [
+      {
+        "toolCallId": "call_1",
+        "title": "Reading project files",
+        "kind": "read",
+        "status": "completed",
+        "locations": [
+          {
+            "path": "/project/README.md"
+          }
+        ],
+        "content": [
+          {
+            "type": "content",
+            "content": {
+              "type": "text",
+              "text": "# My Project"
+            }
+          }
+        ],
+        "rawInput": {
+          "path": "/project/README.md"
+        },
+        "rawOutput": {
+          "content": "# My Project"
+        }
+      }
+    ],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": null
+  },
+  "status": {
+    "state": "completed",
+    "startSeq": 3,
+    "endSeq": 8,
+    "stopReason": "end_turn"
+  }
+}

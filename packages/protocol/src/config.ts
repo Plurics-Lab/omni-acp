@@ -1,5 +1,5 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { OmniError } from "./errors.js";
 
 export const TokenConfig = z
   .object({
@@ -112,12 +112,21 @@ export const DaemonConfig = z.strictObject({
 export type DaemonConfig = z.input<typeof DaemonConfig>;
 export type ResolvedDaemonConfig = z.output<typeof DaemonConfig>;
 
-/** sha256 hex. */
+/** Plain sha256, lower-case hex. The one hashing function in the repository (DESIGN §8). */
 export function hashSecret(secret: string): string {
-  throw new OmniError("internal", "unimplemented: WP-1 (config.hashSecret)");
+  return createHash("sha256").update(secret, "utf8").digest("hex");
 }
 
-/** timingSafeEqual over the hex digests. */
+/**
+ * Constant-time comparison of `sha256(secret)` against a stored digest.
+ *
+ * `timingSafeEqual` throws on a length mismatch, which would itself be a timing signal, so the
+ * lengths are compared first and a malformed stored digest is simply `false`. Both operands are
+ * the ASCII bytes of the hex digests: decoding first would silently accept a truncated digest.
+ */
 export function verifySecret(secret: string, sha256Hex: string): boolean {
-  throw new OmniError("internal", "unimplemented: WP-1 (config.verifySecret)");
+  const actual = Buffer.from(hashSecret(secret), "ascii");
+  const expected = Buffer.from(sha256Hex.toLowerCase(), "ascii");
+  if (actual.length !== expected.length) return false;
+  return timingSafeEqual(actual, expected);
 }

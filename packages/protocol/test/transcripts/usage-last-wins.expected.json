@@ -1,0 +1,28 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": "end_turn",
+    "text": "thinking",
+    "toolCalls": [],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": null,
+    "usage": {
+      "used": 42,
+      "size": 200,
+      "cost": {
+        "amount": 0.12,
+        "currency": "USD"
+      }
+    }
+  },
+  "status": {
+    "state": "completed",
+    "startSeq": 3,
+    "endSeq": 7,
+    "stopReason": "end_turn"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": "end_turn",
+    "text": "one two three",
+    "toolCalls": [],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": null
+  },
+  "status": {
+    "state": "completed",
+    "startSeq": 3,
+    "endSeq": 8,
+    "stopReason": "end_turn"
+  }
+}

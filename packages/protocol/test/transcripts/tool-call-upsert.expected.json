@@ -1,0 +1,37 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": "end_turn",
+    "text": "",
+    "toolCalls": [
+      {
+        "toolCallId": "call_a",
+        "title": "First, renamed",
+        "kind": "read",
+        "status": "completed",
+        "locations": [],
+        "content": []
+      },
+      {
+        "toolCallId": "call_b",
+        "title": "Introduced by an update",
+        "kind": null,
+        "status": "pending",
+        "locations": [],
+        "content": []
+      }
+    ],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": null
+  },
+  "status": {
+    "state": "completed",
+    "startSeq": 3,
+    "endSeq": 9,
+    "stopReason": "end_turn"
+  }
+}

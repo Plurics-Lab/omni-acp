@@ -1,0 +1,30 @@
+{
+  "turnId": "t_00000000000000000000000001",
+  "result": {
+    "turnId": "t_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "stopReason": null,
+    "text": "",
+    "toolCalls": [],
+    "changes": [],
+    "patch": null,
+    "interactions": [],
+    "error": {
+      "code": "agent_error",
+      "message": "session/prompt failed",
+      "acp": {
+        "code": -32000,
+        "message": "model unavailable",
+        "data": {
+          "retryAfter": 30
+        }
+      }
+    }
+  },
+  "status": {
+    "state": "failed",
+    "startSeq": 3,
+    "endSeq": 5,
+    "stopReason": null
+  }
+}

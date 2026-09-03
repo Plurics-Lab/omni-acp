@@ -1,3 +1,5 @@
+import { AcpRequestError } from "./acp.js";
+
 /** Exactly DESIGN §5.4. No additions — see CONTRACTS.md §11 D29. */
 export const OMNI_ERROR_CODES = [
   "bad_request",
@@ -51,12 +53,29 @@ export interface OmniErrorBody {
   acp?: AcpErrorDetail;
 }
 
+/** True for the AbortController / AbortSignal.timeout families, cross-realm. */
+function isAbortLike(e: unknown): boolean {
+  if (typeof e !== "object" || e === null) return false;
+  const name = (e as { name?: unknown }).name;
+  const code = (e as { code?: unknown }).code;
+  return name === "AbortError" || name === "TimeoutError" || code === "ABORT_ERR";
+}
+
+function messageOf(e: unknown, fallback: string): string {
+  if (typeof e === "string" && e.length > 0) return e;
+  if (typeof e === "object" && e !== null) {
+    const m = (e as { message?: unknown }).message;
+    if (typeof m === "string" && m.length > 0) return m;
+  }
+  return fallback;
+}
+
 /**
  * The repository's one error type.
  *
  * The constructor is real even in the scaffold: every other stub in the repository throws
  * `new OmniError("internal", "unimplemented: WP-n")`, so a throwing constructor would make the
- * scaffold unable to describe itself. The behavioural members below are WP-1's.
+ * scaffold unable to describe itself.
  */
 export class OmniError extends Error {
   readonly code: OmniErrorCode;
@@ -78,19 +97,41 @@ export class OmniError extends Error {
     this.detail = opts?.detail;
   }
 
+  /**
+   * The wire body (CONTRACTS.md §9). `detail` is deliberately absent: it is the half of an
+   * OmniError that is logged and never returned. `acp` is present only when there is one, so
+   * two bodies for the same failure are deep-equal.
+   */
   toBody(): OmniErrorBody {
-    throw new OmniError("internal", "unimplemented: WP-1 (errors.OmniError#toBody)");
+    return this.acp === undefined
+      ? { code: this.code, message: this.message }
+      : { code: this.code, message: this.message, acp: this.acp };
   }
 
   static is(e: unknown, code?: OmniErrorCode): e is OmniError {
-    throw new OmniError("internal", "unimplemented: WP-1 (errors.OmniError.is)");
+    return e instanceof OmniError && (code === undefined || e.code === code);
   }
 
   /**
    * Never throws. `acp.RequestError` -> agent_error carrying `acp`;
-   * AbortError/TimeoutError -> agent_timeout; OmniError -> itself; anything else -> internal.
+   * AbortError/TimeoutError -> agent_timeout; OmniError -> itself; anything else -> `fallback`
+   * (default `internal`).
    */
   static from(e: unknown, fallback?: OmniErrorCode): OmniError {
-    throw new OmniError("internal", "unimplemented: WP-1 (errors.OmniError.from)");
+    if (e instanceof OmniError) return e;
+
+    if (e instanceof AcpRequestError) {
+      const acp: AcpErrorDetail =
+        e.data === undefined
+          ? { code: e.code, message: e.message }
+          : { code: e.code, message: e.message, data: e.data };
+      return new OmniError("agent_error", e.message, { acp, cause: e });
+    }
+
+    if (isAbortLike(e)) {
+      return new OmniError("agent_timeout", messageOf(e, "aborted"), { cause: e });
+    }
+
+    return new OmniError(fallback ?? "internal", messageOf(e, "internal error"), { cause: e });
   }
 }

@@ -1,0 +1,140 @@
+[
+  {
+    "seq": 1,
+    "ts": "2026-09-03T12:00:00.100Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": null,
+    "turnId": null,
+    "payloadVersion": 2,
+    "kind": "omni.worker_state",
+    "payload": {
+      "state": "starting",
+      "previous": null,
+      "reason": "created"
+    }
+  },
+  {
+    "seq": 2,
+    "ts": "2026-09-03T12:00:00.200Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": null,
+    "turnId": null,
+    "payloadVersion": 2,
+    "kind": "omni.worker_state",
+    "payload": {
+      "state": "ready",
+      "previous": "starting",
+      "reason": "handshake_ok"
+    }
+  },
+  {
+    "seq": 3,
+    "ts": "2026-09-03T12:00:00.300Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "state_update",
+      "state": "running"
+    }
+  },
+  {
+    "seq": 4,
+    "ts": "2026-09-03T12:00:00.400Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_1",
+      "title": "Edit a",
+      "kind": "edit",
+      "status": "pending",
+      "content": [
+        {
+          "type": "diff",
+          "path": "/repo/a.ts",
+          "oldText": "old",
+          "newText": "new"
+        }
+      ]
+    }
+  },
+  {
+    "seq": 5,
+    "ts": "2026-09-03T12:00:00.500Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_2",
+      "title": "Create b",
+      "kind": "edit",
+      "status": "completed",
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "note"
+          }
+        },
+        {
+          "type": "diff",
+          "path": "/repo/b.ts",
+          "newText": "created"
+        }
+      ]
+    }
+  },
+  {
+    "seq": 6,
+    "ts": "2026-09-03T12:00:00.600Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 1,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_1",
+      "status": "completed",
+      "content": [
+        {
+          "type": "diff",
+          "path": "/repo/a.ts",
+          "oldText": "old2",
+          "newText": "new2"
+        }
+      ]
+    }
+  },
+  {
+    "seq": 7,
+    "ts": "2026-09-03T12:00:00.700Z",
+    "daemonId": "d_00000000000000000000000001",
+    "workerId": "w_00000000000000000000000001",
+    "sessionId": "sess-abc",
+    "turnId": "t_00000000000000000000000001",
+    "payloadVersion": 2,
+    "kind": "acp.session_update",
+    "payload": {
+      "sessionUpdate": "state_update",
+      "state": "idle",
+      "stopReason": "end_turn"
+    }
+  }
+]
