@@ -140,6 +140,47 @@ describe("crash mid-turn (WP-4 acceptance 8)", () => {
     expect(h.log.all.some(isIdle)).toBe(false);
   });
 
+  it("never fabricates an idle when the prompt rejects with no JSON-RPC code and the agent is gone", async () => {
+    // §6.7's rule — "an in-flight RPC that rejects with a plain Error is a dead transport; do not
+    // classify from it" — was guarded only by `#linkClosed`, which is set from a `.then()` on the
+    // SDK's `connection.closed`. That made §7.3 depend on the SDK resolving `closed` BEFORE it
+    // rejects pending requests. It does today (probed against the pinned 1.4.0), but nothing in
+    // this repo owns that ordering, and the cost if it inverted is a fabricated clean turn end
+    // for a dead process — plus a second `prompt()` admitted against a corpse.
+    //
+    // So the process signals are made to arrive FIRST here: `stdoutEnded` settles while the
+    // memory stream is still open (a `controlledProcess` settles the two independently, which is
+    // exactly the grandchild-holds-the-pipe shape), and only then is the transport torn down.
+    // Whatever order the SDK rejects in, the worker has already observed that the agent is gone.
+    const h = harness();
+    const agent = scriptedAgent();
+    const proc = controlledProcess(agent.stream);
+    const w = await h.create({
+      overrides: { supervisor: fixedSupervisor(proc, h.supervisor.platform) },
+    });
+
+    const accepted = await w.prompt([TEXT("hi")], OWNER);
+    await flush();
+
+    proc.endStdout(); // the agent is gone; the exit-grace timer is armed on the fake clock
+    await flush();
+    agent.die(); // ...and NOW the in-flight session/prompt rejects with a plain Error
+    await flush();
+
+    // Nothing was invented from that rejection: no idle, and the worker did not go back to ready.
+    expect(h.log.all.some(isIdle)).toBe(false);
+    expect(w.snapshot().state).toBe("running");
+    expect(w.snapshot().currentTurnId).toBe(accepted.turnId);
+
+    // The crash classifier still owns the ending, and it is the honest one.
+    h.clock.advance(LIMITS.exitGraceMs);
+    await expect(w.closed).resolves.toMatchObject({ reason: "agent_crashed" });
+    await flush();
+    expect(h.log.all.some(isIdle)).toBe(false);
+    expect(h.log.all.filter((e) => e.kind === "omni.error")).toHaveLength(1);
+    expect(w.turn(accepted.turnId).stopReason).toBeNull();
+  });
+
   it("a crash with no turn in flight still closes honestly, with the error on the state payload", async () => {
     const h = harness();
     h.supervisor.enqueue(asScriptedAgent(rawAgent()));

@@ -301,6 +301,7 @@ const EXPECTED: Record<string, readonly string[]> = {
     "isTurnId",
     "isWorkerId",
     "parseWorkerRef",
+    "redactArgs",
     "reduceTurn",
     "turnStatus",
     "verifySecret",

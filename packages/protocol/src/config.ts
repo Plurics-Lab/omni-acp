@@ -130,3 +130,42 @@ export function verifySecret(secret: string, sha256Hex: string): boolean {
   if (actual.length !== expected.length) return false;
   return timingSafeEqual(actual, expected);
 }
+
+/** Flags whose VALUE never belongs in a snapshot, a log line or an HTTP response. */
+const SECRET_FLAG = /^--?[^=]*(token|secret|password|passwd|api[-_]?key|auth)[^=]*$/i;
+
+/**
+ * Agent argv with anything credential-shaped blanked. ONE rule, in ONE place (DESIGN §8).
+ *
+ * Config-supplied args are trusted input, but they are served over HTTP on two surfaces —
+ * `ProcessInfo.argsRedacted` inside `WorkerSnapshot.process`, and `AgentCatalogEntry.args` from
+ * `GET /v1/agents`, which any bearer token can read regardless of which agents it may USE. A
+ * `--api-key sk-…` in a descriptor must not become an API response on either. It lives here,
+ * beside `hashSecret`/`verifySecret`, because a second copy is how one of the two surfaces
+ * quietly stops redacting.
+ *
+ * Both spellings are covered: `--flag=value` and `--flag value`.
+ */
+export function redactArgs(args: readonly string[]): string[] {
+  const out: string[] = [];
+  let redactNext = false;
+  for (const arg of args) {
+    if (redactNext) {
+      out.push("<redacted>");
+      redactNext = false;
+      continue;
+    }
+    const eq = arg.indexOf("=");
+    if (eq > 0 && SECRET_FLAG.test(arg.slice(0, eq))) {
+      out.push(`${arg.slice(0, eq)}=<redacted>`);
+      continue;
+    }
+    if (eq === -1 && SECRET_FLAG.test(arg)) {
+      out.push(arg);
+      redactNext = true;
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}

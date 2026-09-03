@@ -1,6 +1,7 @@
 import { ndJsonStream } from "@agentclientprotocol/sdk";
 import {
   OmniError,
+  redactArgs,
   type AgentProcess,
   type Clock,
   type Logger,
@@ -63,40 +64,6 @@ export interface SpawnDeps {
    * imported at the call site.
    */
   readonly spawnFn?: typeof spawn;
-}
-
-/** Flags whose VALUE never belongs in a snapshot, a log line or an HTTP response. */
-const SECRET_FLAG = /^--?[^=]*(token|secret|password|passwd|api[-_]?key|auth)[^=]*$/i;
-
-/**
- * `ProcessInfo.argsRedacted` — argv with anything that looks like a credential blanked.
- *
- * Config-supplied args are trusted input, but `WorkerSnapshot.process` is served over HTTP to
- * every client that can see the worker, and a `--api-key sk-…` in an agent descriptor should not
- * become an API response. Both spellings are covered: `--flag=value` and `--flag value`.
- */
-function redactArgs(args: readonly string[]): string[] {
-  const out: string[] = [];
-  let redactNext = false;
-  for (const arg of args) {
-    if (redactNext) {
-      out.push("<redacted>");
-      redactNext = false;
-      continue;
-    }
-    const eq = arg.indexOf("=");
-    if (eq > 0 && SECRET_FLAG.test(arg.slice(0, eq))) {
-      out.push(`${arg.slice(0, eq)}=<redacted>`);
-      continue;
-    }
-    if (eq === -1 && SECRET_FLAG.test(arg)) {
-      out.push(arg);
-      redactNext = true;
-      continue;
-    }
-    out.push(arg);
-  }
-  return out;
 }
 
 function messageOf(e: unknown): string {

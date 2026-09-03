@@ -180,6 +180,16 @@ class Worker implements WorkerHandle {
   #proc: AgentProcess | null = null;
   #link: AcpLink | null = null;
   #linkClosed = false;
+  /**
+   * "The agent process is gone", observed from the PROCESS rather than from the SDK.
+   *
+   * §6.7's rule — a rejection with no JSON-RPC code is a dead transport, so do not classify from
+   * it — was enforced only by `#linkClosed`, which is set from a `.then()` on the SDK's
+   * `connection.closed`. That made correctness depend on the SDK resolving `closed` BEFORE it
+   * rejects pending requests. It does today, but nothing in this repo owns that ordering, and the
+   * cost if it ever inverted is a fabricated clean turn end for a dead process (§7.3).
+   */
+  #agentGone = false;
   #currentTurnId: TurnId | null = null;
   #closeReason: WorkerCloseReason | null = null;
 
@@ -341,7 +351,7 @@ class Worker implements WorkerHandle {
       // `stdoutEnded` and `exit`, both already wired, so we hand the turn to them rather than
       // classifying from a transport artefact.
       if (!(e instanceof AcpRequestError)) {
-        if (this.#linkClosed) return;
+        if (this.#linkClosed || this.#agentGone || this.#proc?.pid === null) return;
         this.#logger.warn("session/prompt failed without a JSON-RPC code", { error: String(e) });
       }
 
@@ -486,13 +496,17 @@ class Worker implements WorkerHandle {
     // `reduceTurn` folds — it carries `title`, so an `InteractionRecord` is built from a single
     // envelope kind (review R9) — and `acp.interaction` keeps the request verbatim for audit.
     //
-    // `payloadVersion: 2` on both: the SHAPES are ours (D10's unified InteractionRequest), not
-    // the agent's. The agent's own v1 bytes sit untouched inside `request`, which the type
-    // already documents as a verbatim v1 shape.
+    // The versions differ because §5.1 defines `payloadVersion` as the ACP version of the payload
+    // AS WRITTEN. `omni.policy_decision` is entirely daemon-authored, so it is 2. `acp.interaction`
+    // embeds the agent's verbatim v1 `RequestPermissionRequest` in `payload.request` (the type says
+    // so itself), so it is 1 — and when M2 normalizes `session/request_permission` to D4's
+    // `{title, subject, options}` shape, THAT is the moment this flips to 2. Stamping 2 today
+    // would change `payload.request`'s shape with no change in the one field a client has to
+    // detect it by, which is the silent wire break §7.5 says this flag exists to prevent.
     this.#deps.log.appendAll([
       {
         kind: "acp.interaction",
-        payloadVersion: 2,
+        payloadVersion: 1,
         turnId,
         payload: {
           requestId: decision.record.requestId,
@@ -527,9 +541,11 @@ class Worker implements WorkerHandle {
 
   #watchProcess(proc: AgentProcess): void {
     void proc.exited.then((exit) => {
+      this.#agentGone = true;
       this.#onExit(exit);
     });
     void proc.stdoutEnded.then(() => {
+      this.#agentGone = true;
       this.#onStdoutEnded();
     });
   }
@@ -538,7 +554,15 @@ class Worker implements WorkerHandle {
     this.#exitGraceTimer?.cancel();
     this.#exitGraceTimer = null;
     if (this.#closing) return; // we asked for this; the close path owns it
-    this.#classifyAndClose(exit);
+    // `force`, because the leader is ALREADY gone: there is nobody left to cooperate with, and
+    // rung 0 without `force` REPORTS a surviving tree (`treeGone:false`) instead of reclaiming
+    // it — which is how §6.7's zombie leaked its grandchild past close and past `daemon.stop()`.
+    // This costs nothing on a clean exit: rung 0 with `force` still short-circuits to
+    // `already_exited` whenever `isTreeGone()` is true, so only a leader whose group is provably
+    // still populated escalates to SIGKILL. On Windows `confirmsTreeGone` is false, so this is
+    // one `taskkill /T /F` against the dead leader's pid — the same PID-reuse exposure
+    // `#onStdoutEnded`'s force already carries and §6.4 already documents.
+    this.#classifyAndClose(exit, { force: true });
   }
 
   /**

@@ -1,5 +1,6 @@
 import {
   OmniError,
+  redactArgs,
   type AgentCatalogEntry,
   type AgentDescriptor,
   type ResolvedDaemonConfig,
@@ -24,7 +25,12 @@ export function createCatalog(config: ResolvedDaemonConfig): Catalog {
   const entries: AgentCatalogEntry[] = config.agents.map((a) => ({
     id: a.id,
     command: a.command,
-    args: [...a.args],
+    // Redacted, on the SAME rule `ProcessInfo.argsRedacted` uses. `GET /v1/agents` is readable by
+    // every bearer token — including one whose `agents` list does not contain this agent at all —
+    // so serving `--api-key sk-…` verbatim here would hand the operator's agent credentials to
+    // the lowest-privilege client on the daemon (DESIGN §8). `toSpawnSpec` below still passes the
+    // REAL argv to the child; this entry is the description, not the launch.
+    args: redactArgs(a.args),
     source: "config",
     // M1 probes for the real capabilities; a fabricated value here would be worse than a null.
     probed: null,

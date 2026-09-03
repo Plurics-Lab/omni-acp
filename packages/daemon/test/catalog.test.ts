@@ -49,6 +49,29 @@ describe("Catalog (H4, D22)", () => {
   it("refuses a config with two agents sharing an id", () => {
     expect(() => createCatalog(config([AGENT, AGENT]))).toThrow(/duplicate agent id/);
   });
+
+  it("redacts credential-shaped args, on the same rule as ProcessInfo.argsRedacted (DESIGN §8)", () => {
+    const catalog = createCatalog(
+      config([
+        {
+          ...AGENT,
+          args: ["--model", "sonnet", "--api-key", "sk-ant-SECRET", "--token=tok-SECRET"],
+        },
+      ]),
+    );
+    expect(catalog.list()[0]?.args).toEqual([
+      "--model",
+      "sonnet",
+      "--api-key",
+      "<redacted>",
+      "--token=<redacted>",
+    ]);
+    // The DESCRIPTOR keeps the real argv — the child needs it — and so does the SpawnSpec.
+    expect(catalog.get("example").args).toContain("sk-ant-SECRET");
+    expect(catalog.toSpawnSpec(catalog.get("example"), { cwd: tmpdir() }).args).toContain(
+      "sk-ant-SECRET",
+    );
+  });
 });
 
 describe("Catalog.toSpawnSpec — the ONLY producer of a SpawnSpec (§5.4)", () => {

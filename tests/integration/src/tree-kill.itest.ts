@@ -116,6 +116,17 @@ describe("tree kill", () => {
     );
     expect(readFileSync(path, "utf8").length).toBeGreaterThan(0);
 
+    // Closing the worker is not enough: the grandchild is the whole point of this fixture, and a
+    // close that merely REPORTS `treeGone:false` has leaked an MCP server or an agent-spawned
+    // shell for the 300 s the fixture sleeps. Same oracle as the DELETE test above — the marker
+    // must stop growing — asserted here because nothing else notices a leader that exited on its
+    // own: the AgentProcess has already left `supervisor.live`, so `daemon.stop()`'s backstop
+    // never sees it either (§6.7).
+    await new Promise<void>((resolve) => setTimeout(resolve, 2_000));
+    const settled = sizeOf(path);
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+    expect(sizeOf(path)).toBe(settled);
+
     await server.close();
   }, 60_000);
 });

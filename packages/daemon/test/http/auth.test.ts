@@ -123,4 +123,17 @@ describe("auth over the wire (H13, acceptance 4)", () => {
     expect(res.status).toBe(400);
     await daemon.stop();
   });
+
+  it("answers 401 — not 400 — when the secret is wrong AND the client id is over-long", async () => {
+    // Auth is decided FIRST (§9). An anonymous caller learns only that it is unauthenticated; the
+    // 400 about header bounds is reachable only once a valid secret has been presented.
+    const daemon = await daemonWithToken();
+    const res = await call(daemon, "GET", "/v1/whoami", {
+      [HEADER.auth]: "Bearer totally-wrong-secret-xxxxxxxxxx",
+      [HEADER.clientId]: "x".repeat(300),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ code: "unauthorized" });
+    await daemon.stop();
+  });
 });

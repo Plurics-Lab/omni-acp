@@ -202,7 +202,6 @@ export function createTokenStore(config: ResolvedDaemonConfig): TokenStore {
       const match = BEARER.exec(header);
       if (match === null) throw unauthorized("malformed Authorization header; expected Bearer");
       const secret = match[1] ?? "";
-      const clientId = readClientId(headers);
 
       // Every entry is compared, with no early exit, so the number of comparisons does not vary
       // with WHICH token matched. The comparison itself is `timingSafeEqual` (verifySecret).
@@ -211,6 +210,13 @@ export function createTokenStore(config: ResolvedDaemonConfig): TokenStore {
         if (verifySecret(secret, entry.sha256) && matched === null) matched = entry;
       }
       if (matched === null) throw unauthorized("unknown bearer token");
+
+      // AFTER the secret, deliberately. §9 says a missing / malformed / unknown bearer is 401, and
+      // `readClientId` throws 400 for an over-long header — so validating it first let an
+      // unauthenticated caller get a 400 out of the daemon. Nothing sensitive leaked through it,
+      // but the ordering is the contract's, and the 400 is now only reachable by a caller who
+      // already holds a valid secret.
+      const clientId = readClientId(headers);
       return createAuthContext(matched, clientId);
     },
 
