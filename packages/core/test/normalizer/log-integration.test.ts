@@ -84,9 +84,18 @@ describe("normalizer + event log: the seq ordering the whole design rests on", (
     expect(running).toBe(accepted);
     expect(idle).toBe(h.log.head);
 
+    // The agent's own updates, selected by KIND rather than by `payloadVersion`. M1-R10 flips
+    // `payloadVersion` to 2 for every kind the map lands on a v2 arm — which `agent_message_chunk`
+    // now is, with `messageId` synthesized (§12.4) — so the M0 proxy "payloadVersion === 1 means
+    // the agent sent it" is exactly what the flip retires. This asks the question the assertion
+    // was always about: every update that is not one of OUR two synthesized state changes.
     const updates = h.log
       .read(0)
-      .filter((e) => e.payloadVersion === 1)
+      .filter(
+        (e) =>
+          e.kind === "acp.session_update" &&
+          (e.payload as { sessionUpdate?: string }).sessionUpdate !== "state_update",
+      )
       .map((e) => e.seq);
     expect(updates).toHaveLength(3);
     for (const seq of updates) {
