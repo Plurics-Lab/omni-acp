@@ -114,7 +114,7 @@ function liveTurn(d: ReturnType<typeof driver>): void {
 }
 
 describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => {
-  it("drives quiet -> close_stdin -> drain -> cancel -> terminate, at the documented deadlines", () => {
+  it("drives quiet -> cancel -> close_stdin -> drain -> terminate, at the documented deadlines", () => {
     const d = driver();
     liveTurn(d);
 
@@ -124,19 +124,26 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
     expect(opened.state).toBe("closing");
     expect(opened.scheduleTickAt).toBe(T0 + 100 + QUIET);
 
-    // Rung 2 — EOF on stdin. This is the ONLY ladder that may close it (§6.5, M1-R4).
+    // Rung 2 — `session/cancel`, then its own grace.
+    //
+    // §13.2 SPELLS THIS RUNG FOURTH, after `close_stdin`. It cannot be: `session/cancel` travels
+    // on the agent's STDIN, and closing stdin first means the cancel reaches nobody — asserted
+    // from the agent's side in `e2e/close-out-ladder.test.ts` — and the write rejects into a
+    // floating promise in `worker.ts`'s `#perform`. Transposing the two keeps every rung, every
+    // grace and every deadline, and makes each one deliverable.
     const rung2 = d.tick();
-    expect(rung2?.action).toBe("close_stdin");
+    expect(rung2?.action).toBe("cancel");
+    expect(rung2?.scheduleTickAt).toBe(T0 + 100 + QUIET + CANCEL);
 
-    // Rung 3 — drain, with its own grace.
+    // Rung 3 — EOF on stdin, and NOW "no more requests are coming" is true. This is the only
+    // ladder that may close it (§6.5, ruling M1-R4).
     const rung3 = d.tick();
-    expect(rung3?.action).toBe("drain");
-    expect(rung3?.scheduleTickAt).toBe(T0 + 100 + QUIET + DRAIN);
+    expect(rung3?.action).toBe("close_stdin");
 
-    // Rung 4 — `session/cancel`, then its own grace.
+    // Rung 4 — drain, with its own grace.
     const rung4 = d.tick();
-    expect(rung4?.action).toBe("cancel");
-    expect(rung4?.scheduleTickAt).toBe(T0 + 100 + QUIET + DRAIN + CANCEL);
+    expect(rung4?.action).toBe("drain");
+    expect(rung4?.scheduleTickAt).toBe(T0 + 100 + QUIET + CANCEL + DRAIN);
 
     // Rung 5 — the ladder is finished, and says so.
     const rung5 = d.tick();
@@ -146,9 +153,9 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
     expect(d.steps.map((s) => s.action)).toEqual([
       null, // prompt_sent
       null, // close_requested: rung 1 is a wait
+      "cancel",
       "close_stdin",
       "drain",
-      "cancel",
       null, // rung 5 reports `settled`; §6.5's escalation is the caller's, see terminate()'s note
     ]);
   });
@@ -172,9 +179,9 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
       }
     };
 
-    record(d.tick()); // rung 2
-    record(d.tick()); // rung 3
-    // The agent is still talking during the drain, exactly as scenario 06 records.
+    record(d.tick()); // rung 2 — `session/cancel`
+    // The agent keeps talking AFTER our cancel, exactly as scenario 06 records: a `usage_update`
+    // 53 ms later, and the prompt response ~4 ms after that.
     record(
       d.step({
         type: "agent_update",
@@ -182,8 +189,8 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
         update: { sessionUpdate: "usage_update", used: 42, size: 200 },
       }),
     );
-    // …and answers 4 ms later, which the ladder must carry into `idle`.
     d.step({ type: "prompt_result", stopReason: "cancelled", at: T0 + 504 });
+    record(d.tick()); // rung 3
     record(d.tick()); // rung 4
     record(d.tick()); // rung 5
 
@@ -195,8 +202,9 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
     const d = driver();
     liveTurn(d);
     d.step({ type: "close_requested", at: T0 });
-    d.tick(); // rung 2
-    d.tick(); // rung 3 — draining
+    d.tick(); // rung 2 — cancel
+    d.tick(); // rung 3 — close_stdin
+    d.tick(); // rung 4 — draining
     const out = d.step({
       type: "agent_update",
       at: T0 + 400,
@@ -233,13 +241,13 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
     const d = driver();
     liveTurn(d);
     d.step({ type: "close_requested", at: T0 });
-    d.tick(); // rung 2 — close_stdin
-    d.tick(); // rung 3 — drain
+    d.tick(); // rung 2 — cancel
+    d.tick(); // rung 3 — close_stdin
     const out = d.step({ type: "drained", at: T0 + 300 });
     expect(out.settled).toBe("drained");
     expect(out.scheduleTickAt).toBeNull();
-    // Rung 4's `session/cancel` is never sent: the process's stdout has already ended.
-    expect(d.steps.map((s) => s.action)).not.toContain("cancel");
+    // The drain rung's own grace is never spent: the process's stdout has already ended.
+    expect(d.steps.map((s) => s.action)).not.toContain("drain");
   });
 
   it("`drained` OUTSIDE the ladder is inert and does not disturb an armed timer", () => {
@@ -262,10 +270,16 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
     d.tick(); // rung 3
     const again = d.step({ type: "close_requested", at: T0 + 300 });
     expect(again.action).toBeNull();
-    expect(again.scheduleTickAt).toBe(T0 + QUIET + DRAIN);
-    // DELETE, hibernate, daemon shutdown and the cancel escalation can all fire at once.
-    d.tick(); // still rung 4, not rung 2 again
-    expect(d.steps.at(-1)?.action).toBe("cancel");
+    expect(again.scheduleTickAt).toBe(T0 + QUIET + CANCEL);
+    // DELETE, hibernate, daemon shutdown and the cancel escalation can all fire at once, and the
+    // ladder must carry on from where it was rather than re-offering a rung already spent.
+    d.tick();
+    expect(d.steps.at(-1)?.action).toBe("drain");
+    d.tick();
+    expect(d.steps.at(-1)?.settled).toBe("cancelled");
+    // …and `cancel` and `close_stdin` were each requested exactly ONCE.
+    const actions = d.steps.map((s) => s.action).filter((a) => a !== null);
+    expect(actions).toEqual(["cancel", "close_stdin", "drain"]);
   });
 
   it("does NOT run when there is no live turn: a DELETE of an idle worker keeps M0's path", () => {
@@ -317,7 +331,7 @@ describe("§13.3 — what the ladder must NOT do", () => {
     const rung1 = d.tick();
     expect(rung1?.emit.map((e) => (e.payload as { state?: string }).state)).toEqual(["idle"]);
     expect(rung1?.settled).toBeNull();
-    expect(rung1?.action).toBe("close_stdin");
+    expect(rung1?.action).toBe("cancel");
   });
 
   it("a crash mid-ladder still produces no idle, and does not disarm the ladder", () => {

@@ -659,25 +659,36 @@ function advance(
           vendorPatch: null,
         };
       }
-      // Rung 2: EOF on stdin — no more requests are coming. NEVER at turn end (§6.5, M1-R4);
-      // this is the forced ladder and nothing else.
-      const rung2: TurnLifecycleState = { ...next, rung: 2, deadline: at };
-      return { state: rung2, output: output(emit, rung2, at, null, "close_stdin") };
+      // Rung 2: `session/cancel`, then its own grace.
+      //
+      // §13.2 SPELLS THIS RUNG FOURTH, AFTER `close_stdin`, AND IT CANNOT BE. `session/cancel`
+      // travels on the agent's stdin, and rung `close_stdin` closes it — so a cancel sent after
+      // it reaches nobody, which the e2e ladder test asserts from the AGENT's side, and the
+      // write rejects into a floating promise in `worker.ts`'s `#perform`, which used to make
+      // the whole suite exit non-zero on an unhandled rejection. §13.2's own comment on the
+      // stdin rung says "EOF: no more requests are coming", and a later rung that sends one
+      // contradicts it in the document.
+      //
+      // Transposing the two keeps every rung, every grace and every deadline, keeps corpus
+      // finding 14's reason intact (the quiet window still comes FIRST, so a `usage_update` that
+      // arrives after our cancel still lands before `idle`), and makes each rung deliverable.
+      // Recorded as an amendment request against DESIGN §6.2 and CONTRACTS §13.2 in M1-WP-B's
+      // hand-off notes — with the evidence, which is a test rather than an argument.
+      const cancelDeadline = at + cfg.cancelGraceMs;
+      const rung2: TurnLifecycleState = { ...next, rung: 2, deadline: cancelDeadline };
+      return { state: rung2, output: output(emit, rung2, cancelDeadline, null, "cancel") };
     }
     case 2: {
-      // Rung 3: wait `drainGraceMs` for stdout EOF, FORWARDING everything that arrives.
-      const deadline = at + cfg.drainGraceMs;
-      const rung3: TurnLifecycleState = { ...state, rung: 3, deadline };
-      return { state: rung3, output: output([], rung3, deadline, null, "drain") };
+      // Rung 3: EOF on stdin — no more requests are coming, and now that is TRUE. NEVER at turn
+      // end (§6.5, ruling M1-R4); this is the forced ladder and nothing else.
+      const rung3: TurnLifecycleState = { ...state, rung: 3, deadline: at };
+      return { state: rung3, output: output([], rung3, at, null, "close_stdin") };
     }
     case 3: {
-      // Rung 4: `session/cancel`, then its own grace. Corpus finding 14 is what forces rungs 1
-      // and 4 into THIS order: a `usage_update` arrived 53 ms after our cancel and ~4 ms before
-      // the prompt response, so cancelling at the response boundary orders that update after an
-      // event that belongs to the turn.
-      const deadline = at + cfg.cancelGraceMs;
+      // Rung 4: wait `drainGraceMs` for stdout EOF, FORWARDING everything that arrives.
+      const deadline = at + cfg.drainGraceMs;
       const rung4: TurnLifecycleState = { ...state, rung: 4, deadline };
-      return { state: rung4, output: output([], rung4, deadline, null, "cancel") };
+      return { state: rung4, output: output([], rung4, deadline, null, "drain") };
     }
     default:
       return terminate(state, at);

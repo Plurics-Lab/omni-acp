@@ -20,10 +20,17 @@ import { startE2eWorker, tags, until, type E2eWorker } from "./support.js";
  *
  * So every assertion below is observed from OUTSIDE the reducer:
  *
- *   rung 2 (`close_stdin`)  the fixture writes `eof` to a marker file when ITS stdin ends
- *   rung 3 (`drain`)        the fixture's own process exits, and `stdoutEnded` feeds `drained`
- *   rung 4 (`cancel`)       the fixture writes `cancel` when `session/cancel` reaches it
+ *   rung 2 (`cancel`)       the fixture writes `cancel` when `session/cancel` reaches it
+ *   rung 3 (`close_stdin`)  the fixture writes `eof` when ITS stdin ends
+ *   rung 4 (`drain`)        the fixture's own process exits, and `stdoutEnded` feeds `drained`
  *   §13.4's stderr signal   an `omni.error` appears in the log, before `idle`
+ *
+ * THE MARKER FILE IS WHY THE RUNGS ARE ORDERED THE WAY THEY ARE. §13.2 spells `close_stdin`
+ * second and `cancel` fourth; with that order the fixture recorded only `eof`, because
+ * `session/cancel` travels on the stdin the previous rung closed — and `worker.ts`'s
+ * `#perform` floats the rejected `notify`, which failed the whole suite on an unhandled
+ * rejection. Transposed, the fixture records `cancel` and then `eof`, which is the ladder
+ * actually working. See `turn-lifecycle.ts`'s rung 2 for the full note.
  */
 
 const TURN_OF = (worker: E2eWorker): TurnId => {
@@ -88,7 +95,7 @@ async function start(env: Record<string, string>): Promise<E2eWorker> {
 }
 
 describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
-  it("a DELETE mid-turn closes stdin, and the FIXTURE sees the EOF", async () => {
+  it("a DELETE mid-turn cancels, THEN closes stdin, and the FIXTURE sees both", async () => {
     const marker = markerFile();
     const w = await start({ HYBRID_EOF_MARKER: marker, HYBRID_NEVER_ANSWER: "1" });
 
@@ -102,41 +109,42 @@ describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
 
     await w.worker.close("client_request");
 
-    // Rung 2, observed by the agent itself. Nothing in our own reducer is consulted here.
-    expect(rungs(marker)[0]).toBe("eof");
+    // Rungs 2 and 3, IN ORDER, observed by the agent itself. Nothing in our own reducer is
+    // consulted here — and with §13.2's spelled order this list was `["eof"]`, because the
+    // cancel had no channel left to arrive on.
+    expect(rungs(marker)).toEqual(["cancel", "eof"]);
     expect(w.worker.snapshot().state).toBe("closed");
   }, 30_000);
 
-  it("`drained` from the process's OWN stdout EOF short-circuits rung 4", async () => {
+  it("`drained` from the process's OWN stdout EOF short-circuits the last rung", async () => {
     // The hybrid fixture exits on stdin EOF, like every ACP agent. Its stdout therefore ends,
-    // `#watchProcess` feeds `drained`, and §13.2 says nothing more can arrive — so
-    // `session/cancel` is never sent, and the fixture never records a `cancel`.
+    // `#watchProcess` feeds `drained`, and §13.2 says nothing more can arrive — so the drain
+    // grace is never spent and the close returns as soon as the process is gone.
     const marker = markerFile();
-    const w = await start({ HYBRID_EOF_MARKER: marker, HYBRID_NEVER_ANSWER: "1" });
+    const w = await start({
+      HYBRID_EOF_MARKER: marker,
+      HYBRID_NEVER_ANSWER: "1",
+      // A drain grace far longer than the test's patience: if `drained` did not short-circuit,
+      // this close would take 20 s and the timeout below would catch it.
+      HYBRID_RATE_LIMIT: "",
+    });
     await w.worker.prompt([{ type: "text", text: "go" }], {
       tokenId: w.worker.snapshot().ref.tokenId,
     });
     await until("the agent to start talking", () => w.events().length >= 3);
 
+    const before = Date.now();
     await w.worker.close("client_request");
-    expect(rungs(marker)).toEqual(["eof"]);
+    expect(rungs(marker)).toEqual(["cancel", "eof"]);
+    // The whole ladder, on a cooperative agent, in well under one drain grace plus one cancel
+    // grace: the graces are ceilings, and `drained` is what stops them being floors.
+    expect(Date.now() - before).toBeLessThan(3_000);
   }, 30_000);
 
-  it("an agent that IGNORES stdin EOF is walked past the drain rung, and rung 4 CANNOT reach it", async () => {
-    // The uncooperative case: stdout never ends, so the drain grace expires and the reducer asks
-    // the Worker to send `session/cancel`.
-    //
-    // AND IT CANNOT ARRIVE — which is a fact about §13.2's ORDER, not about this code. Rung 2
-    // sends stdin EOF ("no more requests are coming") and rung 4 sends `session/cancel`, which
-    // travels on the same stdin. After rung 2 there is no channel left to carry it. The Worker
-    // still performs the rung (`link.notify` is attempted and the failure is swallowed, exactly
-    // as `cancel()`'s own "a failed send is not a failed cancel" rule says), and the agent
-    // records nothing, because nothing reached it.
-    //
-    // The rung is not useless: it is the only path for a runtime whose transport is not the
-    // stdin pipe (DESIGN §1.4's remote transports). On stdio it is a no-op after rung 2, and
-    // saying so here is cheaper than discovering it in production. Recorded in M1-WP-B's
-    // hand-off notes as a §13.2 observation.
+  it("an agent that IGNORES both the cancel and the EOF is walked to the last rung and killed", async () => {
+    // The uncooperative case, and the one that proves every rung ran: the agent receives the
+    // cancel and ignores it, receives the EOF and stays alive, so its stdout never ends, the
+    // drain grace expires, and §6.5's escalation is what finally reclaims it.
     const marker = markerFile();
     const w = await start({
       HYBRID_EOF_MARKER: marker,
@@ -148,12 +156,14 @@ describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
     });
     await until("the agent to start talking", () => w.events().length >= 3);
 
-    await w.worker.close("client_request");
+    const result = await w.worker.close("client_request");
 
-    expect(rungs(marker)).toEqual(["eof"]);
-    // Rung 5 still ran: the process is gone and the worker is closed, on an agent that answered
-    // neither the prompt nor the cancel and did not exit on EOF.
+    // Rungs 2 and 3, in order, from the agent's side.
+    expect(rungs(marker)).toEqual(["cancel", "eof"]);
+    // …and the last rung, from ours: the process is gone and its tree with it, on an agent that
+    // answered neither the prompt nor the cancel and did not exit on EOF.
     expect(w.worker.snapshot().state).toBe("closed");
+    expect(result.leaderExited).toBe(true);
   }, 30_000);
 
   it("a hibernate on an idle worker reclaims the process and keeps the RECORD", async () => {
@@ -171,7 +181,9 @@ describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
 
     await w.worker.hibernate("client_request");
 
-    // §15.2: the process is reclaimed and the record is kept.
+    // §15.2: the process is reclaimed and the record is kept. The ladder did not run, so the
+    // only EOF the agent saw came from §6.5's own rung 1 — and no `cancel` was sent, because
+    // there was no turn to cancel.
     expect(w.worker.snapshot().state).toBe("hibernated");
     expect(w.worker.snapshot().process).toBeNull();
     expect(rungs(marker)).toEqual(["eof"]);

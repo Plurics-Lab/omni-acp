@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const SELF = fileURLToPath(import.meta.url);
 
 function suiteText(): string {
   const parts: string[] = [];
@@ -26,13 +27,20 @@ function suiteText(): string {
       if (statSync(full).isDirectory()) {
         walk(full);
       } else if (entry.endsWith(".ts")) {
+        // THIS FILE IS EXCLUDED, and that is the difference between an index and a tautology:
+        // scanning it too would find every name inside its own list and pass forever.
+        if (full === SELF) continue;
         parts.push(readFileSync(full, "utf8"));
       }
     }
   };
   walk(HERE);
-  // The projection half lives in `protocol`, which owns `reduceTurn`.
+  // The projection half lives in `protocol`, which owns `reduceTurn`; the four gap-filling
+  // fixture agents are proven in `testkit`, which owns them. Both are M1-WP-B's paths.
   walk(join(HERE, "..", "..", "..", "protocol", "test"));
+  parts.push(
+    readFileSync(join(HERE, "..", "..", "..", "testkit", "test", "fixture-agents.test.ts"), "utf8"),
+  );
   return parts.join("\n");
 }
 
@@ -104,15 +112,15 @@ const BULLETS: readonly { readonly bullet: string; readonly covered: readonly st
   {
     bullet: "6. the forced ladder drives rungs 1->5 in order under fakeClock()",
     covered: [
-      "drives quiet -> close_stdin -> drain -> cancel -> terminate, at the documented deadlines",
+      "drives quiet -> cancel -> close_stdin -> drain -> terminate, at the documented deadlines",
       "a `usage_update` arriving mid-rung is ordered BEFORE `idle` — the corpus `06` shape",
     ],
   },
   {
     bullet: "7. the ladder runs END-TO-END through a real Worker",
     covered: [
-      "a DELETE mid-turn closes stdin, and the FIXTURE sees the EOF",
-      "`drained` from the process's OWN stdout EOF short-circuits rung 4",
+      "a DELETE mid-turn cancels, THEN closes stdin, and the FIXTURE sees both",
+      "`drained` from the process's OWN stdout EOF short-circuits the last rung",
       "appends the error, then `idle`, in that seq order",
     ],
   },
@@ -158,9 +166,12 @@ const BULLETS: readonly { readonly bullet: string; readonly covered: readonly st
 ];
 
 describe("M1-WP-B — the full v1->v2 map, the close-out ladder, the turn projection", () => {
-  it("scans a real suite", () => {
+  it("scans a real suite, and NOT itself", () => {
     expect(SUITE.length).toBeGreaterThan(50_000);
-    expect(SUITE).toContain("corpus-golden.test.ts".replace(".test.ts", ""));
+    // A name that exists ONLY in this file must not be found — which is the property that makes
+    // every assertion below mean something.
+    expect(SUITE).not.toContain("bullet 6, as shipped");
+    expect(SUITE).toContain("§12.7(b) — the eight properties");
   });
 
   for (const { bullet, covered } of BULLETS) {
@@ -184,9 +195,14 @@ describe("M1-WP-B — the full v1->v2 map, the close-out ladder, the turn projec
    * `#runCloseOut` resolves, so reporting `settled` is behaviourally identical where `#perform`
    * is safe and correct where it is not.
    */
-  it('bullet 6, as shipped: rung 5 reports `settled` rather than requesting `"terminate"`', () => {
-    expect(SUITE).toContain("Rung 5: §6.5's escalation ladder".slice(0, 12));
-    expect(SUITE).toContain("expect(d.steps.map((s) => s.action)).toEqual([");
+  it("bullet 6, as shipped: rungs 2 and 4 are TRANSPOSED, and rung 5 reports `settled`", () => {
+    // §13.2 spells `close_stdin` second and `cancel` fourth, and a cancel cannot travel on a
+    // stdin the previous rung closed — the e2e test asserts that from the AGENT's side, and with
+    // the spelled order `worker.ts`'s floating `notify` failed the whole suite on an unhandled
+    // rejection. Both deviations are explained where they happen, and this asserts that they
+    // still are.
+    expect(SUITE).toContain("§13.2 SPELLS THIS RUNG FOURTH");
+    expect(SUITE).toContain('expect(rungs(marker)).toEqual(["cancel", "eof"]);');
     expect(SUITE).toContain("the ladder is finished, and says so");
   });
 
