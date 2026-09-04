@@ -9,15 +9,41 @@
 # (CONTRACTS.md §6.3). `sdk-example` resolves through `sdkExampleAgentPath()`. Nothing here needs
 # a `requires:` or a `windows:` block: a fixture is a `.mjs` file this repository ships, so it has
 # no precondition and no launch quirk to override.
+#
+# TWO KEYS DO THE WORK, and neither is decoration:
+#
+#   provides:  what this runtime is expected to EXERCISE (`tools` / `permission` / `cancel`). A
+#              case requiring something absent here is a `capability` skip, never a failure. It
+#              does NOT list `resume`: the probe measures that (`ProbeSummary.resumeMethod`), and
+#              a YAML that claimed otherwise would be a second opinion about a fact we measure.
+#   skip:      the `config` source. Every reason is >= 10 characters and names the evidence,
+#              because a skip nobody can argue with is the only kind worth having (§18.3).
 version: 1
 defaults: { handshakeTimeoutMs: 30000, turnTimeoutMs: 60000, cwdStrategy: mkdtemp }
 agents:
   - id: sdk-example
     source: sdk-example
     enabled: true
-    # The tier-3 acceptance fixture: real process, real ndJSON, `loadSession: true`.
+    # The tier-3 acceptance fixture: real process, real ndJSON. Its turn makes two tool calls and
+    # asks for permission on the second, which is what makes it the only hermetic agent that can
+    # satisfy `permission-deny`.
+    provides: [tools, permission, cancel]
+    # Observed on this machine, 2026-09-04, against @agentclientprotocol/sdk 1.4.0:
+    # `initialize` answers `agentCapabilities: {loadSession: false}`. M1-PLAN §2 (WP-F 6) reads
+    # "the SDK example agent (`loadSession: true`)" — that is not true of the pinned SDK, and the
+    # resume cases skip with `source: capability` off the PROBE rather than off this note.
     expect:
-      resume: true
+      protocolVersion: 1
+      capabilities: { loadSession: false }
+    skip:
+      - {
+          case: plain-turn,
+          reason: "the example turn denies a permission by design, so `verdict` is `partial` — that is `permission-deny`'s subject, not a plain turn",
+        }
+      - {
+          case: tool-turn,
+          reason: "the example agent runs the same scripted turn for every prompt, so its `read` turn is the write turn `permission-deny` already asserts",
+        }
 
   # The turn-completing fixtures. `crash` and `orphan` are deliberately absent: neither completes
   # a turn, so neither can satisfy a case list whose first assertion is that a turn ends.
@@ -25,22 +51,52 @@ agents:
     source: fixture
     fixture: echo
     enabled: true
+    provides: [cancel]
   - id: fixture-chatty
     source: fixture
     fixture: chatty
     enabled: true
+    provides: [cancel]
   - id: fixture-noisy
     source: fixture
     fixture: noisy
     enabled: true
+    provides: [cancel]
+
+  # `slow` is in the eight because it is one of the eight non-crashing fixtures, NOT because it
+  # completes a turn — it never answers `session/prompt` and it ignores `session/cancel`, which is
+  # exactly what it exists for (the quiet window and the escalation ladder). Every case whose
+  # first move is "run a turn" is therefore a `config` skip with that one reason, rather than a
+  # five-minute timeout repeated nine times.
   - id: fixture-slow
     source: fixture
     fixture: slow
     enabled: true
+    provides: []
     skip:
       - {
           case: plain-turn,
           reason: "slow.mjs never answers session/prompt; it exists for the quiet window and the cancel ladder",
+        }
+      - {
+          case: stream-resume,
+          reason: "slow.mjs never answers session/prompt, so there is no turn to drop the stream in the middle of",
+        }
+      - {
+          case: cancel-late-update,
+          reason: "slow.mjs IGNORES session/cancel by design, so the turn never settles and no ordering is observable",
+        }
+      - {
+          case: lease,
+          reason: "slow.mjs never answers session/prompt, so the holder's turn never completes for an observer to watch",
+        }
+      - {
+          case: restart-survives,
+          reason: "slow.mjs never answers session/prompt, so its log has no turn to compare across a restart",
+        }
+      - {
+          case: idempotent-map,
+          reason: "slow.mjs emits one chunk and never settles, so there is no completed turn to fold twice",
         }
 
   # M1-WP-B's four gap-filling fixtures (§18.3). They are listed here now so that the fixture
@@ -49,15 +105,33 @@ agents:
     source: fixture
     fixture: plan
     enabled: true
+    provides: [cancel]
   - id: fixture-thought
     source: fixture
     fixture: thought
     enabled: true
+    provides: [cancel]
   - id: fixture-mode
     source: fixture
     fixture: mode
     enabled: true
+    provides: [cancel]
+
+  # The one hermetic agent that can be WOKEN. It advertises `loadSession` and
+  # `sessionCapabilities.resume` and implements both over a session persisted outside the cwd, so
+  # §15.3's wake path and §15.4's `-32002` cwd-mismatch shape are both reachable with no login.
   - id: fixture-hybrid
     source: fixture
     fixture: hybrid
     enabled: true
+    provides: [tools, cancel]
+    # `resumeRequiresSameCwd` is what turns rule 4's verdict from `unclassified` into
+    # `cwd_mismatch` (§15.4). It is a config overlay because `hybrid` has no builtin descriptor —
+    # which is exactly the path an operator adding a new runtime takes.
+    runtime:
+      quirks: { resumeRequiresSameCwd: true }
+    skip:
+      - {
+          case: plain-turn,
+          reason: "hybrid's turn FAILS a tool call on its own merits, so `verdict` is `partial` by construction — that failure is the fixture's whole subject (F24, corpus gap)",
+        }
