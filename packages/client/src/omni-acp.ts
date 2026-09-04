@@ -5,7 +5,15 @@ import { local, type LocalOptions } from "./local.js";
 export interface ConnectOptions {
   readonly url: string;
   readonly token: string;
-  /** -> Omni-Client-Id; default: random per process. */
+  /**
+   * → `Omni-Client-Id`; default: a fresh ULID per `connect()`, minted by `transport.ts`.
+   *
+   * M0 minted one per PROCESS, on the reasoning that two connections from one script should not
+   * look like two clients. M1's lease inverts that: §16.1 rule L4 makes the client id the unit of
+   * CONTROL, and the acceptance script's whole step 4 is two `connect()` calls on one token
+   * discovering that the second is refused with a `423` naming the first. A process-wide id
+   * would make that scenario unreachable, so the default moved (CONTRACTS.md §5.7).
+   */
   readonly clientId?: ClientId;
   /** Injectable. Tests pass `daemon.fetch` and touch no socket at all. */
   readonly fetch?: typeof globalThis.fetch;
@@ -14,13 +22,6 @@ export interface ConnectOptions {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-
-/**
- * Random per PROCESS, not per connection: `Omni-Client-Id` is recorded for audit and future
- * lease attribution (D13, CONTRACTS.md §2.1), and a value that changed per `connect()` would
- * make two connections from the same script look like two clients.
- */
-const PROCESS_CLIENT_ID: ClientId = `c_${globalThis.crypto.randomUUID()}`;
 
 /**
  * `globalThis.fetch` reached through a wrapper rather than passed by reference.
@@ -52,7 +53,9 @@ export const OmniACP: {
     return connectServer({
       url: opts.url,
       token: opts.token,
-      clientId: opts.clientId ?? PROCESS_CLIENT_ID,
+      // Absent ⇒ `createTransport` mints one. Passing `undefined` through rather than choosing a
+      // default here keeps the id's provenance in ONE file (§5.7).
+      ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
       fetch: opts.fetch ?? globalFetch,
       requestTimeoutMs: opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     });

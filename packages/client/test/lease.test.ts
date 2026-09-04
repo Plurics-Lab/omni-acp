@@ -35,7 +35,18 @@ function recordingTransport(answers: unknown[]): {
   calls: Recorded[];
 } {
   const calls: Recorded[] = [];
+  // M1-WP-F widened `Transport` with the client id and the fencing epoch (§5.7): the id every
+  // request carries, and `adoptLeaseEpoch`, which the WORKER HANDLE calls when an answer names us
+  // — never this file, which is testing the three routes and not the fence.
+  let epoch: number | null = null;
   const transport: Transport = {
+    clientId: "cli_a",
+    get leaseEpoch(): number | null {
+      return epoch;
+    },
+    adoptLeaseEpoch: (lease) => {
+      epoch = lease.epoch;
+    },
     request: <R>(method: string, path: string, body?: unknown): Promise<R> => {
       calls.push({ method, path, body });
       const next = answers.shift();
@@ -201,11 +212,12 @@ describe("WorkerLease — over the real transport", () => {
     });
     expect(lease.snapshot.epoch, "a refusal must not advance the cached fence").toBe(1);
 
-    // NOTE (M1-WP-D → M1-WP-F): lifting `body.lease` off the 423 into `OmniError.lease` is
-    // `transport.ts`'s line, and `transport.ts` is WP-F's file (M1-PLAN §3). Until WP-F adds it,
-    // an SDK caller reads the holder from `error.detail`-free JSON rather than from
-    // `error.lease` — which is why this asserts the code and the status and stops there, and why
-    // the property is asserted against a transport double above.
-    expect(caught?.lease).toBeUndefined();
+    // M1-WP-F closed the hand-off this test used to record as open: `transport.ts` now lifts
+    // `body.lease` off a `423` (and `body.resume` off a `422`) into the thrown `OmniError`, so
+    // rule L10's promise — the caller learns WHO holds it, from the failure itself, with no
+    // second round trip against a worker it may no longer control — holds over the REAL
+    // transport and not only against the double above.
+    expect(caught?.lease?.epoch).toBe(9);
+    expect(caught?.lease?.holder).toEqual({ tokenId: "tok_a", clientId: "cli_a" });
   });
 });

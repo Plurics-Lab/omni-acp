@@ -4,14 +4,19 @@ import {
   SSE_CONTROL,
   turnStatus,
   type AgentCatalogEntry,
+  type ClientRefWire,
   type Daemon,
   type DaemonId,
   type DaemonInfo,
   type EventBody,
   type EventEnvelope,
+  type LeaseEventPayload,
+  type LeaseOp,
+  type LeaseSnapshot,
   type OmniErrorBody,
   type OmniErrorCode,
   type PermissionOption,
+  type ResumeReport,
   type SessionId,
   type Seq,
   type StopReason,
@@ -21,6 +26,7 @@ import {
   type WorkerId,
   type WorkerSnapshot,
   type WorkerState,
+  type WorkerStateReason,
 } from "@omni-acp/protocol";
 import { seqIds, stubDaemon } from "@omni-acp/testkit";
 
@@ -171,6 +177,10 @@ export interface WireDaemon {
   setScript(workerId: string, script: ScriptItem[]): void;
   /** Resolves once every scripted envelope of the last accepted turn has been appended. */
   turnWritten(): Promise<void>;
+  /** Every `Omni-Lease-Epoch` header the client sent, in order — `null` for a request without one. */
+  readonly epochs: readonly (number | null)[];
+  /** Forces a worker into `hibernated` out of band, the way an idle timer would (§15.2). */
+  hibernateWorker(workerId: string): void;
 }
 
 // ── implementation ───────────────────────────────────────────────────────────
@@ -226,6 +236,9 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
 
   const nextTs = (): string => new Date(++clock).toISOString();
 
+  /** D6's replay window, as the fixture's own flag: every append inside it is marked (M1-R5). */
+  let replaying = false;
+
   /** The ONE place a seq is assigned — synchronous, gap-free, per worker (§8.2). */
   const append = (
     rec: WorkerRecord,
@@ -241,6 +254,7 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
       sessionId: rec.snapshot.sessionId,
       turnId: o.turnId ?? null,
       payloadVersion: o.payloadVersion ?? 1,
+      ...(replaying ? { replay: true as const } : {}),
     }) as EventEnvelope;
     rec.envelopes.push(envelope);
     rec.snapshot = { ...rec.snapshot, headSeq: envelope.seq, updatedAt: envelope.ts };
@@ -251,8 +265,9 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
   const setState = (
     rec: WorkerRecord,
     state: WorkerState,
-    reason: WorkerCloseReason | "created" | "handshake_ok" | "prompt" | "turn_end",
+    reason: WorkerStateReason,
     turnId: TurnId | null = null,
+    extra: { resume?: ResumeReport; generation?: number } = {},
   ): EventEnvelope => {
     const previous = rec.snapshot.state;
     rec.snapshot = { ...rec.snapshot, state };
@@ -267,9 +282,32 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
           ...(state === "closed"
             ? { leaderExited: true, treeGone: process.platform !== "win32" }
             : {}),
+          ...extra,
         },
       },
       { turnId, payloadVersion: 2 },
+    );
+  };
+
+  /**
+   * D5's audit envelope (§16.1 rule L9), which is what makes observer mode observable: a client
+   * that never called a lease verb still watches the lease move, because every transition is in
+   * the worker's own log.
+   */
+  const leaseEvent = (
+    rec: WorkerRecord,
+    op: LeaseOp,
+    lease: LeaseSnapshot,
+    previous: ClientRefWire | null,
+    by: ClientRefWire | null,
+    how: LeaseEventPayload["how"],
+    reason: string | null,
+  ): EventEnvelope => {
+    rec.snapshot = { ...rec.snapshot, lease };
+    return append(
+      rec,
+      { kind: "omni.lease", payload: { op, lease, previous, by, how, reason } },
+      { payloadVersion: 2 },
     );
   };
 
@@ -313,10 +351,18 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
         currentTurnId: null,
         capabilities: {
           protocolVersion: 1,
-          raw: { loadSession: false },
-          loadSession: false,
+          raw: { loadSession: true, sessionCapabilities: { resume: {} } },
+          loadSession: true,
           promptCapabilities: null,
           supportsSessionClose: false,
+          // M1: a worker that can hibernate is one whose agent advertises a resume spelling
+          // (§15.2, ruling M1-R15). The wire fixture models a resumable agent so the SDK's
+          // hibernate/wake surface has something to talk to.
+          resume: { method: "session/resume", replayFrom: false, requiresSameCwd: false },
+          supportsSessionList: false,
+          configOptions: null,
+          modes: null,
+          extensions: [],
         },
         process: {
           pid: 4242 + workers.size,
@@ -324,8 +370,31 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
           startedAt: now,
           command: process.execPath,
           argsRedacted: ["agent.js"],
+          fingerprint: null,
         },
         closeReason: null,
+        // ── M1 (CONTRACTS.md §5.1 `WorkerSnapshot`) ─────────────────────────
+        // Created lease-FREE. `createWorker()` here is the out-of-band constructor a test uses to
+        // put a worker on the wire; nobody asked for it, so nobody holds it, and rule L5's
+        // implicit acquire is what the first gated call then does. `POST /v1/workers` sets the
+        // holder to its caller, which is `CreateWorkerRequest.lease: "take"`, the default.
+        lease: {
+          workerId,
+          holder: null,
+          epoch: 0,
+          expiresAt: null,
+          acquiredAt: null,
+          pinned: false,
+        },
+        hibernatedAt: null,
+        crashed: false,
+        resume: null,
+        wakeCount: 0,
+        wakeFailures: 0,
+        orphan: null,
+        generation: 1,
+        runtimeId: `${o?.agentId ?? "example"}@wire00000000`,
+        persistence: "memory",
       },
       envelopes: [],
       subscribers: new Set(),
@@ -364,6 +433,20 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
           },
           turnId,
         );
+        return;
+      case "replay":
+        replaying = true;
+        sessionUpdate(
+          rec,
+          {
+            sessionUpdate: "agent_message_chunk",
+            messageId: "m-replay",
+            content: { type: "text", text: item.text },
+          },
+          turnId,
+          2,
+        );
+        replaying = false;
         return;
       case "tool_call":
         sessionUpdate(rec, item.payload, turnId);
@@ -543,6 +626,170 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
     });
   };
 
+  // ── M1: the lease, hibernation and the probe ──────────────────────────────
+
+  const epochs: (number | null)[] = [];
+  const probed = new Set<string>();
+
+  /** Who is asking. `null` is a client that sent no `Omni-Client-Id` — legal by default (L4). */
+  const callerOf = (request: Request): ClientRefWire => ({
+    tokenId: "wire",
+    clientId: request.headers.get(HEADER.clientId),
+  });
+
+  const sameClient = (a: ClientRefWire | null, b: ClientRefWire | null): boolean =>
+    a !== null && b !== null && a.tokenId === b.tokenId && a.clientId === b.clientId;
+
+  const lease423 = (lease: LeaseSnapshot, message: string): Response => {
+    // §16.1 rule L10: the body NAMES the holder and the epoch, which is what lets a caller learn
+    // who took the worker without a second round trip against a worker it may not control.
+    const body: OmniErrorBody = { code: "lease_held", message, lease };
+    return new Response(JSON.stringify(body), {
+      status: ERROR_STATUS["lease_held"],
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  /**
+   * Rules L2, L5 and L7 for one gated request.
+   *
+   * L7 is the one worth modelling here and the one the SDK's fence is measured against: a
+   * PRESENT-and-stale `Omni-Lease-Epoch` is a `423` **even from the right client id**. Order
+   * matters — the epoch is checked first, so a holder that cached an old number is refused rather
+   * than waved through on identity.
+   */
+  const fenceOf = (request: Request, rec: WorkerRecord): Response | null => {
+    const header = request.headers.get(HEADER.leaseEpoch);
+    epochs.push(header === null ? null : Number(header));
+    const lease = rec.snapshot.lease;
+    if (header !== null && Number(header) !== lease.epoch) {
+      return lease423(lease, `stale lease epoch ${header} (current ${String(lease.epoch)})`);
+    }
+    if (lease.holder === null) {
+      // L5: the first gated call on an unheld lease CLAIMS it, and the claim is audited like any
+      // other transition — a lease that changed hands silently is the one thing D5 forbids.
+      const by = callerOf(request);
+      leaseEvent(
+        rec,
+        "acquired",
+        { ...lease, holder: by, epoch: lease.epoch + 1, acquiredAt: nextTs() },
+        null,
+        by,
+        "implicit",
+        null,
+      );
+      return null;
+    }
+    if (sameClient(lease.holder, callerOf(request))) return null;
+    return lease423(lease, `worker is held by ${lease.holder.clientId ?? lease.holder.tokenId}`);
+  };
+
+  const applyLease = (
+    rec: WorkerRecord,
+    op: LeaseOp | "acquire",
+    by: ClientRefWire,
+    body: { reason?: string },
+  ): LeaseSnapshot => {
+    const previous = rec.snapshot.lease.holder;
+    const epoch = rec.snapshot.lease.epoch + 1;
+    const next: LeaseSnapshot =
+      op === "release"
+        ? { ...rec.snapshot.lease, holder: null, epoch, acquiredAt: null }
+        : { ...rec.snapshot.lease, holder: by, epoch, acquiredAt: nextTs() };
+    leaseEvent(
+      rec,
+      op === "acquire" ? "acquired" : op === "release" ? "released" : "stolen",
+      next,
+      previous,
+      by,
+      op === "steal" ? "steal" : "explicit",
+      body.reason ?? null,
+    );
+    return next;
+  };
+
+  /** §15.2's order: release the lease, THEN the state envelope. The process is already gone. */
+  const hibernate = (rec: WorkerRecord): void => {
+    if (rec.snapshot.state === "hibernated") return;
+    const previous = rec.snapshot.lease.holder;
+    leaseEvent(
+      rec,
+      "released",
+      { ...rec.snapshot.lease, holder: null, acquiredAt: null },
+      previous,
+      previous,
+      "hibernate",
+      null,
+    );
+    rec.snapshot = { ...rec.snapshot, process: null, hibernatedAt: nextTs() };
+    setState(rec, "hibernated", "hibernate");
+  };
+
+  /**
+   * §15.3, including the replay window: the envelopes between the `wake` and the `resumed` state
+   * carry `replay: true`, which is precisely what `stream()` filters by default (M1-R5).
+   */
+  const wake = (rec: WorkerRecord, by: ClientRefWire): WorkerSnapshot => {
+    leaseEvent(rec, "acquired", { ...rec.snapshot.lease, holder: by }, null, by, "implicit", null);
+    setState(rec, "starting", "wake");
+    replaying = true;
+    sessionUpdate(
+      rec,
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "m-replay",
+        content: { type: "text", text: "earlier" },
+      },
+      null,
+      2,
+    );
+    replaying = false;
+    const resume: ResumeReport = {
+      outcome: "landed",
+      hint: "ok",
+      rule: "rule7:landed",
+      method: "session/resume",
+      requested: rec.snapshot.sessionId,
+      landedOn: rec.snapshot.sessionId,
+      historyLost: false,
+      acp: null,
+      replayedEvents: 1,
+      replayDropped: 0,
+      durationMs: 7,
+      at: nextTs(),
+    };
+    const generation = rec.snapshot.generation + 1;
+    rec.snapshot = {
+      ...rec.snapshot,
+      resume,
+      generation,
+      wakeCount: rec.snapshot.wakeCount + 1,
+      hibernatedAt: null,
+      process: {
+        pid: 5252 + workers.size,
+        groupId: process.platform === "win32" ? null : 5252 + workers.size,
+        startedAt: nextTs(),
+        command: process.execPath,
+        argsRedacted: ["agent.js"],
+        fingerprint: null,
+      },
+    };
+    setState(rec, "ready", "resumed", null, { resume, generation });
+    return rec.snapshot;
+  };
+
+  const probeSummary = (agentId: string) => ({
+    agentId,
+    at: nextTs(),
+    durationMs: 12,
+    fingerprint: `${agentId}@wire00000000`,
+    agentInfo: { name: agentId, version: "0.0.0-wire" },
+    protocolVersion: 1 as const,
+    capabilities: { loadSession: true },
+    methods: {},
+    errors: [],
+  });
+
   // ── routing ────────────────────────────────────────────────────────────────
 
   const whoami: WhoAmIResponse = {
@@ -594,7 +841,22 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
       if (typeof body.agent !== "string" || typeof body.cwd !== "string") {
         return errorResponse("bad_request", "agent and cwd are required");
       }
-      return json(201, createWorker({ agentId: body.agent, cwd: body.cwd }));
+      const created = createWorker({ agentId: body.agent, cwd: body.cwd });
+      const rec = workers.get(created.workerId);
+      // `CreateWorkerRequest.lease` defaults to `"take"`: the creator holds it (D5).
+      if (rec !== undefined) applyLease(rec, "acquire", callerOf(request), {});
+      return json(201, rec?.snapshot ?? created);
+    }
+
+    const probeMatch = /^\/v1\/agents\/([^/]+)\/probe$/.exec(path);
+    if (probeMatch !== null && request.method === "POST") {
+      const agentId = decodeURIComponent(probeMatch[1] ?? "");
+      if (!agents.some((a) => a.id === agentId)) {
+        return errorResponse("bad_request", `unknown agent "${agentId}"`);
+      }
+      const cached = probed.has(agentId);
+      probed.add(agentId);
+      return json(200, { probe: probeSummary(agentId), cached });
     }
 
     const worker = /^\/v1\/workers\/([^/]+)(\/.*)?$/.exec(path);
@@ -642,6 +904,33 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
 
     if (rest === "/cancel" && request.method === "POST") return json(202, {});
 
+    // ── M1: H17-H19 ────────────────────────────────────────────────────────
+    //
+    // The fixture models the RULES the SDK has to cope with, not the daemon's implementation of
+    // them: rule L7's stale fence, rule L9's audit envelope, §15.3's replay window and §15.5's
+    // `422` carrying a `ResumeReport`. The daemon's own behaviour is proven by
+    // `tests/integration`; a second implementation of it here would be a second opinion.
+
+    if (rest === "/hibernate" && request.method === "POST") {
+      const fenced = fenceOf(request, rec);
+      if (fenced !== null) return fenced;
+      hibernate(rec);
+      return json(200, rec.snapshot);
+    }
+
+    if (rest === "/wake" && request.method === "POST") {
+      const fenced = fenceOf(request, rec);
+      if (fenced !== null) return fenced;
+      if (rec.snapshot.state !== "hibernated") return json(200, rec.snapshot);
+      return json(200, wake(rec, callerOf(request)));
+    }
+
+    const leaseOp = /^\/lease\/(acquire|release|steal)$/.exec(rest);
+    if (leaseOp !== null && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { reason?: string };
+      return json(200, applyLease(rec, leaseOp[1] as LeaseOp | "acquire", callerOf(request), body));
+    }
+
     if (rest === "/events" && request.method === "GET") {
       const raw = parsed.searchParams.get("since");
       const since = raw === null ? 0 : Number(raw);
@@ -678,6 +967,11 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
       rec.closed = true;
       rec.snapshot = { ...rec.snapshot, closeReason: reason, process: null };
       setState(rec, "closed", reason);
+    },
+    epochs,
+    hibernateWorker: (workerId) => {
+      const rec = workers.get(workerId);
+      if (rec !== undefined && !rec.closed) hibernate(rec);
     },
     setScript: (workerId, script) => {
       const rec = workers.get(workerId);

@@ -37,7 +37,11 @@ describe("Server handle", () => {
     const worker = await server.createAgent("example", { cwd: "/tmp/wire", label: "a" });
 
     expect(worker.state).toBe("ready");
-    expect(worker.snapshot.capabilities?.loadSession).toBe(false);
+    // The fixture's agent advertises `loadSession` and a resume spelling, because M1's
+    // hibernate/wake surface needs an agent that can be woken (§15.2, ruling M1-R15). What this
+    // asserts is that the 201 carried the REAL handshake answer through unchanged.
+    expect(worker.snapshot.capabilities?.loadSession).toBe(true);
+    expect(worker.snapshot.capabilities?.resume.method).toBe("session/resume");
     expect(worker.snapshot.process?.pid).toBeGreaterThan(0);
     expect(wire.requests.at(-1)).toEqual({ method: "POST", path: "/v1/workers" });
   });
