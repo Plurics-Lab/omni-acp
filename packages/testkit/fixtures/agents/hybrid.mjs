@@ -29,10 +29,31 @@
 //   HYBRID_RATE_LIMIT=<status> put `{status}` in `usage_update._meta` under this fixture's own
 //                              pointer, so the descriptor's `rate_limit` extension has something
 //                              to resolve. Default: none.
+//   HYBRID_SESSION_DIR=<dir>   where sessions are persisted so a LATER PROCESS can resume one.
+//                              Default `<tmpdir>/omni-hybrid-sessions`; never the cwd, so a test
+//                              that hands this agent `process.cwd()` does not write to the repo.
+//
+// RESUME (M1). This fixture already ADVERTISED `loadSession: true` and
+// `sessionCapabilities.resume` — claude-acp's own handshake — while implementing neither, so
+// every resume against it was a `-32601` and no hermetic agent in this repository could make a
+// wake LAND. It now implements both spellings, and it implements them the way the corpus records
+// the real agent behaving (research README findings 11-13, CONTRACTS.md §15.3-§15.4):
+//
+//   * the session is keyed by (sessionId, cwd) and persisted UNDER `HYBRID_SESSION_DIR`, so a
+//     wake — which is a NEW PROCESS — can find it, and a resume from a FOREIGN cwd cannot;
+//   * a resume for an id this cwd does not own answers `-32002 {message:"Resource not found:
+//     <sessionId>"}` — F15's shape, which §15.4 classifies `unknown` / `cwd_mismatch` and
+//     explicitly must NOT classify `rejected_permanent`;
+//   * a resume that lands REPLAYS the stored transcript as `session/update` notifications
+//     BETWEEN the request and its response (F16's exact, uninterleaved window), then answers
+//     with the `session/new` body — the `loadReturnsBody` quirk, contrary to the v1 schema.
 //
 // Launched as `process.execPath <this file>`, never through npx (CONTRACTS.md §6.3).
 import * as acp from "@agentclientprotocol/sdk";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 
 const EOF_MARKER = process.env.HYBRID_EOF_MARKER ?? "";
@@ -40,6 +61,38 @@ const IGNORE_EOF = process.env.HYBRID_IGNORE_EOF === "1";
 const FATAL_STDERR = process.env.HYBRID_FATAL_STDERR === "1";
 const NEVER_ANSWER = process.env.HYBRID_NEVER_ANSWER === "1";
 const RATE_LIMIT = process.env.HYBRID_RATE_LIMIT ?? "";
+const SESSION_DIR = process.env.HYBRID_SESSION_DIR ?? join(tmpdir(), "omni-hybrid-sessions");
+
+// ── the session store: one small JSON file per session, keyed by id ──────────
+//
+// A wake is a NEW PROCESS, so an in-memory `Map` could never make a resume land — which is
+// exactly why this fixture used to answer `-32601` and why no hermetic suite could prove
+// §15.3. The file records the cwd the session was created in, and the resume path refuses a
+// mismatch: that is what makes `resume-cwd-mismatch` reproducible without a real agent.
+
+const sessionFile = (sessionId) => join(SESSION_DIR, `${encodeURIComponent(sessionId)}.json`);
+
+const readSession = (sessionId) => {
+  try {
+    return JSON.parse(readFileSync(sessionFile(sessionId), "utf8"));
+  } catch {
+    return null;
+  }
+};
+
+const writeSession = (session) => {
+  try {
+    mkdirSync(SESSION_DIR, { recursive: true });
+    writeFileSync(sessionFile(session.sessionId), JSON.stringify(session), "utf8");
+  } catch {
+    // A store we cannot write is a session that cannot be resumed, which is a legitimate agent
+    // and is classified as such. It is never a reason to fail the call the client actually made.
+  }
+};
+
+/** F15's shape, verbatim: the code and the message a cwd mismatch produces on the real agent. */
+const resourceNotFound = (sessionId) =>
+  new acp.RequestError(-32002, `Resource not found: ${sessionId}`);
 
 let keepAlive = null;
 process.on("SIGTERM", () => {
@@ -89,6 +142,80 @@ const CONFIG_OPTIONS = [
 
 const never = () => new Promise(() => {});
 
+/**
+ * The half of `session/new`'s answer a resume returns TOO.
+ *
+ * `loadReturnsBody` is the quirk (F18): `session/load` / `session/resume` come back with the
+ * `session/new` body although the v1 schema types the result `null`. Sharing the literal is the
+ * point — a resume that answered a DIFFERENT shape would be a second agent, not a resumed one.
+ */
+const SESSION_BODY = {
+  modes: {
+    currentModeId: "default",
+    availableModes: [
+      { id: "default", name: "Manual" },
+      { id: "acceptEdits", name: "Accept edits" },
+    ],
+  },
+  configOptions: CONFIG_OPTIONS,
+};
+
+/** Append the client's own prompt to the stored transcript, so a resume has something to replay. */
+const remember = (sessionId, prompt) => {
+  const session = readSession(sessionId);
+  if (session === null) return;
+  const text = (Array.isArray(prompt) ? prompt : [])
+    .filter((block) => block !== null && typeof block === "object" && block.type === "text")
+    .map((block) => String(block.text ?? ""))
+    .join("");
+  session.transcript.push({ role: "user", text });
+  session.transcript.push({ role: "agent", text: "I could not read that file." });
+  writeSession(session);
+};
+
+/**
+ * `session/load` and `session/resume` (CONTRACTS.md §15.3).
+ *
+ * The refusal is the interesting half: an id this cwd does not own is `-32002 Resource not
+ * found`, which §15.4 must classify `unknown` / `cwd_mismatch` with the pointer KEPT — never
+ * `rejected_permanent`. The negative lock in `resume-classify.ts` exists for exactly this
+ * message, and this fixture is what lets a hermetic suite produce it.
+ *
+ * The success half replays the transcript as `session/update` notifications and only THEN
+ * resolves, so everything between the request and the response is replay — F16's window,
+ * reproduced without a real agent.
+ */
+async function resume(ctx) {
+  const sessionId = ctx.params.sessionId;
+  const session = readSession(sessionId);
+  if (session === null) throw resourceNotFound(sessionId);
+  // The cwd check is the whole of `resumeRequiresSameCwd`: the real agent keys its sessions by
+  // project directory, so the SAME live session is refused from a foreign cwd (F15).
+  if (session.cwd !== null && ctx.params.cwd !== undefined && ctx.params.cwd !== session.cwd) {
+    throw resourceNotFound(sessionId);
+  }
+
+  for (const entry of session.transcript) {
+    await ctx.client.notify("session/update", {
+      sessionId,
+      update:
+        entry.role === "user"
+          ? {
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text: entry.text },
+            }
+          : {
+              sessionUpdate: "agent_message_chunk",
+              // Stable across processes, like the real agent's (F14) — which is what makes
+              // `resume.replay: "drop_duplicates"` conceivable at all.
+              messageId: `hybrid-msg-1`,
+              content: { type: "text", text: entry.text },
+            },
+    });
+  }
+  return { sessionId, ...SESSION_BODY };
+}
+
 acp
   .agent({ name: "hybrid" })
   .onRequest("initialize", () => ({
@@ -101,20 +228,24 @@ acp
     },
   }))
   // …and v2 in the body: `configOptions` is a v2 field on a v1 `session/new` response (F24).
-  .onRequest("session/new", () => ({
-    sessionId: `hybrid-${++sessions}`,
-    modes: {
-      currentModeId: "default",
-      availableModes: [
-        { id: "default", name: "Manual" },
-        { id: "acceptEdits", name: "Accept edits" },
-      ],
-    },
-    configOptions: CONFIG_OPTIONS,
-  }))
+  .onRequest("session/new", (ctx) => {
+    // The id carries the pid and six random characters because sessions are persisted under ONE
+    // shared directory: a bare counter would let two concurrently-running fixtures both mint
+    // `hybrid-1` and then resume each other's transcript.
+    const sessionId = `hybrid-${String(process.pid)}-${++sessions}-${randomBytes(3).toString("hex")}`;
+    writeSession({ sessionId, cwd: ctx.params.cwd ?? null, transcript: [] });
+    return { sessionId, ...SESSION_BODY };
+  })
+  // Both spellings, one implementation. F18 records ONE claude-acp process answering both, and a
+  // client that walks a preference order has to find the same session behind either name.
+  .onRequest("session/load", (ctx) => resume(ctx))
+  .onRequest("session/resume", (ctx) => resume(ctx))
   .onRequest("session/prompt", async (ctx) => {
     const sessionId = ctx.params.sessionId;
     const send = (update) => ctx.client.notify("session/update", { sessionId, update });
+    // What a later process would replay. Recorded BEFORE the turn runs, so a turn that never
+    // finishes still leaves the question in the transcript — which is what the real agent does.
+    remember(sessionId, ctx.params.prompt);
 
     await send({ sessionUpdate: "config_option_update", configOptions: CONFIG_OPTIONS });
     await send({

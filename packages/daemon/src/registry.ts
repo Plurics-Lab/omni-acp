@@ -8,6 +8,7 @@ import {
   type CloseResult,
   type DaemonId,
   type EventLog,
+  type HibernateTimer,
   type IdGen,
   type Lease,
   type LeaseSnapshot,
@@ -33,6 +34,7 @@ import {
 } from "@omni-acp/protocol";
 import {
   alwaysGrantedLease,
+  createHibernateTimer,
   createMemoryEventLog,
   createNormalizer,
   createPersistedEventLog,
@@ -107,10 +109,32 @@ interface Entry {
   readonly agentId: string;
   /** Unsubscribes the row-persisting state listener; run once, when the entry is dropped. */
   offStateChange: (() => void) | null;
+  /**
+   * This worker's idle budget in ms, or `null` when hibernation is off for it.
+   *
+   * `CreateWorkerRequest.idleTimeoutMs` overrides `hibernate.idleMs` per worker, and `0` in
+   * either place means "never hibernate this worker" — which has to survive as `null` rather
+   * than as a zero-millisecond timer that fires immediately (`WorkerRow.hibernateIdleMs`).
+   */
+  readonly hibernateIdleMs: number | null;
+  /** §15.2's `ready -> hibernated` driver. Armed by `watchEntry`, cancelled with the worker. */
+  idleTimer: HibernateTimer | null;
 }
 
 /** The states that occupy a `maxWorkers` slot: a worker with a process, or on its way to one. */
 const OCCUPIES_A_SLOT: readonly WorkerState[] = ["starting", "ready", "running", "requires_action"];
+
+/**
+ * One worker's idle budget: the request's override, else the daemon-wide setting.
+ *
+ * `0` in either place is "hibernation is off", and it must come back as `null` — a
+ * zero-millisecond timer fires immediately, which would hibernate every worker the instant it
+ * became ready (`HibernateConfig.idleMs`, `CreateWorkerRequest.idleTimeoutMs`).
+ */
+function idleBudgetOf(requested: number | undefined, daemonWide: number): number | null {
+  const ms = requested ?? daemonWide;
+  return ms > 0 ? ms : null;
+}
 
 /** How long `closeAll` waits for the whole fleet before returning anyway (best effort). */
 const DEFAULT_CLOSE_ALL_MS = 30_000;
@@ -240,6 +264,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
 
   const store = o.persistence;
 
+  /** This daemon's idle budget for one worker; see `idleBudgetOf`. */
+  const idleBudget = (requested: number | undefined): number | null =>
+    idleBudgetOf(requested, o.config.hibernate.idleMs);
+
   /**
    * `WorkerRow` for a live handle. The snapshot is the client-facing half; the rest is what a
    * snapshot does not carry because it is not client-facing (§5.1 `WorkerRow`).
@@ -255,10 +283,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       lastActiveMs: o.clock.now(),
       closedAtMs: snapshot.state === "closed" ? (previous?.closedAtMs ?? o.clock.now()) : null,
       // `0` disables hibernation daemon-wide, and it must survive as `null` rather than as a
-      // zero-millisecond idle timer that fires immediately on the next boot.
-      hibernateIdleMs:
-        previous?.hibernateIdleMs ??
-        (o.config.hibernate.idleMs > 0 ? o.config.hibernate.idleMs : null),
+      // zero-millisecond idle timer that fires immediately on the next boot. The ENTRY's budget
+      // wins over the persisted one: `CreateWorkerRequest.idleTimeoutMs` is a per-worker
+      // override, and a row written before it was read would pin the daemon-wide value forever.
+      hibernateIdleMs: entry.hibernateIdleMs ?? previous?.hibernateIdleMs ?? null,
     };
   };
 
@@ -424,6 +452,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       live: false,
       agentId: row.agentId,
       offStateChange: null,
+      // The budget the row was created with, so a per-worker `idleTimeoutMs` survives a restart.
+      // A row from a boot that never recorded one falls back to this boot's daemon-wide value.
+      hibernateIdleMs: row.hibernateIdleMs ?? idleBudget(undefined),
+      idleTimer: null,
     };
     if (OCCUPIES_A_SLOT.includes(row.snapshot.state)) reacquire(entry);
     entries.set(workerId, entry);
@@ -466,8 +498,66 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
    * them, which is what keeps hibernation's ordering argument (§15.2) inside the one class that
    * can make it.
    */
+  /**
+   * §15.2's idle timer, armed HERE because this is the only place that knows both the worker's
+   * budget and its state transitions.
+   *
+   * `createHibernateTimer` is M1-WP-C's and is pure over an injected clock; the registry supplies
+   * the three things it cannot know — whether this worker's agent advertises a resume spelling
+   * (read at FIRE TIME, because the handshake may not have happened when the timer was built),
+   * what `hibernate.whenNotResumable` says, and what "hibernate" actually does.
+   *
+   * The transition itself is `Worker.hibernate()`'s, so every ordering rule in §15.2 stays inside
+   * the one class that can make it. A refusal here is not an error: a turn that started between
+   * the timer firing and the call landing answers `worker_busy`, and the next `turn_end` re-arms.
+   */
+  const armIdleTimer = (entry: Entry): void => {
+    const idleMs = entry.hibernateIdleMs;
+    if (idleMs === null || idleMs <= 0) return;
+    const logger = o.logger.child({ workerId: entry.id, component: "hibernate-timer" });
+    entry.idleTimer = createHibernateTimer({
+      clock: o.clock,
+      idleMs,
+      logger,
+      // Ruling M1-R15's gate. `resume.method === null` is an agent that told us it cannot resume;
+      // hibernating it would turn a healthy worker into a guaranteed 422 on a timer.
+      resumable: () => entry.handle.snapshot().capabilities?.resume.method !== null,
+      whenNotResumable: o.config.hibernate.whenNotResumable,
+      onNotResumable: () => {
+        void entry.handle.close("idle_timeout").catch((e: unknown) => {
+          logger.warn("closing an idle non-resumable worker failed", { error: String(e) });
+        });
+      },
+      onFire: () => {
+        // `maxHibernated` is the registry's bound, not the worker's, so it is checked here for
+        // the same reason `hibernate(id, auth)` checks it: the transition reclaims a process tree
+        // and there is no undo.
+        if (countHibernated() >= o.config.hibernate.maxHibernated) {
+          logger.info("idle timer fired but the hibernated-worker limit is reached", {
+            maxHibernated: o.config.hibernate.maxHibernated,
+          });
+          return;
+        }
+        void entry.handle.hibernate("idle_timeout").catch((e: unknown) => {
+          // Every refusal edge is legitimate: `worker_busy` (a turn started first),
+          // `not_resumable` (the agent advertises no spelling), `worker_closed` (it went away).
+          // None of them is worth failing anything over — the next turn boundary re-arms.
+          logger.debug("idle hibernation was refused", { error: String(e) });
+        });
+      },
+    });
+    entry.idleTimer.touch();
+  };
+
   const watchEntry = (entry: Entry): void => {
+    armIdleTimer(entry);
     entry.offStateChange = entry.handle.onStateChange((state) => {
+      // The idle countdown NEVER runs across a live turn (§15.2): `pause()` while the worker is
+      // busy or asleep, `touch()` on every return to `ready`, `cancel()` once it is gone.
+      if (state === "ready") entry.idleTimer?.touch();
+      else if (state === "closed") entry.idleTimer?.cancel();
+      else entry.idleTimer?.pause();
+
       if (state === "hibernated") {
         // A hibernated worker owns NO process, so it must not hold a `maxWorkers` slot (H14).
         // It is bounded by `hibernate.maxHibernated` instead, enforced in `wake`/`hibernate`.
@@ -698,6 +788,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           live: true,
           agentId: req.agent,
           offStateChange: null,
+          // `CreateWorkerRequest.idleTimeoutMs` overrides the daemon-wide budget for THIS worker,
+          // and `0` in either place means "never hibernate this one" (H5, §15.2).
+          hibernateIdleMs: idleBudget(req.idleTimeoutMs),
+          idleTimer: null,
         };
         entries.set(workerId, entry);
         watchEntry(entry);
@@ -822,6 +916,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       for (const entry of entries.values()) {
         entry.subscription?.close();
         entry.handle.log.close();
+        // A live `setTimer` keeps the event loop referenced, so a daemon that stopped would not
+        // exit until every idle budget elapsed. `cancel()` is terminal by design.
+        entry.idleTimer?.cancel();
+        entry.idleTimer = null;
       }
     },
 

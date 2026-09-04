@@ -15,7 +15,13 @@ import {
   type WhoAmIResponse,
   type WorkerId,
 } from "@omni-acp/protocol";
-import { createBaselineResponder, createLease, createSupervisor } from "@omni-acp/core";
+import {
+  DEFAULT_V1_PROFILE,
+  createBaselineResponder,
+  createLease,
+  createSessionStrategy,
+  createSupervisor,
+} from "@omni-acp/core";
 import type { AddressInfo } from "node:net";
 import type { Hono } from "hono";
 import { createTokenStore } from "./auth.js";
@@ -197,8 +203,32 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
             }
           },
         })),
-    // Seam 2: absent ⇒ `worker.ts`'s inline M0 handshake, so the M0 suite runs untouched.
-    ...(deps?.session === undefined ? {} : { session: deps.session }),
+    /**
+     * SEAM 2, closed: M1-WP-C's `SessionStrategy` is the daemon's default.
+     *
+     * Absent, `worker.ts` falls back to M0's inline `runHandshake` — and that fallback is what
+     * the Land step left standing so the M0 suite could run before WP-C existed. It is NOT a
+     * viable production default any more: `Worker.hibernate()` REFUSES outright when no strategy
+     * is wired ("no SessionStrategy is wired, so nothing could reopen the session") and
+     * `Worker.wake()` closes the worker with `not_resumable`, so a daemon composed without one
+     * has an idle timer that can never fire and a `POST …/wake` that can only fail. The M1
+     * integration suite found exactly that (M1-PLAN §2, WP-F 6).
+     *
+     * The strategy is per DAEMON while the quirk table is per AGENT, which is why it is
+     * constructed with the generic v1 profile: every call carries its own
+     * `SessionOpenOptions.descriptor` / `SessionReopenOptions.descriptor` — the worker's resolved
+     * builtin ⊕ config ⊕ probe table — and `session-open.ts` prefers it (§17.2). The constructor
+     * argument is only the fallback for a caller that has none.
+     *
+     * An injected `deps.session` still wins, so a test can drive a scripted strategy.
+     */
+    session:
+      deps?.session ??
+      createSessionStrategy({
+        descriptor: DEFAULT_V1_PROFILE,
+        clock,
+        logger: logger.child({ mod: "session" }),
+      }),
     persistence,
     onBootAdoption: (r) => {
       adoption = r;
