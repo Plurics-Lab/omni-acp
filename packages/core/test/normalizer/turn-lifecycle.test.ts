@@ -562,7 +562,7 @@ describe("normalizer: the object itself", () => {
   it("declares the slice it implements", () => {
     const n = make();
     expect(n.sourceProtocolVersion).toBe(1);
-    expect(n.slice).toBe("m0-lifecycle");
+    expect(n.slice).toBe("m1-full");
   });
 
   it("is a pure function of its inputs: two instances, same script, identical outputs", () => {

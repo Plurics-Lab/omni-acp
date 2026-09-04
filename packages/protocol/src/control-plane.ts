@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { PlatformOwnership } from "./contracts.js";
+import type { PlatformOwnership, RetentionReport } from "./contracts.js";
 import type { Seq, TokenId, TurnId, DaemonId } from "./ids.js";
+import type { ProbeSummary } from "./runtime.js";
 import type { WorkerSnapshot } from "./worker.js";
 
 /**
@@ -19,9 +20,38 @@ export const CreateWorkerRequest = z.strictObject({
   onUnresolved: z.literal("deny").optional(),
   /** Handshake budget in ms. Default 60_000. */
   timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
-  // M1+/M2, rejected by strictObject in M0: policy, env
+  /** Per-worker override of `hibernate.idleMs`. 0 disables hibernation for this worker. */
+  idleTimeoutMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  /** "take" (default) ⇒ the creator holds the lease; "observe" ⇒ created lease-free (D5). */
+  lease: z.enum(["take", "observe"]).optional(),
+  // M2, still rejected by strictObject: policy, env
 });
 export type CreateWorkerRequest = z.infer<typeof CreateWorkerRequest>;
+
+export const LeaseRequestBody = z.strictObject({
+  ttlMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  /** `steal` only; recorded VERBATIM in the `omni.lease` audit envelope (D5: 带审计). */
+  reason: z.string().max(500).optional(),
+});
+export type LeaseRequestBody = z.infer<typeof LeaseRequestBody>;
+
+export const WakeRequestBody = z.strictObject({
+  timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+});
+export type WakeRequestBody = z.infer<typeof WakeRequestBody>;
+
+export const ProbeRequestBody = z.strictObject({
+  force: z.boolean().optional(),
+  deep: z.boolean().optional(),
+  timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+});
+export type ProbeRequestBody = z.infer<typeof ProbeRequestBody>;
+
+export interface ProbeResponse {
+  readonly probe: ProbeSummary;
+  /** true ⇒ served from `<dataDir>/probes/<id>.json` without spawning anything. */
+  readonly cached: boolean;
+}
 
 /**
  * M0 accepts ONLY `type: "text"` blocks (CONTRACTS.md §2.3, review R12).
@@ -82,6 +112,30 @@ export interface DaemonInfo {
   readonly startedAt: string;
   /** CONTRACTS.md §6 — the honesty field. */
   readonly ownership: PlatformOwnership;
+  /** The version of the canonical payload this daemon WRITES. M1: 2 (ruling M1-R10). */
+  readonly canonicalPayloadVersion: 2;
+  /**
+   * §14.9 / H21. `driver` says whether this daemon's logs survive a restart, `writeFailures`
+   * says whether they still do. An operator must be able to read these BEFORE anything goes
+   * wrong (§6.6's rule, extended).
+   */
+  readonly persistence: {
+    readonly driver: "memory" | "sqlite";
+    readonly file: string | null;
+    readonly schemaVersion: number;
+    readonly sizeBytes: number;
+    readonly writeFailures: number;
+    readonly retentionDays: number;
+    readonly lastSweep: RetentionReport | null;
+  };
+  /** This daemon INSTANCE's id (not the stable `daemonId`). Distinguishes boots (§15.7). */
+  readonly bootId: string;
+  /** What a previous boot left behind — including `skipped: n` on Windows, where nothing can be reaped. */
+  readonly orphansAtStart: {
+    readonly found: number;
+    readonly reaped: number;
+    readonly skipped: number;
+  };
 }
 
 export interface AgentCatalogEntry {
@@ -89,8 +143,10 @@ export interface AgentCatalogEntry {
   readonly command: string;
   readonly args: readonly string[];
   readonly source: "config";
-  /** M1. */
-  readonly probed: null;
+  /** The cached probe, or null if never probed — NEVER fabricated (H4). */
+  readonly probed: ProbeSummary | null;
+  /** The descriptor that WILL govern a worker created now: `"<agentId>@<fingerprint12>"`. */
+  readonly runtimeId: string;
 }
 
 export interface WorkerListResponse {
@@ -105,6 +161,8 @@ export const HEADER = {
   auth: "authorization",
   clientId: "omni-client-id",
   lastEventId: "last-event-id",
+  /** Optional fencing token. Present and stale ⇒ 423 (§16.1 rule L7). */
+  leaseEpoch: "omni-lease-epoch",
 } as const;
 
 /** SSE control frames that are NOT envelopes and consume no seq (CONTRACTS.md §8.4). */

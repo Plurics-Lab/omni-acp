@@ -1,20 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { createBaselineResponder } from "@omni-acp/core";
-import type { PermissionOption, RequestPermissionRequest } from "@omni-acp/protocol";
+import type { MappedPermissionRequest, PermissionOption } from "@omni-acp/protocol";
 import { fakeClock } from "@omni-acp/testkit";
 
 const option = (optionId: string, kind: string, name = optionId): PermissionOption =>
   ({ optionId, kind, name }) as PermissionOption;
 
+/**
+ * The V2-MAPPED request, because ruling M1-R14 is that the responder never sees the raw v1 one:
+ * D4's rule set is written against v2's tagged `subject`, and mapping first is what lets M2's
+ * rule engine match without a per-agent branch. The mapping itself
+ * (`normalizer/map/permission.ts`) is tested separately; every rule asserted below is unchanged.
+ */
 const request = (
   options: readonly PermissionOption[],
   title = "Write src/main.ts",
-): RequestPermissionRequest =>
-  ({
-    sessionId: "sess_1",
-    toolCall: { toolCallId: "call_1", title },
-    options: [...options],
-  }) as unknown as RequestPermissionRequest;
+): MappedPermissionRequest => ({
+  sessionId: "sess_1",
+  title,
+  subject: { type: "tool_call", toolCall: { toolCallId: "call_1", title } },
+  options: [...options],
+  toolCallId: "call_1",
+});
 
 const ALLOW_ONCE = option("allow", "allow_once");
 const REJECT_ONCE = option("reject", "reject_once");
@@ -138,11 +145,15 @@ describe("createBaselineResponder — the recorded decision", () => {
     expect(responder("deny").decide(request([REJECT_ONCE], "Delete build/")).record.title).toBe(
       "Delete build/",
     );
+    // The mapper is what recovers a title from `toolCall.title` (v1 has no top-level one); a
+    // request whose tool call had none arrives here with `title: ""`, and the record keeps it.
     const noTitle = {
       sessionId: "s",
-      toolCall: { toolCallId: "c" },
+      title: "",
+      subject: { type: "tool_call", toolCall: { toolCallId: "c" } },
       options: [REJECT_ONCE],
-    } as unknown as RequestPermissionRequest;
+      toolCallId: "c",
+    } as MappedPermissionRequest;
     expect(responder("deny").decide(noTitle).record.title).toBe("");
   });
 
@@ -153,7 +164,7 @@ describe("createBaselineResponder — the recorded decision", () => {
   });
 
   it("is total: a request with no options array at all still yields a record", () => {
-    const d = responder("deny").decide({ sessionId: "s" } as unknown as RequestPermissionRequest);
+    const d = responder("deny").decide({ sessionId: "s" } as unknown as MappedPermissionRequest);
     expect(d.response).toBeNull();
     expect(d.record.offered).toEqual([]);
     expect(d.record.title).toBe("");

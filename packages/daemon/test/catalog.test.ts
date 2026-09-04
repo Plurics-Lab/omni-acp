@@ -27,6 +27,9 @@ describe("Catalog (H4, D22)", () => {
         args: ["--version"],
         source: "config",
         probed: null,
+        // Which quirk table WILL govern a worker created now (§5.1 AgentCatalogEntry).
+        // `unresolved` is the fingerprint sentinel until M1-WP-E computes the real sha256.
+        runtimeId: "example@unresolved",
       },
     ]);
   });

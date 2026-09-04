@@ -109,6 +109,18 @@ function fakePlatformOps(ownership: PlatformOwnership): PlatformOps {
     isTreeGone: (p) =>
       Promise.resolve(ownership.confirmsTreeGone && (p as FakeAgentProcess).pid === null),
     isLeaderGone: (p) => Promise.resolve((p as FakeAgentProcess).pid === null),
+
+    // ── M1 (§15.7) ──────────────────────────────────────────────────────────
+    //
+    // The fake models the PLATFORM SPLIT and nothing else: a POSIX fake takes a fingerprint (so
+    // the "reap only on a match" tests have something to match), a Windows fake returns null (so
+    // the "never signal without one" tests have the real refusal). Neither talks to /proc or ps.
+    fingerprint: (pid: number) => Promise.resolve(windows ? null : `fake:${String(pid)}`),
+    signalTreeByGroup: (_groupId, sig) =>
+      Promise.resolve<TerminationRung>(
+        sig === "SIGTERM" ? "sigterm" : windows ? "taskkill" : "sigkill",
+      ),
+    isGroupGone: () => Promise.resolve(ownership.confirmsTreeGone),
   };
 }
 
@@ -161,6 +173,9 @@ function createFakeAgentProcess(
     startedAt,
     command: spec.command,
     argsRedacted: [...spec.args],
+    // Same platform split as `fakePlatformOps.fingerprint`, captured where a real spawn captures
+    // it — null on Windows means "never signal this pid after a restart" (§15.7).
+    fingerprint: windows ? null : `fake:${String(pid)}`,
   };
 
   const process_: FakeAgentProcess = {
@@ -236,6 +251,23 @@ export function fakeSupervisor(opts?: { ownership?: PlatformOwnership }): FakeSu
 
     enqueue(agent) {
       queue.push(agent);
+    },
+
+    /**
+     * §15.7's rule, modelled honestly: signal ONLY when the recorded fingerprint still matches,
+     * and record WHY when it does not. A null fingerprint is never a reason to signal — pid reuse
+     * makes that a coin flip on somebody else's process. Nothing is actually killed here; the
+     * point of the fake is that a test can assert no signal was even attempted.
+     */
+    reapOrphan(o) {
+      const live = platform.ownership.confirmsTreeGone;
+      if (o.fingerprint === null) {
+        return Promise.resolve({ ...o, reaped: false, reapSkipped: "unsupported_platform" });
+      }
+      if (!live) {
+        return Promise.resolve({ ...o, reaped: false, reapSkipped: "policy" });
+      }
+      return Promise.resolve({ ...o, reaped: true, reapSkipped: null });
     },
 
     spawn(spec, signal) {

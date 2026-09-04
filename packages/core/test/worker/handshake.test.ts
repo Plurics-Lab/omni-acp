@@ -32,6 +32,14 @@ describe("createWorker — the successful handshake (WP-4 acceptance 1)", () => 
       loadSession: false,
       promptCapabilities: null,
       supportsSessionClose: false,
+      // M1's fields (§5.1 `AgentCapabilitiesSnapshot`). `resume.method: null` is "no resume
+      // spelling has been RESOLVED" — the reading that makes `whenNotResumable:"keep"` refuse to
+      // hibernate — and every other field says the handshake learned nothing it did not observe.
+      resume: { method: null, replayFrom: false, requiresSameCwd: false },
+      supportsSessionList: false,
+      configOptions: null,
+      modes: null,
+      extensions: [],
     });
     expect(snap.process?.pid).toBeGreaterThan(0);
     expect(snap.closeReason).toBeNull();

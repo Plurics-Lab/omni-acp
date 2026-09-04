@@ -100,9 +100,73 @@ import type {
   WorkerSnapshot,
   WorkerState,
   WorkerStatePayload,
+  // ── M1 (CONTRACTS.md §5.1: lease.ts, resume.ts, runtime.ts, and the §5.1 diffs) ──────────
+  AcpLinkLike,
+  BuiltinRuntime,
+  ClientRefWire,
+  CloseOutAction,
+  ErrorClass,
+  ErrorRule,
+  EventLogCoreOptions,
+  EventStore,
+  EventStoreDiagnostics,
+  ExtensionPath,
+  HibernateTimer,
+  LeaseEventPayload,
+  LeaseOp,
+  LeaseOptions,
+  LeaseRequestBody,
+  LeaseSnapshot,
+  MappedPermissionRequest,
+  MappedUpdate,
+  MethodPreferences,
+  MethodVerdict,
+  OrphanRecord,
+  OutboundCall,
+  PersistedEventLogOptions,
+  PersistenceHandle,
+  ProbeRequestBody,
+  ProbeResponse,
+  ProbeSummary,
+  Quirks,
+  ResolvedEventLogConfig,
+  ResolvedHibernateConfig,
+  ResolvedLeaseConfig,
+  ResolvedProbeConfig,
+  ResumeAttempt,
+  ResumeHint,
+  ResumeMethod,
+  ResumeOutcome,
+  ResumeReport,
+  RetentionInput,
+  RetentionPlan,
+  RetentionReport,
+  RuntimeDescriptor,
+  RuntimeOverlay,
+  SessionOpenOptions,
+  SessionOpenResult,
+  SessionReopenOptions,
+  SessionStrategy,
+  TurnVerdict,
+  TurnWarning,
+  UpdateRule,
+  WakeRequestBody,
+  WorkerRow,
+  WorkerStateReason,
+  WorkerStore,
 } from "@omni-acp/protocol";
 import type { FakeAgentProcess, FakeClock, FakeSupervisor, ScriptedAgent } from "@omni-acp/testkit";
-import type { AcpLink, AcpLinkHandlers, CreateWorkerDeps, SupervisorOptions } from "@omni-acp/core";
+import type {
+  AcpLink,
+  AcpLinkHandlers,
+  CreateWorkerDeps,
+  SupervisorOptions,
+  // ── M1 ────────────────────────────────────────────────────────────────────
+  NormalizerOptions,
+  OpenPersistenceOptions,
+  ProbeOptions,
+  RehydrateDeps,
+} from "@omni-acp/core";
 import type {
   AuthContext as DaemonAuthContext,
   Catalog as DaemonCatalog,
@@ -110,6 +174,9 @@ import type {
   DaemonDeps as DaemonDepsType,
   DaemonEvent as DaemonEventType,
   WorkerRegistry as DaemonWorkerRegistry,
+  // ── M1 ────────────────────────────────────────────────────────────────────
+  ProbeCache,
+  ProbeService,
 } from "@omni-acp/daemon";
 import type {
   ConnectOptions,
@@ -121,6 +188,8 @@ import type {
   StreamEvent,
   Worker,
   WorkerEventMap,
+  // ── M1 ────────────────────────────────────────────────────────────────────
+  WorkerLease,
 } from "@omni-acp/client";
 import type { ParsedArgs } from "@omni-acp/cli";
 
@@ -129,6 +198,67 @@ import type { ParsedArgs } from "@omni-acp/cli";
  * delete the coverage. `never` inhabits every position, and none of this is evaluated.
  */
 type Named =
+  // ── M1 (the Land step's additions; see the import blocks above) ─────────────
+  | AcpLinkLike
+  | BuiltinRuntime
+  | ClientRefWire
+  | CloseOutAction
+  | ErrorClass
+  | ErrorRule
+  | EventLogCoreOptions
+  | EventStore
+  | EventStoreDiagnostics
+  | ExtensionPath
+  | HibernateTimer
+  | LeaseEventPayload
+  | LeaseOp
+  | LeaseOptions
+  | LeaseRequestBody
+  | LeaseSnapshot
+  | MappedPermissionRequest
+  | MappedUpdate
+  | MethodPreferences
+  | MethodVerdict
+  | OrphanRecord
+  | OutboundCall
+  | PersistedEventLogOptions
+  | PersistenceHandle
+  | ProbeRequestBody
+  | ProbeResponse
+  | ProbeSummary
+  | Quirks
+  | ResolvedEventLogConfig
+  | ResolvedHibernateConfig
+  | ResolvedLeaseConfig
+  | ResolvedProbeConfig
+  | ResumeAttempt
+  | ResumeHint
+  | ResumeMethod
+  | ResumeOutcome
+  | ResumeReport
+  | RetentionInput
+  | RetentionPlan
+  | RetentionReport
+  | RuntimeDescriptor
+  | RuntimeOverlay
+  | SessionOpenOptions
+  | SessionOpenResult
+  | SessionReopenOptions
+  | SessionStrategy
+  | TurnVerdict
+  | TurnWarning
+  | UpdateRule
+  | WakeRequestBody
+  | WorkerRow
+  | WorkerStateReason
+  | WorkerStore
+  | NormalizerOptions
+  | OpenPersistenceOptions
+  | ProbeOptions
+  | RehydrateDeps
+  | ProbeCache
+  | ProbeService
+  | WorkerLease
   | AcpErrorDetail
   | AgentCapabilitiesSnapshot
   | AgentCatalogEntry
@@ -266,8 +396,14 @@ const LITERALS: {
  * Architecture guard: `exports-are-stable` (CONTRACTS.md §10.2, review R15).
  *
  * Every name in each frozen `index.ts` resolves and is typed. The lists are literal on purpose:
- * the barrels are FROZEN (M0-PLAN §1.2), so a diff here is a renegotiation of CONTRACTS.md, and
- * the test is supposed to say so out loud rather than accommodate it.
+ * the barrels are FROZEN (M0-PLAN §1.2, M1-PLAN §1.1), so a diff here is a renegotiation of
+ * CONTRACTS.md, and the test is supposed to say so out loud rather than accommodate it.
+ *
+ * The M1 names were added by the Land step, which is the one commit allowed to move them
+ * (M1-PLAN §1.1); every one of them is a signature-complete stub whose body throws
+ * `unimplemented: M1-WP-x` until its work package fills it in. `resolves every exported value`
+ * below checks that the BINDING exists, never that calling it works — a stub that throws is
+ * exactly what this milestone's barrel is supposed to contain.
  */
 const EXPECTED: Record<string, readonly string[]> = {
   "@omni-acp/protocol": [
@@ -279,19 +415,31 @@ const EXPECTED: Record<string, readonly string[]> = {
     "DaemonConfig",
     "ERROR_STATUS",
     "EVENT_KINDS",
+    "EventLogConfig",
     "HEADER",
+    "HibernateConfig",
     "ID_PATTERN",
+    "LeaseConfig",
+    "LeaseRequestBody",
     "ListenConfig",
     "M0_WORKER_STATES",
+    "M1_WORKER_STATES",
     "OMNI_ERROR_CODES",
     "OmniError",
+    "ProbeConfig",
+    "ProbeOverrides",
+    "ProbeRequestBody",
     "PromptRequestBody",
+    "RESUME_OUTCOMES",
+    "ResumeReplayConfig",
+    "RuntimeOverlay",
     "SSE_CONTROL",
     "SupervisorConfig",
     "TokenConfig",
     "TurnConfig",
     "ULID_BODY",
     "WORKER_STATES",
+    "WakeRequestBody",
     "assertTurnId",
     "assertWorkerId",
     "createIdGen",
@@ -310,31 +458,66 @@ const EXPECTED: Record<string, readonly string[]> = {
   "@omni-acp/testkit": [
     "collectSse",
     "fakeClock",
+    "fakeRuntime",
     "fakeSupervisor",
     "fixtureAgentPath",
     "isAlive",
+    "loadTranscript",
     "memoryStreamPair",
     "nullLogger",
     "parseSse",
     "runEventLogConformance",
+    "runLeaseConformance",
     "scriptedAgent",
     "sdkExampleAgentPath",
     "seqIds",
     "stubDaemon",
+    "tmpPersistence",
+    "transcriptNames",
+    "transcriptUpdates",
     "waitGone",
+    "wireAgentPath",
   ],
   "@omni-acp/core": [
+    "BUILTIN_RUNTIMES",
+    "DEFAULT_V1_PROFILE",
+    "SCHEMA_VERSION",
+    "acquireDataDirLock",
     "alwaysGrantedLease",
+    "classifyProbe",
+    "classifyResume",
     "createBaselineResponder",
+    "createEventLogCore",
+    "createHibernateTimer",
+    "createLease",
     "createMemoryEventLog",
     "createNormalizer",
+    "createPersistedEventLog",
     "createPlatformOps",
+    "createRehydratedWorker",
+    "createSessionStrategy",
     "createSupervisor",
     "createWorker",
+    "descriptorFingerprint",
+    "fingerprintOf",
     "openAcpLink",
+    "openPersistence",
+    "planRetention",
+    "probeAgent",
+    "resolveDescriptor",
+    "runRetention",
     "runUtility",
   ],
-  "@omni-acp/daemon": ["createDaemon", "createHttpApp"],
+  "@omni-acp/daemon": [
+    "createDaemon",
+    "createHttpApp",
+    "createProbeCache",
+    "createProbeService",
+    "openDaemonPersistence",
+    "recoverFromPreviousBoot",
+    "registerAgentRoutes",
+    "registerLeaseRoutes",
+  ],
   "@omni-acp/client": ["OmniACP", "OmniError"],
   "@omni-acp/cli": ["main", "parseArgs", "yamlToDaemonConfig"],
 };

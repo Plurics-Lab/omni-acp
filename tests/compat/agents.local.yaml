@@ -1,0 +1,26 @@
+# REAL agents on THIS machine. Runs only under `OMNI_COMPAT_REAL=1`.
+#
+# One entry today, and that is a statement of evidence rather than of ambition: claude-acp is the
+# only real ACP agent available on this machine, and the M1 corpus
+# (`docs/research/transcripts/claude-acp-0.73.0/`) is its ground truth.
+#
+# ADDING AN AGENT IS AN EDIT TO THIS FILE AND NOTHING ELSE. No `.ts` file may name a real agent's
+# command — the suite asserts it. An agent listed here but not installed is SKIPPED with a
+# printed source and reason; a skip with no source FAILS (§18.2).
+version: 1
+agents:
+  - id: claude-acp
+    source: command
+    command: npx
+    args: ["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"]
+    # Observed on this machine, 2026-09-04: initialize ~7 s cold / ~1.5 s warm, `loadSession: true`,
+    # sessionCapabilities list/resume/close/delete/fork.
+    budgets:
+      initializeMs: 30000
+      resumeMs: 30000
+      turnMs: 300000
+    # Corpus gaps (§18.3): rows the suite must NOT assert for this agent, because no recorded run
+    # exercises them. A gap is not a failure, and pretending otherwise is how a suite starts lying.
+    unverified:
+      - authenticate
+      - plan

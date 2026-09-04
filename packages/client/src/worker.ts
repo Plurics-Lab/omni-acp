@@ -113,6 +113,12 @@ const IS_CLOSE_REASON: { readonly [R in WorkerCloseReason]: true } = {
   agent_exited: true,
   agent_crashed: true,
   protocol_error: true,
+  // M1's three (§5.1 `WorkerCloseReason`). The map is exhaustive BY CONSTRUCTION, which is why
+  // adding a reason to the protocol shows up here as a compile error rather than as a snapshot
+  // whose `closeReason` silently became null.
+  idle_timeout: true,
+  wake_failed: true,
+  orphaned: true,
   cancel_timeout: true,
   not_resumable: true,
 };

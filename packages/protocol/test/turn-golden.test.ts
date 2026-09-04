@@ -157,9 +157,18 @@ describe("the corpus covers every acceptance clause", () => {
 
   it('`changes` come from ToolCallContent{type:"diff"} with `oldText ?? null` (F5)', () => {
     const { envelopes, expected } = load("diff-changes");
+    // `operation` is DERIVED when the agent gives only v1 fields (`oldText == null ? "add" :
+    // "modify"`), and `fragment` is the descriptor's `diffIsFragment` quirk — never guessed, so
+    // a payload that does not carry it reads false (§12.5, F19).
     expect(reduceTurn(expected.turnId, envelopes).changes).toStrictEqual([
-      { path: "/repo/a.ts", oldText: "old2", newText: "new2" },
-      { path: "/repo/b.ts", oldText: null, newText: "created" },
+      {
+        path: "/repo/a.ts",
+        operation: "modify",
+        oldText: "old2",
+        newText: "new2",
+        fragment: false,
+      },
+      { path: "/repo/b.ts", operation: "add", oldText: null, newText: "created", fragment: false },
     ]);
   });
 

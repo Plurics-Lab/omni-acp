@@ -98,11 +98,24 @@ function read(file: string, text: string): Source {
   return { file, text, code: blank(text, false), bare: blank(text, true) };
 }
 
-function httpSources(): Source[] {
-  return readdirSync(HTTP_DIR)
-    .filter((f) => f.endsWith(".ts"))
-    .sort()
-    .map((file) => read(file, readFileSync(join(HTTP_DIR, file), "utf8")));
+/**
+ * RECURSIVE, since the Land step split `routes.ts` into `routes/` (M1-PLAN §1.1): four route
+ * families, four owners, one guard. A non-recursive scan would have kept passing while every new
+ * route in the repository went unchecked, which is the exact way a guard goes quiet.
+ *
+ * `file` is the path RELATIVE to `src/http`, so the exemptions below still name one file each.
+ */
+function httpSources(dir = HTTP_DIR, prefix = ""): Source[] {
+  const out: Source[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+    a.name < b.name ? -1 : 1,
+  )) {
+    const rel = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) out.push(...httpSources(join(dir, entry.name), rel));
+    else if (entry.name.endsWith(".ts"))
+      out.push(read(rel, readFileSync(join(dir, entry.name), "utf8")));
+  }
+  return out;
 }
 
 /** Module specifiers a file statically imports, exports-from, or imports dynamically. */
@@ -153,7 +166,10 @@ describe("guard: http-has-no-logic", () => {
       "app.ts",
       "auth-middleware.ts",
       "errors.ts",
-      "routes.ts",
+      "routes/agents.ts",
+      "routes/index.ts",
+      "routes/lease.ts",
+      "routes/workers.ts",
       "sse.ts",
     ]);
   });
@@ -170,7 +186,12 @@ describe("guard: http-has-no-logic", () => {
   it("talks to the daemon through the CONTRACT, never through the library's own modules", () => {
     // If this list ever needs `../registry.js`, the adapter has stopped being an adapter and
     // "delete the HTTP layer and the library still tests" has quietly become false.
-    const allowed = /^(@omni-acp\/protocol|hono|\.\.\/types\.js|\.\/[\w-]+\.js)$/;
+    // `../../types.js` and `../auth-middleware.js` appear once the route modules live a
+    // directory deeper. The rule is unchanged and is the one that matters: the adapter reaches
+    // the daemon through the CONTRACT (`types.js`) and its own siblings, never through
+    // `../registry.js`.
+    const allowed =
+      /^(@omni-acp\/protocol|hono|\.\.\/\.\.\/types\.js|\.\.\/types\.js|\.\.\/[\w-]+\.js|\.\/[\w-]+\.js|\.\/routes\/[\w-]+\.js)$/;
     for (const source of sources) {
       for (const spec of imports(source)) {
         expect({ file: source.file, spec, ok: allowed.test(spec) }).toEqual({

@@ -17,7 +17,12 @@
     ],
     "changes": [],
     "patch": null,
+    "vendorPatch": null,
     "interactions": [],
+    "verdict": "ok",
+    "warnings": [],
+    "failedToolCalls": [],
+    "deniedToolCalls": [],
     "error": null
   },
   "status": {

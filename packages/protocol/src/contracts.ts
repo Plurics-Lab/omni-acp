@@ -13,7 +13,8 @@
 
 import type {
   AcpStream,
-  RequestPermissionRequest,
+  NormalizedSessionUpdate,
+  PermissionOption,
   RequestPermissionResponse,
   StopReason,
 } from "./acp.js";
@@ -21,22 +22,39 @@ import type {
   AgentCatalogEntry,
   CreateWorkerRequest,
   DaemonInfo,
+  LeaseRequestBody,
+  ProbeRequestBody,
+  ProbeResponse,
   PromptAccepted,
   PromptRequestBody,
   WhoAmIResponse,
 } from "./control-plane.js";
-import type { AgentDescriptor, ResolvedDaemonConfig } from "./config.js";
-import type { OmniErrorBody } from "./errors.js";
+import type {
+  AgentDescriptor,
+  ResolvedDaemonConfig,
+  ResolvedEventLogConfig,
+  ResolvedLeaseConfig,
+} from "./config.js";
+import type { AcpErrorDetail, OmniErrorBody } from "./errors.js";
 import type {
   EventEnvelope,
   EventInput,
+  OrphanRecord,
   PolicyDecisionPayload,
   WorkerCloseReason,
   WorkerState,
 } from "./events.js";
 import type { ClientId, DaemonId, Seq, SessionId, TokenId, TurnId, WorkerId } from "./ids.js";
+import type { LeaseEventPayload, LeaseSnapshot } from "./lease.js";
+import type { ResumeHint, ResumeOutcome, ResumeReport } from "./resume.js";
+import type { RuntimeDescriptor } from "./runtime.js";
 import type { TurnStatus } from "./turn.js";
-import type { CloseResult, ProcessInfo, WorkerSnapshot } from "./worker.js";
+import type {
+  AgentCapabilitiesSnapshot,
+  CloseResult,
+  ProcessInfo,
+  WorkerSnapshot,
+} from "./worker.js";
 
 // ── ambient ──────────────────────────────────────────────────────────────────
 
@@ -180,6 +198,11 @@ export interface PlatformOps {
   isTreeGone(p: AgentProcess): Promise<boolean>;
   /** POSIX: kill(pid,0). Windows: tasklist /FI. */
   isLeaderGone(p: AgentProcess): Promise<boolean>;
+  /** The incarnation token for a live pid, or null where this platform cannot take one (§15.7). */
+  fingerprint(pid: number): Promise<string | null>;
+  /** Signal a tree we did NOT spawn, addressed by its recorded group id. */
+  signalTreeByGroup(groupId: number, sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung>;
+  isGroupGone(groupId: number): Promise<boolean>;
 }
 
 export interface Supervisor {
@@ -189,6 +212,12 @@ export interface Supervisor {
   readonly live: ReadonlySet<AgentProcess>;
   /** Kill everything still owned, in parallel, bounded. Called by daemon.stop(). */
   shutdown(opts?: { gracefulMs?: number; timeoutMs?: number }): Promise<KillOutcome[]>;
+  /**
+   * Kill a process this daemon did NOT spawn, gated on the fingerprint a previous boot captured.
+   * NEVER signals when `fingerprint` is null or does not match — a recycled pid is somebody
+   * else's process. ALWAYS resolves: a reap failure is data (`reapSkipped`), not an exception.
+   */
+  reapOrphan(o: OrphanRecord): Promise<OrphanRecord>;
 }
 
 // ── event log (WP-3 implements) ──────────────────────────────────────────────
@@ -233,14 +262,150 @@ export interface EventLog {
    * existence, and back-filling them would contradict CONTRACTS.md §8.2 rule 3 (review R16).
    */
   setSessionId(id: SessionId): void;
+  /** true ⇒ survives a daemon restart; `tail` is bounded by retention, not by the ring (§14.1). */
+  readonly persistent: boolean;
+  /** sqlite: commit anything pending. memory: no-op. Called before `daemon.stop()` returns. */
+  flush(): void;
 }
 
-// ── normalizer (WP-3 implements) ─────────────────────────────────────────────
+// ── persistence (M1-WP-A implements) ─────────────────────────────────────────
+
+/**
+ * The durable side of an EventLog. SYNCHRONOUS, for exactly the reason `EventLog.append` is:
+ * `DatabaseSync` is synchronous, and an async `put` reintroduces the interleave that a
+ * non-monotonic `seq` is (§8.1). Nothing here assigns a `seq` — the store is TOLD what it is.
+ */
+export interface EventStore {
+  /** `max(seq)` ever assigned, INCLUDING rows retention has already evicted (§14.4). */
+  headOf(workerId: WorkerId): Seq;
+  /** Lowest RETAINED seq; `head + 1` when everything for this worker is gone. Never 1 by default. */
+  tailOf(workerId: WorkerId): Seq;
+  put(e: EventEnvelope): void;
+  /** seq > since, ascending, at most `limit`. Deserialized — object identity is NOT preserved,
+   *  which is exactly why the ring stays in front of it (F11). */
+  read(workerId: WorkerId, since: Seq, limit: number): readonly EventEnvelope[];
+  /** Delete `seq <= upTo` for one worker AND raise its durable tail, in ONE transaction. */
+  evict(workerId: WorkerId, upTo: Seq): number;
+  /** The nth-oldest retained seq, or null — the row-cap sweep without `DELETE … LIMIT`. */
+  seqAtOffset(workerId: WorkerId, offset: number): Seq | null;
+  workersWithEvents(): readonly WorkerId[];
+  readonly diagnostics: EventStoreDiagnostics;
+}
+
+export interface EventStoreDiagnostics {
+  readonly driver: "sqlite" | "memory";
+  readonly file: string | null;
+  readonly schemaVersion: number;
+  readonly sizeBytes: number;
+  /** Non-zero after any `put` failure; surfaced in `GET /v1/info` (§14.3). */
+  readonly writeFailures: number;
+}
+
+/** The durable half of the Worker Registry — D2's `workerId → (agentId, sessionId, cwd, …)`. */
+export interface WorkerStore {
+  upsert(row: WorkerRow): void;
+  get(id: WorkerId): WorkerRow | null;
+  /** Newest `updatedAt` first. Visibility is the REGISTRY's job, never the store's. */
+  list(): readonly WorkerRow[];
+  /** Rows whose `bootId` is not the current one AND whose state is live — §15.7's orphans. */
+  abandoned(currentBootId: string): readonly WorkerRow[];
+  delete(id: WorkerId): void;
+  closedBefore(cutoffMs: number): readonly WorkerRow[];
+}
+
+/** A snapshot plus what a snapshot does not carry because it is not client-facing. */
+export interface WorkerRow {
+  readonly snapshot: WorkerSnapshot;
+  readonly agentId: string;
+  /** The daemon INSTANCE that last wrote this row. Not `daemonId`, which is stable across boots. */
+  readonly bootId: string;
+  /** Persisted so `DELETE` is idempotent ACROSS a restart, byte-for-byte (§15.6). */
+  readonly closeResult: CloseResult | null;
+  readonly lastActiveMs: number;
+  readonly closedAtMs: number | null;
+  readonly hibernateIdleMs: number | null;
+}
+
+export interface RetentionReport {
+  readonly workersDropped: number;
+  readonly eventsDeleted: number;
+  readonly byAge: number;
+  readonly byRowCap: number;
+  readonly durationMs: number;
+}
+
+/**
+ * The three bounds of §14.5, resolved into one plan BEFORE anything is deleted. Pure input →
+ * pure plan → one transactional apply: that is what makes retention table-testable.
+ */
+export interface RetentionInput {
+  readonly nowMs: number;
+  readonly retentionDays: number;
+  readonly maxPersistedEventsPerWorker: number;
+  readonly rows: readonly {
+    readonly workerId: WorkerId;
+    readonly state: WorkerState;
+    readonly closedAtMs: number | null;
+    readonly head: Seq;
+    readonly tail: Seq;
+  }[];
+}
+
+export interface RetentionPlan {
+  /** Workers whose rows AND events go entirely: closed longer ago than the age bound. */
+  readonly dropWorkers: readonly WorkerId[];
+  /** Per worker, delete `seq <= upTo` and raise the durable tail to `upTo + 1`. */
+  readonly evictTo: readonly { readonly workerId: WorkerId; readonly upTo: Seq }[];
+}
+
+/** What `createDaemon()` opens once and hands to the registry. `null` for the memory driver. */
+export interface PersistenceHandle {
+  readonly events: EventStore;
+  readonly workers: WorkerStore;
+  readonly bootId: string;
+  /** One bounded retention pass. Returns what it deleted, for the log line and the test. */
+  sweep(nowMs: number): RetentionReport;
+  close(): void;
+}
+
+/** Options for the shared ring/subscriber core every driver sits on (§14.1). */
+export interface EventLogCoreOptions {
+  readonly workerId: WorkerId;
+  readonly daemonId: DaemonId;
+  readonly clock: Clock;
+  readonly maxEvents?: number;
+  readonly queueSize?: number;
+  /** Seeds `head` on a rehydrated worker so `seq` never restarts at 1 (§14.4, L15). */
+  readonly startSeq?: Seq;
+  /** Write-through sink. Absent ⇒ a pure in-memory log. Never assigns a `seq`. */
+  readonly store?: EventStore;
+  readonly logger?: Logger;
+}
+
+export interface PersistedEventLogOptions extends EventLogCoreOptions {
+  readonly store: EventStore;
+  readonly config: ResolvedEventLogConfig;
+}
+
+// ── normalizer (M1-WP-B implements) ──────────────────────────────────────────
 
 export type TurnInput =
   | { readonly type: "prompt_sent"; readonly turnId: TurnId; readonly at: number }
-  | { readonly type: "agent_update"; readonly update: unknown; readonly at: number }
-  | { readonly type: "prompt_result"; readonly stopReason: StopReason; readonly at: number }
+  | {
+      readonly type: "agent_update";
+      readonly update: unknown;
+      readonly at: number;
+      /** D6. Set by the WORKER for every update inside the replay window; the reducer copies it
+       *  onto every `EventInput` it emits for this update and carries no window state (§15.3). */
+      readonly replay?: true;
+    }
+  | {
+      readonly type: "prompt_result";
+      readonly stopReason: StopReason;
+      /** v1 `PromptResponse.usage` (F21). Lands on `state_update{idle}.usage`. */
+      readonly usage?: unknown;
+      readonly at: number;
+    }
   | { readonly type: "prompt_error"; readonly error: OmniErrorBody; readonly at: number }
   | {
       readonly type: "process_gone";
@@ -248,28 +413,97 @@ export type TurnInput =
       readonly stderrTail: string;
       readonly at: number;
     }
+  /** Starts the FORCED close-out ladder. The reducer decides which rung is next (§13.2). */
+  | { readonly type: "close_requested"; readonly at: number }
+  /** stdout EOF observed during the drain rung. */
+  | { readonly type: "drained"; readonly at: number }
+  /** One COMPLETE stderr line, for `end_turn`-with-fatal-stderr promotion (§13.4). */
+  | { readonly type: "stderr_line"; readonly line: string; readonly at: number }
   | { readonly type: "tick"; readonly at: number };
 
-export type SettleReason = "quiet" | "hard" | "error" | "gone";
+export type SettleReason = "quiet" | "hard" | "error" | "gone" | "drained" | "cancelled";
+
+/**
+ * The rung the Worker must perform next. `null` = do nothing. The ONLY side effect the reducer
+ * requests, which is what keeps the whole ladder unit-testable with a fake clock and no process.
+ */
+export type CloseOutAction = "close_stdin" | "drain" | "cancel" | "terminate";
 
 export interface TurnOutput {
   /** Appended to the log in array order, in one synchronous loop. */
   readonly emit: readonly EventInput[];
   /** Absolute epoch-ms at which the Worker must deliver a `tick`, or null. */
   readonly scheduleTickAt: number | null;
-  readonly state: "idle" | "running" | "settling";
+  readonly state: "idle" | "running" | "settling" | "closing";
   readonly turnId: TurnId | null;
   readonly settled: SettleReason | null;
+  readonly action: CloseOutAction | null;
 }
+
+export interface MappedUpdate {
+  readonly payload: NormalizedSessionUpdate;
+  /** 2 when the mapper landed on a KNOWN v2 arm; 1 when it passed an unrecognized kind through. */
+  readonly payloadVersion: 1 | 2;
+  /** Which table row fired, e.g. "tool_call->tool_call_update". "" for identity. Golden-tested. */
+  readonly rule: string;
+  /** For chunk kinds: the messageId in force after mapping, real or synthesized. */
+  readonly messageId: string | null;
+  /** false ⇒ the descriptor says drop this kind; it is never appended and consumes no seq (§14.6). */
+  readonly keep: boolean;
+}
+
+export interface MappedPermissionRequest {
+  readonly sessionId: string;
+  readonly title: string;
+  /** v2's TAGGED subject. `tool_call` is the only arm a v1 agent can produce; `toolCall` is
+   *  passed BY IDENTITY so `kind`/`locations`/`content`/`rawInput` — what M2's rule engine
+   *  matches on — arrive unmodified. */
+  readonly subject: Readonly<Record<string, unknown>> | null;
+  readonly options: readonly PermissionOption[];
+  readonly toolCallId: string | null;
+  readonly _meta?: Readonly<Record<string, unknown>>;
+}
+
+export interface OutboundCall {
+  readonly method: string;
+  readonly params: Record<string, unknown>;
+  /** null when every spelling is exhausted; the caller reports `unsupported`. */
+  readonly spelling: string | null;
+  readonly onFailure: "fail" | "warn";
+}
+
+export type ErrorClass =
+  | { readonly kind: "bad_request" }
+  | { readonly kind: "agent_error" }
+  | { readonly kind: "unsupported_method"; readonly method: string | null }
+  | { readonly kind: "resume"; readonly outcome: ResumeOutcome; readonly hint: ResumeHint }
+  | { readonly kind: "unclassified" };
 
 export interface Normalizer {
-  readonly sourceProtocolVersion: 1;
-  readonly slice: "m0-lifecycle";
+  /** Reporting only; NO mapping rule reads it (F24). */
+  readonly sourceProtocolVersion: 1 | 2;
+  readonly slice: "m1-full";
+  readonly descriptor: RuntimeDescriptor;
   /** PURE. No timers, no I/O, no async. Same inputs => same outputs, forever. */
   step(input: TurnInput): TurnOutput;
+  /**
+   * The v1→v2 map as a free function on the interface, so it is testable without a turn and
+   * reusable by the compat suite and the golden generator. PURE, TOTAL and IDEMPOTENT:
+   * `mapUpdate(mapUpdate(x).payload).payload` is deep-equal to `mapUpdate(x).payload` for every
+   * input, and an unrecognized kind comes back BY IDENTITY with `payloadVersion: 1` (§12).
+   */
+  mapUpdate(update: unknown): MappedUpdate;
+  /** v1 `{sessionId, toolCall, options}` → v2 `{title, subject, options}`. PURE, idempotent. */
+  mapPermissionRequest(req: unknown): MappedPermissionRequest;
+  /** Canonical (v2) client→agent call → the spelling THIS runtime answers (§17.3). PURE. */
+  mapRequest(method: string, params: Record<string, unknown>): OutboundCall;
+  /** Record a `-32601` so the next `mapRequest` skips that spelling for this process. */
+  noteUnsupported(method: string): void;
+  /** Classify a JSON-RPC error with the descriptor's rules. NEVER throws. */
+  classifyError(e: AcpErrorDetail): ErrorClass;
 }
 
-// ── permission responder (WP-4 implements) ───────────────────────────────────
+// ── permission responder (M1-WP-B/C implement) ───────────────────────────────
 
 export interface PermissionDecision {
   /** null => the Worker must reply with JSON-RPC -32603 (D4 rule 4). */
@@ -278,24 +512,112 @@ export interface PermissionDecision {
 }
 
 export interface PermissionResponder {
-  decide(req: RequestPermissionRequest): PermissionDecision;
+  /**
+   * `req` is the V2-MAPPED request (ruling M1-R14). D4's rule set is written against v2's tagged
+   * `subject`, and mapping first is what lets M2's rule engine match `kind` / `path` / `cmd` with
+   * no per-agent branch.
+   */
+  decide(req: MappedPermissionRequest): PermissionDecision;
 }
 
-// ── lease (WP-4 implements; D5 enforcement is M1) ────────────────────────────
+// ── lease (M1-WP-D implements; D5) ───────────────────────────────────────────
 
 export interface ClientRef {
   readonly tokenId: TokenId;
   readonly clientId: ClientId | null;
 }
 
+export interface LeaseOptions {
+  readonly workerId: WorkerId;
+  readonly clock: Clock;
+  readonly config: ResolvedLeaseConfig;
+  /** The creator, when `CreateWorkerRequest.lease` is `"take"`; null for `"observe"`. */
+  readonly initialHolder?: ClientRef | null;
+  /** Where `omni.lease` envelopes go. Absent ⇒ the audit trail is the `onChange` callback only. */
+  readonly onEvent?: (e: LeaseEventPayload) => void;
+}
+
 export interface Lease {
   readonly holder: ClientRef | null;
-  /** M0: never throws. M1: throws OmniError("lease_held"). Callers already branch today. */
-  assertHolder(who: ClientRef): void;
-  /** M0: throws bad_request. */
-  acquire(who: ClientRef, opts?: { steal?: boolean }): void;
-  /** M0: throws bad_request. */
-  release(who: ClientRef): void;
+  readonly epoch: number;
+  snapshot(): LeaseSnapshot;
+  /**
+   * Throws `lease_held` (423) carrying `snapshot()` in the error body. On an UNHELD lease it
+   * implicitly acquires for `who` and emits `omni.lease{acquired, how:"implicit"}` — a worker
+   * nobody controls should not 423 the first client that reaches for it (§16.1 rule L5).
+   * `opts.epoch` is the optional fencing check from `Omni-Lease-Epoch`.
+   */
+  assertHolder(who: ClientRef, opts?: { epoch?: number }): LeaseSnapshot;
+  acquire(who: ClientRef, opts?: { ttlMs?: number }): LeaseSnapshot;
+  release(who: ClientRef): LeaseSnapshot;
+  /** D13: admin always; a same-token peer after `stealAfterIdleMs`. Audited, epoch +1. */
+  steal(who: ClientRef, opts: { reason: string | null; admin: boolean }): LeaseSnapshot;
+  /** Suspends expiry while a turn is live; returns the un-pin. Nested calls refcount (rule L6). */
+  pinExpiry(): () => void;
+  /** Hibernation releases the lease unconditionally (DESIGN §3.2: 进程回收、lease 释放). */
+  releaseForHibernate(): LeaseSnapshot;
+  onChange(cb: (e: LeaseEventPayload) => void): () => void;
+  close(): void;
+}
+
+// ── session strategy: the seam that keeps `worker.ts` frozen (M1-WP-C) ───────
+
+/**
+ * The subset of `core`'s `AcpLink` a `SessionStrategy` may touch. Declared here, and narrowly,
+ * because `protocol` may not import `core` (§4) and because a strategy that could reach the
+ * whole link would be able to send a prompt.
+ */
+export interface AcpLinkLike {
+  request<T = unknown>(method: string, params: unknown): Promise<T>;
+  notify(method: string, params: unknown): void;
+  readonly closed: boolean;
+}
+
+export interface SessionOpenOptions {
+  readonly cwd: string;
+  readonly descriptor: RuntimeDescriptor;
+  /** Always `[]` in M1 (DESIGN §8 — presets are M2). */
+  readonly mcpServers: readonly unknown[];
+  readonly budgetMs: number;
+  readonly signal?: AbortSignal;
+}
+
+export interface SessionReopenOptions extends SessionOpenOptions {
+  /** The pointer being preserved. A reopen without one is a programming error, not a resume. */
+  readonly sessionId: SessionId;
+  readonly capabilities: AgentCapabilitiesSnapshot | null;
+  /** Opens D6's replay window and returns the closer; the Worker sets the flag, the strategy
+   *  decides when. The reducer stays pure. */
+  readonly controls: { replayWindow(): () => void };
+}
+
+export interface SessionOpenResult {
+  readonly capabilities: AgentCapabilitiesSnapshot;
+  readonly sessionId: SessionId;
+  readonly resume: ResumeReport | null;
+}
+
+/**
+ * After M1, `Worker` never names `initialize`, `session/new`, `session/load` or `session/resume`
+ * again: it holds a `SessionStrategy` and calls `open` on create and `reopen` on wake. This is
+ * the seam that lets the resume work package and the daemon work package own disjoint files while
+ * `worker.ts` itself is edited exactly once, by the Land step, and then frozen (M1-PLAN §1).
+ */
+export interface SessionStrategy {
+  open(link: AcpLinkLike, o: SessionOpenOptions): Promise<SessionOpenResult>;
+  reopen(link: AcpLinkLike, o: SessionReopenOptions): Promise<SessionOpenResult>;
+  /** Best-effort `session/close` when advertised. NEVER throws. */
+  close(link: AcpLinkLike, sessionId: SessionId): Promise<void>;
+}
+
+/** The idle timer that drives `ready -> hibernated` (§15.2). Owned by M1-WP-C. */
+export interface HibernateTimer {
+  /** Restart the countdown. Called on every turn boundary. */
+  touch(): void;
+  /** Suspend while a turn is live; `touch()` resumes it. */
+  pause(): void;
+  cancel(): void;
+  readonly armed: boolean;
 }
 
 // ── worker handle (WP-4 implements; WP-5 consumes) ───────────────────────────
@@ -313,6 +635,20 @@ export interface WorkerHandle {
   turn(turnId: TurnId): TurnStatus;
   onStateChange(cb: (s: WorkerState, prev: WorkerState | null) => void): () => void;
   readonly closed: Promise<CloseResult>;
+  /**
+   * ready → hibernated. Idempotent; throws `worker_busy` while a turn is live. Reclaims the
+   * process tree, RELEASES the lease, keeps the record and the session pointer, and NEVER sends
+   * `session/close` — the pointer is the entire value being preserved (§15.2).
+   */
+  hibernate(reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot>;
+  /**
+   * hibernated → ready. Idempotent and SINGLE-FLIGHT: concurrent callers share one attempt.
+   * Throws `not_resumable` (422) carrying the `ResumeReport`, `agent_error` (502),
+   * `agent_timeout` (504), `worker_limit` (429) or `worker_closed` (410) — the table is §15.5.
+   */
+  wake(who: ClientRef, opts?: { timeoutMs?: number }): Promise<WorkerSnapshot>;
+  /** Processes this worker has had. 0 = it has never run. */
+  readonly generation: number;
 }
 
 // ── daemon (WP-5 implements; testkit's stubDaemon() produces one) ────────────
@@ -364,6 +700,24 @@ export interface WorkerRegistry {
   turn(id: WorkerId, auth: AuthContext, turnId: TurnId): TurnStatus;
   /** H10: the log the SSE writer subscribes to. Visibility is checked here, not in `http/`. */
   logFor(id: WorkerId, auth: AuthContext): EventLog;
+
+  // ── M1 façade rows (H17-H19), same rule: parse -> ONE call -> serialize ────
+
+  /** Workers occupying NO process. Bounded by `hibernate.maxHibernated`, not `maxWorkers`. */
+  readonly hibernatedSize: number;
+  /** H17: `200 LeaseSnapshot`; `423 lease_held` carries the holder and the epoch. */
+  lease(
+    id: WorkerId,
+    auth: AuthContext,
+    op: "acquire" | "release" | "steal",
+    body: LeaseRequestBody,
+  ): LeaseSnapshot;
+  /** H18: `200 WorkerSnapshot{state:"hibernated"}`. */
+  hibernate(id: WorkerId, auth: AuthContext): Promise<WorkerSnapshot>;
+  /** H19: `200 WorkerSnapshot{state:"ready"}`; the outcome table is §15.5. */
+  wake(id: WorkerId, auth: AuthContext): Promise<WorkerSnapshot>;
+  /** Boot adoption: every live-state row from a previous boot becomes `hibernated` or `closed`. */
+  adopt(): Promise<{ hibernated: number; closed: number; orphans: readonly OrphanRecord[] }>;
 }
 
 export interface Catalog {
@@ -372,6 +726,10 @@ export interface Catalog {
   get(id: string): AgentDescriptor;
   /** Descriptor + cwd -> SpawnSpec. The ONLY producer of SpawnSpec. */
   toSpawnSpec(d: AgentDescriptor, o: { cwd: string }): SpawnSpec;
+  /** Merged builtin ⊕ config ⊕ cached-probe descriptor. NEVER throws; falls back to the v1 profile. */
+  descriptor(id: string): RuntimeDescriptor;
+  /** H16. `auth.assertAgent(id)` FIRST, so a forbidden agent 403s before a process exists. */
+  probe(id: string, o: ProbeRequestBody, auth: AuthContext): Promise<ProbeResponse>;
 }
 
 export type DaemonEvent =
@@ -422,4 +780,8 @@ export interface DaemonDeps {
   readonly ids?: IdGen;
   readonly logger?: Logger;
   readonly responder?: PermissionResponder;
+  /** Opened once by `createDaemon()`; absent for the memory driver (§14.1, M1-WP-A/E). */
+  readonly persistence?: PersistenceHandle;
+  /** Injected so `worker.ts` never names `initialize` / `session/new` again (seam 2, M1-WP-C). */
+  readonly session?: SessionStrategy;
 }

@@ -22,7 +22,7 @@ describe("alwaysGrantedLease (L8, D5)", () => {
     }).not.toThrow();
   });
 
-  it("acquire and release throw bad_request naming M1, never lease_held", () => {
+  it("acquire and release throw bad_request naming the M1 work package, never lease_held", () => {
     const lease = alwaysGrantedLease(OWNER);
     for (const call of [() => lease.acquire(OTHER), () => lease.release(OWNER)]) {
       let caught: unknown;
@@ -33,14 +33,17 @@ describe("alwaysGrantedLease (L8, D5)", () => {
       }
       expect(OmniError.is(caught, "bad_request")).toBe(true);
       expect((caught as OmniError).status).toBe(400);
-      expect((caught as OmniError).message).toContain("M1");
+      expect((caught as OmniError).message).toContain("M1-WP-D");
     }
   });
 
-  it("acquire({steal:true}) is refused the same way — no partial M1 behaviour leaks", () => {
+  // M1 moved stealing to its own method (`Lease.steal`), so `acquire({steal:true})` no longer
+  // exists; the property under test — no partial D5 behaviour leaks out of the permissive lease
+  // — is unchanged and now covers `steal` directly.
+  it("steal is refused the same way — no partial D5 behaviour leaks", () => {
     const lease = alwaysGrantedLease(OWNER);
     expect(() => {
-      lease.acquire(OTHER, { steal: true });
+      lease.steal(OTHER, { reason: "because", admin: true });
     }).toThrow(OmniError);
     expect(lease.holder).toEqual(OWNER);
   });

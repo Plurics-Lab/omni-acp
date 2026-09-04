@@ -14,4 +14,11 @@ export type {
   DaemonDeps,
   DaemonEvent,
   WorkerRegistry,
+  // ── M1 (CONTRACTS.md §5.1 contracts.ts) ───────────────────────────────────
+  EventStore,
+  PersistenceHandle,
+  RetentionReport,
+  SessionStrategy,
+  WorkerRow,
+  WorkerStore,
 } from "@omni-acp/protocol";

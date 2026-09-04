@@ -247,6 +247,19 @@ export function createMemoryEventLog(o: MemoryEventLogOptions): EventLog {
       // — they precede the session's existence (review R16).
       sessionId = id;
     },
+
+    // ── M1 (§14.1) ──────────────────────────────────────────────────────────
+    //
+    // Both members are FINAL here, not stubs: the memory driver's honest answers are "nothing I
+    // hold survives a restart" and "there is nothing to commit". `GET /v1/info.persistence`
+    // and `WorkerSnapshot.persistence` read the first one so an operator is never guessing
+    // (§6.6's honesty rule). The write-through driver is `event-log/sqlite-log.ts` (M1-WP-A).
+
+    persistent: false,
+
+    flush(): void {
+      // No durable side; `append()` is already the whole commit.
+    },
   };
 }
 

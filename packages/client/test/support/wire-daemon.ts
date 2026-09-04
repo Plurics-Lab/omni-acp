@@ -401,6 +401,8 @@ export function createWireDaemon(options: WireOptions = {}): WireDaemon {
               rule: "m0:auto-deny",
               optionId: item.optionId,
               offered: PERMISSION_OPTIONS,
+              // §13.4: the join back to the tool call, recorded by the party that decided.
+              toolCallId: null,
             },
           },
           { turnId, payloadVersion: 2 },

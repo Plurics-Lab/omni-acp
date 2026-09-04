@@ -13,6 +13,7 @@ import {
   type WhoAmIResponse,
   type WorkerRegistry,
 } from "@omni-acp/protocol";
+import { fakeRuntime } from "./fake-runtime.js";
 import { fakeSupervisor } from "./fake-supervisor.js";
 import { seqIds } from "./seq-ids.js";
 
@@ -172,6 +173,17 @@ export function stubDaemon(
     cancel: (id) => Promise.resolve(notFound(id)),
     turn: (id) => notFound(id),
     logFor: (id) => notFound(id),
+
+    // ── M1 façade rows (H17-H19) ────────────────────────────────────────────
+    //
+    // Same discipline as the M0 rows above: a stub route test must fail LOUDLY if it reaches a
+    // registry method the test never overrode, rather than pass against a default that quietly
+    // invents a lease or a snapshot.
+    hibernatedSize: 0,
+    lease: (id) => notFound(id),
+    hibernate: (id) => Promise.resolve(notFound(id)),
+    wake: (id) => Promise.resolve(notFound(id)),
+    adopt: () => Promise.resolve({ hibernated: 0, closed: 0, orphans: [] }),
   };
 
   const catalog: Catalog = {
@@ -186,6 +198,13 @@ export function stubDaemon(
       env: { ...d.env },
       label: d.id,
     }),
+    // `Catalog.descriptor` NEVER throws (CONTRACTS.md §5.4): it falls back to the generic v1
+    // profile, so a route that asks which quirk table governs an unknown agent gets an answer
+    // instead of a 500. The stub honours that, with the id the caller asked about.
+    descriptor: (id: string) => fakeRuntime({ id }),
+    probe: (id: string) => {
+      throw new OmniError("internal", `stubDaemon: override \`catalog.probe\` to use it (${id})`);
+    },
   };
 
   const info: DaemonInfo = {
@@ -197,6 +216,20 @@ export function stubDaemon(
     protocolVersions: [1],
     startedAt,
     ownership: supervisor.platform.ownership,
+    canonicalPayloadVersion: 2,
+    // The honest answers for a daemon with no persistence at all (§14.9, H21): nothing here
+    // survives a restart, nothing has failed to be written, and no previous boot left anything.
+    persistence: {
+      driver: "memory",
+      file: null,
+      schemaVersion: 0,
+      sizeBytes: 0,
+      writeFailures: 0,
+      retentionDays: 0,
+      lastSweep: null,
+    },
+    bootId: "boot_stub",
+    orphansAtStart: { found: 0, reaped: 0, skipped: 0 },
   };
 
   const base: Daemon = {

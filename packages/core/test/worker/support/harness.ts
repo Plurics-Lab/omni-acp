@@ -7,6 +7,7 @@ import type {
   DaemonId,
   KillOutcome,
   Lease,
+  LeaseSnapshot,
   Logger,
   ProcessExit,
   ProcessInfo,
@@ -76,17 +77,43 @@ export interface RecordingLease extends Lease {
 
 export function recordingLease(holder: ClientRef): RecordingLease {
   const asserted: ClientRef[] = [];
+  // M1's `Lease` returns a snapshot from every verb (§5.1 contracts.ts). The double grants
+  // unconditionally and records WHO asked, which is the only property these tests are about.
+  const snapshot = (): LeaseSnapshot => ({
+    workerId: WORKER_ID,
+    holder: { tokenId: holder.tokenId, clientId: holder.clientId },
+    epoch: 0,
+    expiresAt: null,
+    acquiredAt: null,
+    pinned: false,
+  });
   return {
     holder,
-    assertHolder(who: ClientRef): void {
+    epoch: 0,
+    snapshot,
+    assertHolder(who: ClientRef): LeaseSnapshot {
       asserted.push(who);
+      return snapshot();
     },
-    acquire(): void {
-      throw new Error("acquire is M1");
+    acquire(): LeaseSnapshot {
+      throw new Error("acquire is M1-WP-D");
     },
-    release(): void {
-      throw new Error("release is M1");
+    release(): LeaseSnapshot {
+      throw new Error("release is M1-WP-D");
     },
+    steal(): LeaseSnapshot {
+      throw new Error("steal is M1-WP-D");
+    },
+    pinExpiry(): () => void {
+      return () => {};
+    },
+    releaseForHibernate(): LeaseSnapshot {
+      return snapshot();
+    },
+    onChange(): () => void {
+      return () => {};
+    },
+    close(): void {},
     asserted,
   };
 }

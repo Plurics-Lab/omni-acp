@@ -1,39 +1,84 @@
-import { OmniError, type ClientRef, type Lease } from "@omni-acp/protocol";
+import {
+  OmniError,
+  type ClientRef,
+  type Lease,
+  type LeaseEventPayload,
+  type LeaseSnapshot,
+  type WorkerId,
+} from "@omni-acp/protocol";
 
 /**
- * The M0 lease: `assertHolder()` never throws, `acquire()`/`release()` throw `bad_request`
- * naming M1. The interface exists now so that every call site already branches the way D5's
- * enforcement will require, and M1 is a swap rather than a rewrite.
+ * The permissive lease: `assertHolder()` always grants, every mutating call is `bad_request`
+ * naming the work package that implements it.
  *
- * `holder` is the worker's creator (D5: the client that created the worker holds the lease).
- * It is reported truthfully today even though nothing is enforced against it, so that an M0
- * audit line and an M1 enforcement check read the same field.
+ * M1 KEEPS it (CONTRACTS.md §5.7) for in-process callers and fixtures — a library embedder
+ * running `createDaemon({listen:null})` has exactly one controller by construction, and a unit
+ * test that wants to exercise a Worker should not have to model D5 to do it. The enforcing
+ * implementation is `createLease` (`lease/lease.ts`, M1-WP-D).
+ *
+ * `holder` is reported truthfully so an audit line and an enforcement check read the same field.
  */
-export function alwaysGrantedLease(holder: ClientRef): Lease {
+export function alwaysGrantedLease(holder: ClientRef, workerId?: WorkerId): Lease {
+  const snapshot = (): LeaseSnapshot => ({
+    // A lease is per worker; a caller that did not name one gets the sentinel rather than a
+    // fabricated id, because `LeaseSnapshot.workerId` is a claim about which worker is held.
+    workerId: workerId ?? ("w_unknown" as WorkerId),
+    holder: { tokenId: holder.tokenId, clientId: holder.clientId },
+    // Epoch 0 = "never contested". A fencing check against this lease can therefore only ever
+    // pass on 0, which is the honest reading of a lease that is never taken away.
+    epoch: 0,
+    expiresAt: null,
+    acquiredAt: null,
+    pinned: false,
+  });
+
+  const unimplemented = (what: string): never => {
+    // CONTRACTS.md §9 / D29: an unimplemented feature is `bad_request` naming its milestone.
+    throw new OmniError(
+      "bad_request",
+      `lease.${what}() is not implemented by alwaysGrantedLease (M1-WP-D owns D5 enforcement); ` +
+        `the worker's creator holds the lease`,
+    );
+  };
+
   return {
     holder,
+    epoch: 0,
+    snapshot,
 
-    /**
-     * M0: never throws — D5's single-controller rule is M1 (CONTRACTS.md §2.3). The argument is
-     * still taken, so every call site already passes the `ClientRef` M1 will compare against.
-     */
-    assertHolder(_who: ClientRef): void {
-      // Intentionally empty; see the doc comment. Enforcement lands in M1.
+    /** Always grants — including a different client, and including a stale fencing epoch. */
+    assertHolder(_who: ClientRef, _opts?: { epoch?: number }): LeaseSnapshot {
+      return snapshot();
     },
 
-    /** CONTRACTS.md §9: an unimplemented feature is `bad_request` naming its milestone (D29). */
-    acquire(_who: ClientRef, _opts?: { steal?: boolean }): void {
-      throw new OmniError(
-        "bad_request",
-        "lease.acquire() is not implemented until M1 (D5); the worker's creator holds the lease",
-      );
+    acquire(_who: ClientRef, _opts?: { ttlMs?: number }): LeaseSnapshot {
+      return unimplemented("acquire");
     },
 
-    release(_who: ClientRef): void {
-      throw new OmniError(
-        "bad_request",
-        "lease.release() is not implemented until M1 (D5); the worker's creator holds the lease",
-      );
+    release(_who: ClientRef): LeaseSnapshot {
+      return unimplemented("release");
+    },
+
+    steal(_who: ClientRef, _opts: { reason: string | null; admin: boolean }): LeaseSnapshot {
+      return unimplemented("steal");
+    },
+
+    /** Nothing can expire, so pinning is a no-op and the un-pin is too. */
+    pinExpiry(): () => void {
+      return () => {};
+    },
+
+    releaseForHibernate(): LeaseSnapshot {
+      return snapshot();
+    },
+
+    /** Nothing ever changes, so no callback can ever fire. */
+    onChange(_cb: (e: LeaseEventPayload) => void): () => void {
+      return () => {};
+    },
+
+    close(): void {
+      // Nothing to release: there is no timer and no subscriber.
     },
   };
 }

@@ -42,6 +42,10 @@ describe("eventEnvelopeSchema", () => {
           rule: "m0:auto-deny",
           optionId: "reject",
           offered: [{ kind: "reject_once", name: "Skip", optionId: "reject" }],
+          // §13.4: we are the party that denied, so the join back to the tool call is OURS to
+          // record — `reduceTurn` reports it as `deniedToolCalls` instead of parsing the agent's
+          // English ("User refused permission to run tool").
+          toolCallId: "call_1",
         },
       },
       {
@@ -57,6 +61,30 @@ describe("eventEnvelopeSchema", () => {
           exit: { code: 1, signal: null },
           leaderExited: true,
           treeGone: false,
+        },
+      },
+      {
+        ...meta,
+        payloadVersion: 2,
+        turnId: null,
+        kind: "omni.lease",
+        payload: {
+          op: "stolen",
+          lease: {
+            workerId: `w_${"0".repeat(26)}`,
+            holder: { tokenId: "tok_b", clientId: "cli_b" },
+            // The FENCING token: +1 on every acquire / steal / expiry, which is what stops a
+            // client that cached "I hold it" from acting after a steal (§16.1 rule L7).
+            epoch: 4,
+            expiresAt: null,
+            acquiredAt: "2026-09-03T12:00:00.700Z",
+            pinned: false,
+          },
+          previous: { tokenId: "tok_a", clientId: "cli_a" },
+          by: { tokenId: "tok_b", clientId: "cli_b" },
+          how: "steal",
+          // D5: 带审计 — the operator's reason is recorded VERBATIM.
+          reason: "the holder went home",
         },
       },
       {
@@ -181,6 +209,7 @@ describe("eventEnvelopeSchema", () => {
         rule: "m0:auto-deny",
         optionId: null,
         offered: [{ kind: "allow_when_the_moon_is_full", name: "?", optionId: "x" }],
+        toolCallId: null,
       },
     });
     expect(parsed.kind).toBe("omni.policy_decision");

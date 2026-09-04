@@ -32,8 +32,16 @@ describe("DaemonConfig", () => {
       agents: [],
       maxWorkers: 64,
       eventLog: {
+        // STILL "memory" by default (ruling M1-R17): `omni-acp start` writes "sqlite" into the
+        // config it builds; `createDaemon()` keeps a zero-file, zero-experimental-module
+        // footprint so `OmniACP.local()` in a user's script leaves no database behind.
         driver: "memory",
         maxEventsPerWorker: 10_000,
+        maxPersistedEventsPerWorker: 200_000,
+        retentionDays: 7,
+        retentionSweepMs: 3_600_000,
+        synchronous: "normal",
+        suppressExperimentalWarning: true,
         subscriberQueueSize: 1_024,
         sseHeartbeatMs: 15_000,
       },
@@ -46,8 +54,34 @@ describe("DaemonConfig", () => {
         stderrTailBytes: 32 * 1024,
         allowShimLaunch: false,
         windowsHide: true,
+        reapOrphans: "fingerprint",
       },
-      turn: { quietMs: 250, hardMs: 5_000, cancelGraceMs: 10_000 },
+      turn: { quietMs: 250, hardMs: 5_000, cancelGraceMs: 10_000, drainGraceMs: 2_000 },
+      hibernate: {
+        idleMs: 1_800_000,
+        wakeTimeoutMs: 90_000,
+        // Hibernating a worker you can never wake turns a healthy worker into a guaranteed 422
+        // on a timer, so the default REFUSES rather than closes (ruling M1-R15).
+        whenNotResumable: "keep",
+        maxWakeFailures: 3,
+        maxHibernated: 256,
+      },
+      lease: {
+        ttlMs: 900_000,
+        renewOnUse: true,
+        stealAfterIdleMs: 0,
+        // Default false, so raw curl and `curl-shapes.itest.ts` keep working; the SDK mints a
+        // ULID per `connect()` (§16.1 rule L4).
+        requireClientId: false,
+      },
+      probe: {
+        onStart: "cached",
+        ttlHours: 168,
+        timeoutMs: 90_000,
+        maxConcurrent: 2,
+        deep: true,
+      },
+      resume: { replay: "mark_all" },
       logLevel: "info",
     });
   });
@@ -120,6 +154,10 @@ describe("AgentDescriptor", () => {
       env: {},
       protocolVersion: 1,
       shutdown: { signal: "SIGTERM", graceMs: 5_000 },
+      // The operator's overlay on the builtin Runtime descriptor, and the per-agent probe
+      // overrides — both empty, because an unspecified overlay must not override anything.
+      runtime: {},
+      probe: {},
     });
   });
 });

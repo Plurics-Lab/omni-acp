@@ -63,6 +63,13 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
 
   await mkdir(resolved.dataDir, { recursive: true });
   const daemonId = await resolveDaemonId(resolved, ids);
+  /**
+   * This BOOT's id, distinct from the persistent `daemonId` (§15.7). It is what lets boot
+   * adoption recognise a worker row a PREVIOUS boot owned; `deps.persistence` carries the
+   * authoritative one once M1-WP-A opens the store, and until then a per-process value is the
+   * honest answer for a daemon whose rows never leave memory.
+   */
+  const bootId = deps?.persistence?.bootId ?? `boot_${ids.request()}`;
 
   const tokens = createTokenStore(resolved);
   const catalog = createCatalog(resolved);
@@ -119,6 +126,32 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     // §6.6: the honesty field, taken from the platform the Supervisor actually chose — never
     // from `process.platform` re-derived here.
     ownership: supervisor.platform.ownership,
+
+    // ── M1 (§14.9, §15.7, H21) ──────────────────────────────────────────────
+    //
+    // The version of the canonical payload this daemon WRITES (ruling M1-R10).
+    canonicalPayloadVersion: 2 as const,
+    /**
+     * The whole point of these three is that an operator can read them BEFORE anything goes
+     * wrong: whether this daemon's logs survive a restart, whether they still do, and what a
+     * previous boot left behind — including `skipped: n` on Windows, where nothing can be reaped.
+     *
+     * They report the state of a daemon with no persistence opened, which is exactly what
+     * `eventLog.driver: "memory"` (still the default, ruling M1-R17) means. M1-WP-E wires them
+     * to the real `PersistenceHandle` and to `recoverFromPreviousBoot`.
+     */
+    persistence: {
+      driver: resolved.eventLog.driver === "sqlite" ? ("sqlite" as const) : ("memory" as const),
+      file: null,
+      schemaVersion: 0,
+      sizeBytes: 0,
+      writeFailures: 0,
+      retentionDays: resolved.eventLog.retentionDays,
+      lastSweep: null,
+    },
+    /** This daemon INSTANCE's id — not `daemonId`, which is stable across boots (§15.7). */
+    bootId,
+    orphansAtStart: { found: 0, reaped: 0, skipped: 0 },
   });
 
   // Bound lazily so that `createHttpApp(daemon)` can close over the finished object. The import

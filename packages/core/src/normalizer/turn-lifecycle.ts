@@ -100,6 +100,11 @@ const output = (
   state: state.state,
   turnId: state.turnId,
   settled,
+  // Seam 1 (M1-PLAN §1.2): the close-out ladder's DECISIONS live in this reducer and the Worker
+  // only performs them. The M0 slice requests no rung — `settle` (the per-turn quiet window) is
+  // unchanged and never closes stdin at turn end (§13, ruling M1-R4). M1-WP-B adds the forced
+  // ladder's `close_stdin` / `drain` / `cancel` / `terminate` here.
+  action: null,
 });
 
 /** `min(U + quietMs, hardCutoff)` — the moving deadline of §7.2, with the hard cap applied. */

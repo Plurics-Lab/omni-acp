@@ -199,5 +199,25 @@ export function createWindowsPlatformOps(deps: WindowsPlatformDeps): PlatformOps
         return false;
       }
     },
+
+    // ── M1 (§15.7), owned by M1-WP-C ────────────────────────────────────────
+
+    /**
+     * ALWAYS null on win32, and that is the FINAL behaviour, not a stub: there is no cheap,
+     * dependency-free incarnation token here, and §15.7's rule is that a null fingerprint
+     * forbids signalling the pid after a restart. `reapSkipped:"unsupported_platform"` and
+     * `GET /v1/info.orphansAtStart.skipped` are what say so out loud.
+     */
+    fingerprint(_pid: number): Promise<string | null> {
+      return Promise.resolve(null);
+    },
+
+    signalTreeByGroup(_groupId: number, _sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    },
+
+    isGroupGone(_groupId: number): Promise<boolean> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    },
   };
 }

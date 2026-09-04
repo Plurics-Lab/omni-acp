@@ -130,6 +130,19 @@ export async function runHandshake(
     const sessionCaps = record(raw["sessionCapabilities"]);
     const capabilities: AgentCapabilitiesSnapshot = {
       protocolVersion: 1,
+      // ── M1 fields, filled by M1-WP-C ──────────────────────────────────────
+      //
+      // The values below are what this handshake can HONESTLY report today, not placeholders
+      // dressed as findings: it does not yet consult a descriptor's preference order (F18), does
+      // not read `session/new`'s body, and has proven no extension live. `resume.method: null`
+      // therefore means "no resume spelling has been resolved", which is exactly the state that
+      // makes `hibernate.whenNotResumable:"keep"` refuse to hibernate (ruling M1-R15) — the safe
+      // reading, not a claim that the agent cannot resume.
+      resume: { method: null, replayFrom: false, requiresSameCwd: false },
+      supportsSessionList: false,
+      configOptions: null,
+      modes: null,
+      extensions: [],
       // Verbatim, never reshaped: the M1 quirk table and the compat suite both read the real
       // thing, and a rebuilt object would have silently dropped whatever they need.
       raw,

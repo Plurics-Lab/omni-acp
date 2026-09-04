@@ -12,6 +12,7 @@ export { OmniACP, type ConnectOptions } from "./omni-acp.js";
 export type { LocalOptions } from "./local.js";
 export type { Server, CreateAgentOptions } from "./server.js";
 export type { Worker, PromptInput, PromptOptions, StreamEvent, WorkerEventMap } from "./worker.js";
+export type { WorkerLease } from "./lease.js";
 
 export { OmniError } from "@omni-acp/protocol";
 export type {
@@ -24,4 +25,10 @@ export type {
   WhoAmIResponse,
   DaemonInfo,
   AgentCatalogEntry,
+  // ── M1 (CONTRACTS.md §5.7) ────────────────────────────────────────────────
+  LeaseSnapshot,
+  ProbeResponse,
+  ProbeSummary,
+  ResumeReport,
+  RuntimeDescriptor,
 } from "@omni-acp/protocol";

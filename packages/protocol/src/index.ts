@@ -20,6 +20,15 @@ export * from "./events.js";
 // Worker-facing shapes.
 export * from "./worker.js";
 
+// D5's lease wire shapes (M1).
+export * from "./lease.js";
+
+// D2's resume four-state (M1).
+export * from "./resume.js";
+
+// DESIGN §7's Runtime descriptors and the probe summary (M1).
+export * from "./runtime.js";
+
 // The one pure turn aggregator (DESIGN §5.5).
 export * from "./turn.js";
 

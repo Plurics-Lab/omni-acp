@@ -115,6 +115,24 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
+  tests/compat:
+    devDependencies:
+      '@omni-acp/client':
+        specifier: workspace:*
+        version: link:../../packages/client
+      '@omni-acp/daemon':
+        specifier: workspace:*
+        version: link:../../packages/daemon
+      '@omni-acp/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@omni-acp/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
+      yaml:
+        specifier: ^2.9.0
+        version: 2.9.0
+
   tests/integration:
     devDependencies:
       '@agentclientprotocol/sdk':

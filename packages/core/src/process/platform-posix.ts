@@ -1,4 +1,5 @@
 import {
+  OmniError,
   type AgentProcess,
   type PlatformOps,
   type PlatformOwnership,
@@ -141,6 +142,20 @@ export function createPosixPlatformOps(): PlatformOps {
     isLeaderGone(p: AgentProcess): Promise<boolean> {
       if (p.pid === null) return Promise.resolve(true); // `exit` already delivered
       return Promise.resolve(probe(p.info.pid) === "gone");
+    },
+
+    // ── M1 (§15.7), owned by M1-WP-C ────────────────────────────────────────
+
+    fingerprint(_pid: number): Promise<string | null> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    },
+
+    signalTreeByGroup(_groupId: number, _sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    },
+
+    isGroupGone(_groupId: number): Promise<boolean> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
     },
   };
 }

@@ -16,3 +16,10 @@ export * from "./sse.js";
 export * from "./process-tree.js";
 export * from "./paths.js";
 export * from "./event-log-conformance.js";
+
+// ── M1 additions (CONTRACTS.md §5.7) ────────────────────────────────────────
+export * from "./corpus.js";
+export * from "./wire-agent.js";
+export * from "./fake-runtime.js";
+export * from "./tmp-persistence.js";
+export * from "./lease-conformance.js";

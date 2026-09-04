@@ -1,10 +1,10 @@
 import {
   type Clock,
+  type MappedPermissionRequest,
   type PermissionDecision,
   type PermissionOption,
   type PermissionResponder,
   type PolicyDecisionPayload,
-  type RequestPermissionRequest,
   type RequestPermissionResponse,
 } from "@omni-acp/protocol";
 
@@ -35,8 +35,8 @@ const REJECT_ONCE_KIND = "reject_once";
  * for us: `PermissionOptionKind` is a closed enum in the schema, and D4 rule 6 requires an
  * unknown kind to survive far enough to be treated as a non-grant. So the shape check is here.
  */
-function offeredOptions(req: RequestPermissionRequest): readonly PermissionOption[] {
-  const raw = (req as { options?: unknown }).options;
+function offeredOptions(req: MappedPermissionRequest): readonly PermissionOption[] {
+  const raw: unknown = req.options;
   if (!Array.isArray(raw)) return [];
   return raw.filter(
     (o): o is PermissionOption =>
@@ -47,11 +47,16 @@ function offeredOptions(req: RequestPermissionRequest): readonly PermissionOptio
   );
 }
 
-/** `request.toolCall.title ?? ""` (CONTRACTS.md §7.4, review R9). */
-function titleOf(req: RequestPermissionRequest): string {
-  const toolCall = (req as { toolCall?: unknown }).toolCall;
-  if (typeof toolCall !== "object" || toolCall === null) return "";
-  const title = (toolCall as { title?: unknown }).title;
+/**
+ * v2's top-level `title`, which the map already derived from `toolCall.title ?? ""`
+ * (CONTRACTS.md §7.4, §12.6, review R9). v1 has no top-level title, which is why the mapper is
+ * the one that recovers it and the responder never reaches into `toolCall` itself.
+ */
+function titleOf(req: MappedPermissionRequest): string {
+  // Defensive for the same reason `offeredOptions` is: the responder must be TOTAL. The mapper
+  // always sets a string, but a decision that throws is a permission request that hangs forever
+  // (F1), so a malformed input must still produce a record.
+  const title: unknown = req.title;
   return typeof title === "string" ? title : "";
 }
 
@@ -100,7 +105,7 @@ export function createBaselineResponder(mode: "allow" | "deny", clock: Clock): P
   let counter = 0;
 
   return {
-    decide(req: RequestPermissionRequest): PermissionDecision {
+    decide(req: MappedPermissionRequest): PermissionDecision {
       counter += 1;
       const requestId = `perm_${String(clock.now())}_${String(counter)}`;
       const offered = offeredOptions(req);
@@ -118,6 +123,10 @@ export function createBaselineResponder(mode: "allow" | "deny", clock: Clock): P
         rule,
         optionId: chosen === null ? null : chosen.optionId,
         offered,
+        // §13.4: we are the party that denied, so the join back to the tool call is ours to
+        // record — never recovered from the agent's English (`rawOutput: "User refused
+        // permission to run tool"`). The mapper puts it on the request; M1-WP-B fills it in.
+        toolCallId: req.toolCallId,
       };
 
       // Rule 4: nothing acceptable was offered. `null` is the instruction to the caller to reply

@@ -7,7 +7,9 @@ import {
   type DaemonId,
   type EventLog,
   type IdGen,
+  type LeaseSnapshot,
   type Logger,
+  type OrphanRecord,
   type PermissionResponder,
   type PromptAccepted,
   type ResolvedDaemonConfig,
@@ -351,6 +353,37 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
 
     logFor(id, auth): EventLog {
       return get(id, auth).log;
+    },
+
+    // ── M1 façade rows (H17-H19, §5.4) ────────────────────────────────────────
+    //
+    // Same shape as the M0 rows above and for the same reason (review R11): an HTTP route is
+    // "parse -> call ONE daemon method -> serialize", so `POST …/lease/steal` must not become a
+    // get-then-act orchestration in the adapter.
+    //
+    // Owned by M1-WP-E (daemon wiring), which lands the persisted worker store, lazy
+    // rehydration and the hibernated counter behind them. M1-WP-D swaps in the enforcing `Lease`
+    // FACTORY without touching this file — seam 3.
+
+    /** A hibernated worker owns no process, so it is bounded separately from `maxWorkers` (H14). */
+    get hibernatedSize(): number {
+      return 0;
+    },
+
+    lease(_id, _auth, _op, _body): LeaseSnapshot {
+      throw new OmniError("internal", "unimplemented: M1-WP-D");
+    },
+
+    hibernate(_id, _auth): Promise<WorkerSnapshot> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    },
+
+    wake(_id, _auth): Promise<WorkerSnapshot> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    },
+
+    adopt(): Promise<{ hibernated: number; closed: number; orphans: readonly OrphanRecord[] }> {
+      throw new OmniError("internal", "unimplemented: M1-WP-E");
     },
   };
 }

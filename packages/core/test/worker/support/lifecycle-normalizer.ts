@@ -1,5 +1,11 @@
+import { fakeRuntime } from "@omni-acp/testkit";
 import type {
+  AcpErrorDetail,
+  ErrorClass,
   EventInput,
+  MappedPermissionRequest,
+  MappedUpdate,
+  OutboundCall,
   NormalizedSessionUpdate,
   Normalizer,
   SettleReason,
@@ -47,7 +53,9 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
     emit: readonly EventInput[],
     scheduleTickAt: number | null,
     settled: SettleReason | null,
-  ): TurnOutput => ({ emit, scheduleTickAt, state, turnId, settled });
+    // M1's `TurnOutput` carries the close-out rung the Worker must perform (seam 1). The M0
+    // lifecycle requests none, which is exactly what the real reducer does today.
+  ): TurnOutput => ({ emit, scheduleTickAt, state, turnId, settled, action: null });
 
   const reset = (): void => {
     state = "idle";
@@ -59,7 +67,8 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
 
   return {
     sourceProtocolVersion: 1,
-    slice: "m0-lifecycle",
+    slice: "m1-full",
+    descriptor: fakeRuntime(),
     inputs,
     step(input: TurnInput): TurnOutput {
       inputs.push(input.type);
@@ -144,7 +153,56 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
           reset();
           return out(emit, null, "gone");
         }
+
+        default:
+          // M1 widened `TurnInput` with the forced close-out ladder's inputs
+          // (`close_requested` / `drained` / `stderr_line`). The M0 lifecycle this double models
+          // has no ladder, so they are inert here — and inert must mean "no emit, no rung",
+          // never "fall off the end and return undefined".
+          return out([], null, null);
       }
+    },
+
+    // ── the v1->v2 map (M1-WP-B) ────────────────────────────────────────────
+    //
+    // This double models the LIFECYCLE, which is all `worker.ts` needs from a Normalizer, with
+    // one exception: ruling M1-R14 routes every permission request through the map before the
+    // responder sees it, so that one row is modelled and the rest refuse loudly.
+
+    mapUpdate(_update: unknown): MappedUpdate {
+      throw new Error("mapUpdate is M1-WP-B");
+    },
+
+    mapPermissionRequest(req: unknown): MappedPermissionRequest {
+      const r = (typeof req === "object" && req !== null ? req : {}) as Record<string, unknown>;
+      const toolCall = (
+        typeof r["toolCall"] === "object" && r["toolCall"] !== null ? r["toolCall"] : null
+      ) as Record<string, unknown> | null;
+      const options = Array.isArray(r["options"])
+        ? (r["options"] as MappedPermissionRequest["options"])
+        : [];
+      return {
+        sessionId: typeof r["sessionId"] === "string" ? r["sessionId"] : "",
+        title: toolCall !== null && typeof toolCall["title"] === "string" ? toolCall["title"] : "",
+        subject: toolCall === null ? null : { type: "tool_call", toolCall },
+        options,
+        toolCallId:
+          toolCall !== null && typeof toolCall["toolCallId"] === "string"
+            ? toolCall["toolCallId"]
+            : null,
+      };
+    },
+
+    mapRequest(_method: string, _params: Record<string, unknown>): OutboundCall {
+      throw new Error("mapRequest is M1-WP-B");
+    },
+
+    noteUnsupported(_method: string): void {
+      throw new Error("noteUnsupported is M1-WP-B");
+    },
+
+    classifyError(_e: AcpErrorDetail): ErrorClass {
+      throw new Error("classifyError is M1-WP-B");
     },
   };
 }

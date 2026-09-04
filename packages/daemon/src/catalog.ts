@@ -1,9 +1,14 @@
+import { DEFAULT_V1_PROFILE } from "@omni-acp/core";
 import {
   OmniError,
   redactArgs,
   type AgentCatalogEntry,
   type AgentDescriptor,
+  type AuthContext,
+  type ProbeRequestBody,
+  type ProbeResponse,
   type ResolvedDaemonConfig,
+  type RuntimeDescriptor,
   type SpawnSpec,
 } from "@omni-acp/protocol";
 import type { Catalog } from "./types.js";
@@ -32,8 +37,14 @@ export function createCatalog(config: ResolvedDaemonConfig): Catalog {
     // REAL argv to the child; this entry is the description, not the launch.
     args: redactArgs(a.args),
     source: "config",
-    // M1 probes for the real capabilities; a fabricated value here would be worse than a null.
+    // Never fabricated: `probed` is the CACHED `ProbeSummary` or null (H4). M1-WP-E fills it
+    // from `<dataDir>/probes/<id>.json`, and the probe result must not become the credential
+    // leak `redactArgs` above closed.
     probed: null,
+    // "Which quirk table WILL govern a worker created now" (§5.1 `AgentCatalogEntry`).
+    // `DEFAULT_V1_PROFILE.fingerprint` is the `unresolved` sentinel until M1-WP-E computes the
+    // real one; reporting the sentinel is honest, inventing 12 hex digits would not be.
+    runtimeId: `${a.id}@${DEFAULT_V1_PROFILE.fingerprint.slice(0, 12)}`,
   }));
 
   return {
@@ -46,6 +57,20 @@ export function createCatalog(config: ResolvedDaemonConfig): Catalog {
         throw new OmniError("bad_request", `unknown agent "${id}"`);
       }
       return descriptor;
+    },
+
+    /**
+     * builtin ⊕ config overlay ⊕ probe (§17.2). NEVER throws — an unknown agent falls back to the
+     * generic v1 profile, because "which quirk table governs this?" must always have an answer.
+     * M1-WP-E replaces the fallback with the real merge.
+     */
+    descriptor(id: string): RuntimeDescriptor {
+      return { ...DEFAULT_V1_PROFILE, id };
+    },
+
+    /** H16. Owned by M1-WP-E (`probe-service.ts`), which spawns the one throwaway process. */
+    probe(_id: string, _o: ProbeRequestBody, _auth: AuthContext): Promise<ProbeResponse> {
+      throw new OmniError("internal", "unimplemented: M1-WP-E");
     },
 
     /**

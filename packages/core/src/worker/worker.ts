@@ -33,6 +33,11 @@ import {
   type TurnStatus,
   type WorkerCloseReason,
   type WorkerHandle,
+  type CloseOutAction,
+  type MappedPermissionRequest,
+  type OrphanRecord,
+  type ResumeReport,
+  type SessionStrategy,
   type WorkerId,
   type WorkerSnapshot,
   type WorkerState,
@@ -73,10 +78,33 @@ export interface CreateWorkerDeps {
    * required, so a caller written against the document compiles untouched.
    */
   readonly toSpawnSpec?: (d: AgentDescriptor, o: { cwd: string }) => SpawnSpec;
+  /**
+   * SEAM 2 (M1-PLAN §1.2). Once M1-WP-C lands `createSessionStrategy`, the Worker holds one and
+   * calls `open()` on create and `reopen()` on wake, and never names `initialize`,
+   * `session/new`, `session/load` or `session/resume` again.
+   *
+   * It is OPTIONAL at the Land step and absent means "M0's inline `runHandshake` path", because
+   * a required dependency whose only implementation throws would take all 978 M0 tests with it.
+   * The injection point is what matters here: WP-C fills it in without editing this frozen file.
+   */
+  readonly session?: SessionStrategy;
+  /**
+   * Descriptor identity for `WorkerSnapshot.runtimeId` — "which quirk table governed this
+   * worker". M1-WP-E computes it as `"<agentId>@<fingerprint12>"` from the resolved descriptor;
+   * absent, the snapshot reports the agent id against the `unresolved` fingerprint sentinel
+   * rather than a hex string that would look authoritative (see `runtime/known.ts`).
+   */
+  readonly runtimeId?: string;
 }
 
-/** The states an M0 worker can actually occupy (`events.ts` M0_WORKER_STATES). */
-type M0State = "starting" | "ready" | "running" | "closed";
+/**
+ * The states an M1 worker can actually occupy (`events.ts` M1_WORKER_STATES).
+ *
+ * `hibernated` is reachable from M1 on; `requires_action` stays wire-stable and unemitted until
+ * M2's policy engine, so it is deliberately NOT in this union — a state the kernel cannot enter
+ * must not typecheck as one it can.
+ */
+type M1State = "starting" | "ready" | "running" | "hibernated" | "closed";
 
 /** Close reasons whose meaning is "the agent process is gone", as opposed to "we asked". */
 const DEATH_REASONS: ReadonlySet<WorkerCloseReason> = new Set<WorkerCloseReason>([
@@ -167,7 +195,7 @@ class Worker implements WorkerHandle {
   readonly #listeners = new Set<(s: WorkerState, prev: WorkerState | null) => void>();
 
   /** The authoritative state. `prompt()` flips it during its synchronous admission check. */
-  #state: M0State = "starting";
+  #state: M1State = "starting";
   /**
    * The last state actually WRITTEN to the log, which is what `previous` means to a reader.
    * It is a separate field because `prompt()` claims "running" before the envelope that
@@ -192,6 +220,33 @@ class Worker implements WorkerHandle {
   #agentGone = false;
   #currentTurnId: TurnId | null = null;
   #closeReason: WorkerCloseReason | null = null;
+
+  // ── M1 record fields (§15.1, §5.1 `WorkerSnapshot`) ────────────────────────
+  //
+  // Every one of them is reported by `snapshot()`, so each is maintained here rather than
+  // guessed at the boundary. The transitions that MOVE them are M1-WP-C's (`hibernate.ts`,
+  // `wake.ts`); what the Land step owns is that they exist, are honest from the first call, and
+  // have exactly one home.
+
+  /** Processes this worker has had. 1 after the first handshake; +1 on every wake. */
+  #generation = 0;
+  /** Sticky: set by any abnormal death, and it NEVER goes back to false (D2). */
+  #crashed = false;
+  /** ISO-8601 of the transition into `hibernated`; null in every other state. */
+  #hibernatedAt: string | null = null;
+  #wakeCount = 0;
+  /** Consecutive TRANSIENT wake failures; reset to 0 by a successful wake. */
+  #wakeFailures = 0;
+  /** The LAST wake attempt's classification. null before the first wake. */
+  #resume: ResumeReport | null = null;
+  #orphan: OrphanRecord | null = null;
+  /**
+   * D6's replay window, as a REFCOUNT rather than a boolean: `SessionStrategy.reopen` opens it
+   * and closes it in a `finally`, and a refcount is what keeps a nested or re-entered open from
+   * closing a window somebody else still holds. Non-zero ⇒ every `agent_update` fed to the
+   * reducer carries `replay: true` (§15.3).
+   */
+  #replayWindow = 0;
 
   #tickTimer: TimerHandle | null = null;
   #cancelTimer: TimerHandle | null = null;
@@ -254,6 +309,19 @@ class Worker implements WorkerHandle {
       // null once closed: a pid that has been reaped is a pid that can be reused.
       process: this.#state === "closed" ? null : (this.#proc?.info ?? null),
       closeReason: this.#closeReason,
+      // ALWAYS present: `holder: null` is a real, actionable state, not "no lease feature".
+      lease: this.#deps.lease.snapshot(),
+      hibernatedAt: this.#hibernatedAt,
+      crashed: this.#crashed,
+      resume: this.#resume,
+      wakeCount: this.#wakeCount,
+      wakeFailures: this.#wakeFailures,
+      orphan: this.#orphan,
+      generation: this.#generation,
+      runtimeId: this.#deps.runtimeId ?? `${this.#deps.descriptor.id}@unresolved`,
+      // The log knows whether it has a durable side; the worker must not restate the answer.
+      // "degraded" — a durable write FAILED — is M1-WP-A's to report through the log it owns.
+      persistence: this.#deps.log.persistent ? "durable" : "memory",
     };
   }
 
@@ -406,6 +474,51 @@ class Worker implements WorkerHandle {
     });
   }
 
+  get generation(): number {
+    return this.#generation;
+  }
+
+  /**
+   * ready → hibernated (§15.2). Reclaims the process tree, RELEASES the lease, keeps the record
+   * and the session pointer, and NEVER sends `session/close` — the pointer is the entire value
+   * being preserved. Owned by M1-WP-C (`worker/hibernate.ts`).
+   */
+  hibernate(_reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot> {
+    throw new OmniError("internal", "unimplemented: M1-WP-C");
+  }
+
+  /**
+   * hibernated → ready (§15.5). Idempotent and single-flight. Owned by M1-WP-C
+   * (`worker/wake.ts`), which drives it through the injected `SessionStrategy.reopen`.
+   */
+  wake(_who: ClientRef, _opts?: { timeoutMs?: number }): Promise<WorkerSnapshot> {
+    // The resume call happens INSIDE D6's replay window, which is why the wake path is the one
+    // that opens it. `#withReplayWindow` is the seam; what runs inside it is M1-WP-C's.
+    return this.#withReplayWindow(() => {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    });
+  }
+
+  /**
+   * D6's replay window, opened for the duration of `fn` and closed in a `finally`.
+   *
+   * The `finally` is load-bearing and is an acceptance bullet of its own (M1-PLAN WP-C 3): a
+   * REJECTED resume that left the window open would mark the NEXT turn's updates as replay, and
+   * a consumer filtering `replay: true` would then silently drop a live turn.
+   *
+   * It is a REFCOUNT rather than a boolean so a nested or re-entered open cannot close a window
+   * somebody else still holds. `SessionReopenOptions.controls.replayWindow()` is the same thing
+   * handed to a `SessionStrategy`.
+   */
+  async #withReplayWindow<T>(fn: () => Promise<T>): Promise<T> {
+    this.#replayWindow += 1;
+    try {
+      return await fn();
+    } finally {
+      this.#replayWindow -= 1;
+    }
+  }
+
   close(reason: WorkerCloseReason): Promise<CloseResult> {
     return this.#closeWith(reason, {});
   }
@@ -446,7 +559,41 @@ class Worker implements WorkerHandle {
     }
   }
 
+  /**
+   * SEAM 1 (M1-PLAN §1.2). The close-out ladder's DECISIONS live in the pure reducer; the Worker
+   * performs the rung it is handed and adds no judgement of its own. That is what keeps the whole
+   * ladder unit-testable with `fakeClock()` and no process.
+   *
+   * The M0 slice never requests a rung (`turn-lifecycle.ts` returns `action: null`), so nothing
+   * below runs until M1-WP-B fills the forced ladder in.
+   */
+  #perform(action: CloseOutAction | null): void {
+    if (action === null) return;
+    switch (action) {
+      case "close_stdin":
+        // Rung 2. NEVER at turn end — only in the FORCED ladder (§13, ruling M1-R4).
+        this.#proc?.closeStdin();
+        return;
+      case "drain":
+        // Rung 3. Nothing to do: the drain is OBSERVED (`stdoutEnded` feeds `drained` back into
+        // the reducer, which owns the grace deadline). A rung that acted here would be racing
+        // the reducer's own clock.
+        return;
+      case "cancel":
+        // Rung 4. The notification only; the reducer owns the grace that follows it.
+        if (this.#link !== null && !this.#linkClosed && this.#sessionId !== null) {
+          this.#link.notify("session/cancel", { sessionId: this.#sessionId });
+        }
+        return;
+      case "terminate":
+        // Rung 5. `force`, because every cooperative rung above it has already been offered.
+        void this.#closeWith("cancel_timeout", { force: true });
+        return;
+    }
+  }
+
   #afterStep(out: TurnOutput): void {
+    this.#perform(out.action);
     const settledTurn = this.#currentTurnId;
     if (out.settled === null) return;
 
@@ -483,11 +630,26 @@ class Worker implements WorkerHandle {
         received: n.sessionId,
       });
     }
-    this.#feed({ type: "agent_update", update: n.update, at: this.#deps.clock.now() });
+    // D6: every update that arrives inside the replay window is MARKED, and the reducer copies
+    // the flag onto each `EventInput` it emits — so the window lives here, in the Worker, and the
+    // reducer stays pure and carries no window state of its own (§15.3).
+    this.#feed({
+      type: "agent_update",
+      update: n.update,
+      at: this.#deps.clock.now(),
+      ...(this.#replayWindow > 0 ? { replay: true as const } : {}),
+    });
   }
 
   async #onPermissionRequest(req: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    const decision = this.#deps.responder.decide(req);
+    // Ruling M1-R14: the responder sees the V2-MAPPED request, never the raw v1 one. D4's rule
+    // set is written against v2's tagged `subject`, and mapping FIRST is what lets M2's rule
+    // engine match `kind` / `path` / `cmd` with no per-agent branch.
+    //
+    // The envelope below still carries the RAW request verbatim — `acp.interaction` is the audit
+    // record, and an audit of a reshaped object audits our reshaping (§7.5).
+    const mapped: MappedPermissionRequest = this.#deps.normalizer.mapPermissionRequest(req);
+    const decision = this.#deps.responder.decide(mapped);
     const turnId = this.#currentTurnId;
     const answered = decision.response !== null;
     const optionId = decision.record.optionId;
@@ -657,6 +819,10 @@ class Worker implements WorkerHandle {
 
     // Best effort, and skipped unless advertised: `session/close` does not exist in v1 unless
     // `sessionCapabilities.close` says so, and an unadvertised call would just earn a -32601.
+    //
+    // It stays FALSE unless the call resolved, which is the whole point of the field: the daemon
+    // guarantees it stops referencing the session, never that the agent deleted it (§15.6).
+    let sessionClosed = false;
     if (
       this.#capabilities?.supportsSessionClose === true &&
       this.#link !== null &&
@@ -671,6 +837,7 @@ class Worker implements WorkerHandle {
           this.#link.request("session/close", { sessionId: this.#sessionId }),
           this.#deps.limits.gracefulMs,
         );
+        sessionClosed = true;
       } catch (e) {
         this.#logger.debug("session/close failed; continuing to the kill", { error: String(e) });
       }
@@ -714,6 +881,10 @@ class Worker implements WorkerHandle {
       reason,
       leaderExited,
       treeGone,
+      // §15.6: whether `session/close` was actually SENT AND ACKNOWLEDGED — not whether the
+      // agent deleted anything, which we cannot know. False for every close of a `hibernated`
+      // worker, because we do not spawn a process in order to politely close a session.
+      sessionClosed,
     };
     this.#logger.info("worker closed", { reason, previous, leaderExited, treeGone });
     this.#resolveClosed(result);
@@ -759,7 +930,7 @@ class Worker implements WorkerHandle {
   // ── state ──────────────────────────────────────────────────────────────────
 
   #setState(
-    next: M0State,
+    next: M1State,
     reason: WorkerStatePayload["reason"],
     o: {
       turnId?: TurnId | null;
@@ -854,6 +1025,10 @@ class Worker implements WorkerHandle {
       });
       this.#capabilities = capabilities;
       this.#sessionId = sessionId;
+      // One process has now handshaken. `generation` is "processes this worker has had", so it
+      // is incremented HERE and not at spawn: a spawn that never handshakes produced no
+      // generation of this worker, it produced a failed create (§5.1 `WorkerSnapshot`).
+      this.#generation += 1;
     } catch (e) {
       const error = OmniError.from(e, "agent_error");
       const reason: WorkerCloseReason =

@@ -180,6 +180,9 @@ describe("close (WP-4 acceptance 11)", () => {
       reason: "client_request",
       leaderExited: true,
       treeGone: true,
+      // §15.6: the fixture does not advertise `sessionCapabilities.close`, so nothing was sent
+      // and nothing is claimed. `sessionClosed` reports the SEND, never the agent's bookkeeping.
+      sessionClosed: false,
     });
     // §6.6: the same two facts must reach the operator through the state envelope too.
     expect(stateOf(h.log.all.at(-1))).toMatchObject({ leaderExited: true, treeGone: true });

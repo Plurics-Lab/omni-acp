@@ -5,8 +5,33 @@ import type { Seq, TurnId, WorkerId } from "./ids.js";
 
 export interface FileChange {
   readonly path: string;
+  /** v2 `DiffChange.operation`. Derived when the agent gives only v1 fields:
+   *  `oldText == null ? "add" : "modify"`. */
+  readonly operation: "add" | "modify" | "delete" | "move" | "copy" | string;
   readonly oldText: string | null;
   readonly newText: string;
+  /**
+   * TRUE when `oldText`/`newText` are the CHANGED FRAGMENT rather than whole-file content, from
+   * the descriptor's `diffIsFragment` quirk — never guessed. F19: claude-acp widens the pair
+   * between updates (`"mode = slow"→"mode = fast"`, then `"mode = slow\nretries = 3"→…`), so a
+   * consumer that writes `newText` to `path` corrupts the file.
+   *
+   * The fold cannot know the quirk (it is pure over envelopes and holds no descriptor), so the
+   * NORMALIZER stamps it onto the diff block it emits and this reads it back; absent ⇒ false.
+   */
+  readonly fragment: boolean;
+}
+
+/** DESIGN §6.2's "`end_turn` ≠ 成功", made machine-readable — with no new event kind (§13.4). */
+export type TurnVerdict = "ok" | "partial" | "failed";
+
+export interface TurnWarning {
+  /** "rate_limit" | "tool_denied" | "tool_failed" | "permission_not_offered" | … */
+  readonly code: string;
+  readonly message: string;
+  /** Where it came from, so a consumer can weigh it. `stderr` is the weakest and is descriptor-gated. */
+  readonly source: "usage_meta" | "stderr" | "policy" | "tool_status";
+  readonly detail?: Readonly<Record<string, unknown>>;
 }
 
 export interface ToolCallView {
@@ -39,14 +64,40 @@ export interface TurnResult {
   readonly toolCalls: readonly ToolCallView[];
   /** From ToolCallContent{type:"diff"} (CONTRACTS.md F5). */
   readonly changes: readonly FileChange[];
-  /** M0: always null (D8, the git provider is M2). */
+  /** STILL `null` in M1 (D8, ruling M1-R11). The git provider is M2 and is the only thing that
+   *  may fill it, because only it can compare against the actual disk. */
   readonly patch: string | null;
+  /**
+   * A patch reconstructed from a descriptor-registered VENDOR `_meta` extension, clearly labelled
+   * as such. For claude-acp that is `_meta.claudeCode.toolResponse.{structuredPatch, originalFile,
+   * content}` (F19). `null` for any agent without a registered extractor, and `null` rather than
+   * wrong when the reconstructed hunk line counts disagree with `oldLines`/`newLines`.
+   */
+  readonly vendorPatch: { format: "git_patch"; text: string; source: string } | null;
   readonly usage?: {
     used: number;
     size: number;
     cost?: { amount: number; currency: string };
   };
+  /**
+   * The v2 `Usage` block from the prompt RESPONSE (F21) — a different shape from `usage` above,
+   * which stays sourced from the last `usage_update` (F4). Rides on `state_update{idle}.usage`,
+   * which is where v2 puts it.
+   */
+  readonly tokens?: {
+    totalTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedReadTokens?: number;
+    cachedWriteTokens?: number;
+  };
   readonly interactions: readonly InteractionRecord[];
+  readonly verdict: TurnVerdict;
+  readonly warnings: readonly TurnWarning[];
+  /** Tool calls whose FINAL status is "failed", in stream order. */
+  readonly failedToolCalls: readonly string[];
+  /** Tool calls THIS daemon denied, from our own `omni.policy_decision` — never from prose. */
+  readonly deniedToolCalls: readonly string[];
   readonly error: OmniErrorBody | null;
 }
 
@@ -87,6 +138,12 @@ const CLOSE_REASON_CODE: { readonly [R in WorkerCloseReason]: OmniErrorCode } = 
   protocol_error: "agent_error",
   handshake_timeout: "agent_timeout",
   cancel_timeout: "agent_timeout",
+  // M1's three new reasons. `idle_timeout` and `orphaned` are OUR decision to stop holding the
+  // worker, so they read as `worker_closed`; `wake_failed` is a run of failed attempts against
+  // the agent, so it reads as `agent_error`.
+  idle_timeout: "worker_closed",
+  orphaned: "worker_closed",
+  wake_failed: "agent_error",
 };
 
 interface MutableToolCall {
@@ -360,7 +417,16 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
       const path = str(d["path"]);
       const newText = str(d["newText"]);
       if (path === null || newText === null) continue;
-      changes.push({ path, oldText: str(d["oldText"]), newText });
+      const oldText = str(d["oldText"]);
+      changes.push({
+        path,
+        // The v2 field wins when the payload carries one; otherwise the derivation the contract
+        // states verbatim. Neither is a guess about CONTENT — see `fragment`.
+        operation: str(d["operation"]) ?? (oldText === null ? "add" : "modify"),
+        oldText,
+        newText,
+        fragment: d["fragment"] === true,
+      });
     }
   }
 
@@ -372,8 +438,16 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
     toolCalls,
     changes,
     patch: null,
+    vendorPatch: null,
     ...(f.usage === null ? {} : { usage: f.usage }),
     interactions: f.interactions,
+    // M1-WP-B owns §13.4's promotion rules (rate-limit `_meta`, failed/denied tool calls, the
+    // descriptor-gated stderr signal). Until then the only evidence the M0 fold already holds is
+    // `error`, and reporting it is the honest floor: never a fabricated "ok" over a failure.
+    verdict: f.error === null ? "ok" : "failed",
+    warnings: [],
+    failedToolCalls: [],
+    deniedToolCalls: [],
     error: f.error,
   };
 }

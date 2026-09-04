@@ -2,7 +2,7 @@ import { OmniError } from "@omni-acp/protocol";
 import { Hono } from "hono";
 import type { Daemon } from "../types.js";
 import { toErrorResponse } from "./errors.js";
-import { registerRoutes } from "./routes.js";
+import { registerRoutes } from "./routes/index.js";
 
 /**
  * The HTTP adapter, in full. ZERO business logic (D15 constraint 1).

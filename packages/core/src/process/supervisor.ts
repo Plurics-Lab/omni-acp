@@ -1,8 +1,10 @@
 import {
+  OmniError,
   type AgentProcess,
   type Clock,
   type KillOutcome,
   type Logger,
+  type OrphanRecord,
   type PlatformOps,
   type ResolvedSupervisorConfig,
   type SpawnSpec,
@@ -113,6 +115,15 @@ export function createSupervisor(o: SupervisorOptions): Supervisor {
       );
 
       return outcomes;
+    },
+
+    /**
+     * §15.7 / L18. Kill a process this daemon did NOT spawn, gated on the incarnation token a
+     * previous boot recorded. ALWAYS resolves: a reap failure is data (`reapSkipped`), never an
+     * exception. Owned by M1-WP-C.
+     */
+    reapOrphan(_o: OrphanRecord): Promise<OrphanRecord> {
+      throw new OmniError("internal", "unimplemented: M1-WP-C");
     },
   };
 }

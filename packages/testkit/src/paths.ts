@@ -22,7 +22,23 @@ export function sdkExampleAgentPath(): string {
   return join(dirname(mainEntry), "examples", "agent.js");
 }
 
-export type FixtureAgentName = "echo" | "crash" | "slow" | "chatty" | "orphan" | "noisy";
+export type FixtureAgentName =
+  | "echo"
+  | "crash"
+  | "slow"
+  | "chatty"
+  | "orphan"
+  | "noisy"
+  /**
+   * M1's four, covering the corpus gaps the research README enumerates (CONTRACTS.md §5.7,
+   * §18.3). The NAMES are landed here so every consumer compiles against the final union; the
+   * `.mjs` files themselves are M1-WP-B's, which is also what makes `fixture-agents.test.ts`
+   * (WP-B's) the test that proves each one launches.
+   */
+  | "plan"
+  | "thought"
+  | "mode"
+  | "hybrid";
 
 /**
  * Absolute path to one of the repository's own fixture agents (`fixtures/agents/*.mjs`).

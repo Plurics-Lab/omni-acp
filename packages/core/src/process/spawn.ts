@@ -228,6 +228,9 @@ export async function spawnAgentProcess(
 
   const pid = child.pid ?? null;
   const info: ProcessInfo = {
+    // Captured at spawn by M1-WP-C (`process/fingerprint.ts`); until then it is honestly absent,
+    // and an absent fingerprint is the value that FORBIDS signalling this pid after a restart.
+    fingerprint: null,
     pid: pid ?? -1,
     // POSIX `detached` means setsid(), so pgid === pid. Windows has no addressable group, and
     // this is derived from the ownership decision rather than from `process.platform` (§6.1).

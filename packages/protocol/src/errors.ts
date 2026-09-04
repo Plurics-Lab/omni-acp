@@ -1,4 +1,6 @@
 import { AcpRequestError } from "./acp.js";
+import type { LeaseSnapshot } from "./lease.js";
+import type { ResumeReport } from "./resume.js";
 
 /** Exactly DESIGN §5.4. No additions — see CONTRACTS.md §11 D29. */
 export const OMNI_ERROR_CODES = [
@@ -51,6 +53,13 @@ export interface OmniErrorBody {
   code: OmniErrorCode;
   message: string;
   acp?: AcpErrorDetail;
+  /**
+   * ONLY on `lease_held` (423). Says WHO holds it and at which epoch, so a caller does not have
+   * to re-GET a worker it may no longer control just to find out (CONTRACTS.md §16.1).
+   */
+  lease?: LeaseSnapshot;
+  /** ONLY on `not_resumable` (422). Which of D2's four states fired, and on what evidence. */
+  resume?: ResumeReport;
 }
 
 /** True for the AbortController / AbortSignal.timeout families, cross-realm. */
@@ -81,19 +90,31 @@ export class OmniError extends Error {
   readonly code: OmniErrorCode;
   readonly status: number;
   readonly acp?: AcpErrorDetail;
+  /** Present only on `lease_held`; spread onto the body so two 423s stay deep-equal (§16.1). */
+  readonly lease?: LeaseSnapshot;
+  /** Present only on `not_resumable`; the evidence behind D2's four-state verdict (§15). */
+  readonly resume?: ResumeReport;
   /** Machine-readable extras that never cross the wire (pid, exit code, path...). */
   readonly detail?: Readonly<Record<string, unknown>>;
 
   constructor(
     code: OmniErrorCode,
     message: string,
-    opts?: { acp?: AcpErrorDetail; cause?: unknown; detail?: Record<string, unknown> },
+    opts?: {
+      acp?: AcpErrorDetail;
+      cause?: unknown;
+      detail?: Record<string, unknown>;
+      lease?: LeaseSnapshot;
+      resume?: ResumeReport;
+    },
   ) {
     super(message, opts?.cause === undefined ? undefined : { cause: opts.cause });
     this.name = "OmniError";
     this.code = code;
     this.status = ERROR_STATUS[code];
     this.acp = opts?.acp;
+    this.lease = opts?.lease;
+    this.resume = opts?.resume;
     this.detail = opts?.detail;
   }
 
@@ -103,9 +124,15 @@ export class OmniError extends Error {
    * two bodies for the same failure are deep-equal.
    */
   toBody(): OmniErrorBody {
-    return this.acp === undefined
-      ? { code: this.code, message: this.message }
-      : { code: this.code, message: this.message, acp: this.acp };
+    // Each extra is spread only when it exists, so two bodies for the same failure are
+    // deep-equal and there is still exactly ONE mapper (§9).
+    return {
+      code: this.code,
+      message: this.message,
+      ...(this.acp === undefined ? {} : { acp: this.acp }),
+      ...(this.lease === undefined ? {} : { lease: this.lease }),
+      ...(this.resume === undefined ? {} : { resume: this.resume }),
+    };
   }
 
   static is(e: unknown, code?: OmniErrorCode): e is OmniError {

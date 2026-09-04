@@ -1,0 +1,44 @@
+# Hermetic compat targets. Run on every push, on all three OSes, with no login and no network.
+#
+# The whole point of this file is CONTRACTS.md §18's rule: adding an agent is a YAML edit with
+# ZERO code changes, and a test proves it by appending an entry to a temp copy of this file and
+# running the suite unchanged. A second test asserts that no `.ts` file in the repository
+# contains a real agent's command string, so the rule cannot rot into "config plus one branch".
+#
+# `command: node` means `process.execPath` — never `npx`, which is a `.cmd` shim on Windows
+# (CONTRACTS.md §6.3). `sdk-example` resolves through `sdkExampleAgentPath()`.
+version: 1
+agents:
+  - id: sdk-example
+    source: sdk-example
+    # The tier-3 acceptance fixture: real process, real ndJSON, `loadSession: true`.
+    expect:
+      resume: true
+
+  - id: fixture-echo
+    source: fixture
+    fixture: echo
+  - id: fixture-chatty
+    source: fixture
+    fixture: chatty
+  - id: fixture-noisy
+    source: fixture
+    fixture: noisy
+  - id: fixture-slow
+    source: fixture
+    fixture: slow
+
+  # M1-WP-B's four gap-filling fixtures (§18.3). They are listed here now so that the fixture
+  # they cover is named in config the day it lands, not the day somebody remembers.
+  - id: fixture-plan
+    source: fixture
+    fixture: plan
+  - id: fixture-thought
+    source: fixture
+    fixture: thought
+  - id: fixture-mode
+    source: fixture
+    fixture: mode
+  - id: fixture-hybrid
+    source: fixture
+    fixture: hybrid
