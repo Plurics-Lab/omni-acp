@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, realpath } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -34,15 +34,26 @@ describe("openDaemonPersistence — the driver decides (ruling M1-R17)", () => {
   });
 
   it('hands "sqlite" to M1-WP-A\'s openPersistence, config and all', async () => {
-    // Reaching that body IS the assertion: the driver-gating decision is this module's, and the
-    // store itself is M1-WP-A's (a throwing stub in this tree).
-    await expect(
-      openDaemonPersistence({
-        config: config({ eventLog: { driver: "sqlite" } }),
-        clock: fakeClock(),
-        logger: nullLogger(),
-      }),
-    ).rejects.toThrow(/M1-WP-A/);
+    // The driver-gating decision is this module's; the store is M1-WP-A's. With both landed the
+    // assertion is that the two met: a real handle, over a file this dataDir owns, reporting the
+    // driver the operator asked for.
+    const dataDir = await mkdtemp(join(tmpdir(), "omni-event-store-"));
+    const handle = await openDaemonPersistence({
+      config: config({ dataDir, eventLog: { driver: "sqlite" } }),
+      clock: fakeClock(),
+      logger: nullLogger(),
+    });
+    expect(handle).not.toBeNull();
+    try {
+      expect(handle?.events.diagnostics.driver).toBe("sqlite");
+      expect(handle?.events.diagnostics.file).toBe(join(dataDir, "events.db"));
+      expect(handle?.events.diagnostics.schemaVersion).toBeGreaterThan(0);
+      // The config reached it: a store opened under a dataDir leaves its file THERE, which is
+      // what makes `OMNI_DATA_DIR` mean anything.
+      expect((await readdir(dataDir)).filter((e) => e.endsWith(".db"))).toEqual(["events.db"]);
+    } finally {
+      handle?.close();
+    }
   });
 });
 
@@ -192,17 +203,56 @@ describe("createDaemon — a store that refuses to open fails the START, naming 
     // startup failure (M1-WP-A), and what this owns is that such a failure REACHES the caller
     // instead of being swallowed into a daemon that quietly runs on memory.
     const root = await realpath(await mkdtemp(join(tmpdir(), "omni-retention-")));
-    await expect(
-      createDaemon(
-        {
-          dataDir: join(root, "data"),
-          listen: null,
-          tokens: [{ id: "t", secret: "the-only-valid-secret-0123456789", cwdRoots: [root] }],
-          eventLog: { driver: "sqlite" },
-          logLevel: "silent",
-        },
-        { supervisor: fakeSupervisor(), ids: seqIds(), logger: nullLogger() },
-      ),
-    ).rejects.toThrow(OmniError);
+    const dataDir = join(root, "data");
+    await mkdir(dataDir, { recursive: true });
+    await plantFutureSchema(join(dataDir, "events.db"));
+
+    const start = createDaemon(
+      {
+        dataDir,
+        listen: null,
+        tokens: [{ id: "t", secret: "the-only-valid-secret-0123456789", cwdRoots: [root] }],
+        eventLog: { driver: "sqlite" },
+        logLevel: "silent",
+      },
+      { supervisor: fakeSupervisor(), ids: seqIds(), logger: nullLogger() },
+    );
+    await expect(start).rejects.toThrow(OmniError);
+    // "naming why": the version is in the message, so an operator who downgraded a daemon by
+    // accident is told which binary wrote the file rather than being handed a bare 500.
+    await expect(start).rejects.toThrow(/999/);
+  });
+
+  it("starts on a GOOD sqlite file, so the refusal above is not vacuous", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "omni-retention-")));
+    const daemon = await createDaemon(
+      {
+        dataDir: join(root, "data"),
+        listen: null,
+        tokens: [{ id: "t", secret: "the-only-valid-secret-0123456789", cwdRoots: [root] }],
+        eventLog: { driver: "sqlite" },
+        logLevel: "silent",
+      },
+      { supervisor: fakeSupervisor(), ids: seqIds(), logger: nullLogger() },
+    );
+    expect(daemon.info.persistence.driver).toBe("sqlite");
+    await daemon.stop();
   });
 });
+
+/**
+ * Writes an `events.db` whose `schema_version` is from the future.
+ *
+ * Raw `node:sqlite` on purpose: the point is a file this build did NOT write, so going through
+ * `openPersistence` to make one would only prove it agrees with itself.
+ */
+async function plantFutureSchema(file: string): Promise<void> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(file);
+  try {
+    db.exec("create table meta (key text primary key, value text not null)");
+    db.exec("insert into meta (key, value) values ('schema_version', '999')");
+  } finally {
+    db.close();
+  }
+}

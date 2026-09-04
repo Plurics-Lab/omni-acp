@@ -346,7 +346,16 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     const owner: ClientRef = { tokenId: row.snapshot.ownerTokenId, clientId: null };
     let handle: WorkerHandle;
     try {
+      // From the CURRENT config, never from the row (M1-WP-C's `RehydrateDeps` header): a
+      // `cwdRoots`, timeout or quirk-table change between boots must take effect on the worker
+      // this boot wakes. `catalog.get` THROWS for an agent the operator has since removed, which
+      // the catch below turns into "no handle" rather than a 500 — the same answer the row gets
+      // when its log belongs to somebody else.
+      const descriptor = o.catalog.get(row.agentId);
+      const runtime = o.catalog.descriptor(row.agentId);
+      const runtimeId = o.catalog.list().find((e) => e.id === row.agentId)?.runtimeId;
       handle = createRehydratedWorker(row, log, {
+        descriptor,
         supervisor: o.supervisor,
         // `session` is required by `RehydrateDeps`; without an injected strategy the rehydrated
         // worker uses the same inline handshake `worker.ts` falls back to, and M1-WP-C's
@@ -356,6 +365,30 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         clock: o.clock,
         ids: o.ids,
         logger: o.logger.child({ workerId, agent: row.agentId, rehydrated: true }),
+        // The same four `create()` builds, for the same reasons: a woken worker maps its updates
+        // through the resolved descriptor, answers permissions through the daemon's one wired
+        // responder, and takes its budgets from this boot's config.
+        normalizer: createNormalizer({
+          quietMs: o.config.turn.quietMs,
+          hardMs: o.config.turn.hardMs,
+          drainGraceMs: o.config.turn.drainGraceMs,
+          cancelGraceMs: o.config.turn.cancelGraceMs,
+          descriptor: runtime,
+          ids: { synth: (prefix: string) => `${prefix}_${o.ids.request()}` },
+        }),
+        responder: o.responder,
+        limits: {
+          handshakeTimeoutMs: o.config.handshakeTimeoutMs,
+          cancelGraceMs: o.config.turn.cancelGraceMs,
+          exitGraceMs: o.config.supervisor.exitGraceMs,
+          gracefulMs: o.config.supervisor.gracefulMs,
+          wakeTimeoutMs: o.config.hibernate.wakeTimeoutMs,
+          maxWakeFailures: o.config.hibernate.maxWakeFailures,
+        },
+        runtime,
+        ...(runtimeId === undefined ? {} : { runtimeId }),
+        toSpawnSpec: (d, spawnOpts) => o.catalog.toSpawnSpec(d, spawnOpts),
+        owner,
       });
     } catch (e) {
       // A row we cannot reconstruct is not a 500 on `GET /v1/workers`: the row is still visible

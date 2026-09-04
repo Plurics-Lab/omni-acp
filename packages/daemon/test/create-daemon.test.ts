@@ -153,20 +153,24 @@ describe("createDaemon config resolution", () => {
   it('ACCEPTS eventLog.driver "sqlite" and opens persistence with it (M1, §8.1)', async () => {
     // M0 parsed this and then refused it at runtime. M1 is the milestone that removes the
     // refusal: the config SHAPE never changed, only that one line, and `createDaemon` now hands
-    // the driver to `openPersistence`. Reaching M1-WP-A's body IS the assertion — the failure
-    // below is that package's unimplemented store, not this one's rejection.
+    // the driver to `openPersistence` — which, with M1-WP-A landed, opens a real database.
     expect(() =>
       DaemonConfig.parse({
         tokens: [{ id: "t", secret: SECRET }],
         eventLog: { driver: "sqlite" },
       }),
     ).not.toThrow();
-    await expect(
-      createDaemon({
-        tokens: [{ id: "t", secret: SECRET }],
-        eventLog: { driver: "sqlite" },
-      }),
-    ).rejects.toThrow(/M1-WP-A/);
+    const { daemon, dataDir } = await build({ eventLog: { driver: "sqlite" } });
+    try {
+      expect(daemon.config.eventLog.driver).toBe("sqlite");
+      // The driver reached the STORE, not just the config object: `GET /v1/info` reports the
+      // file that is actually open, which is the difference between wiring and a parsed field.
+      expect(daemon.info.persistence.driver).toBe("sqlite");
+      expect(daemon.info.persistence.file).toBe(join(dataDir, "events.db"));
+      expect(existsSync(join(dataDir, "events.db"))).toBe(true);
+    } finally {
+      await daemon.stop();
+    }
   });
 
   it('keeps "memory" as the default, so createDaemon() leaves no database behind (M1-R17)', async () => {
