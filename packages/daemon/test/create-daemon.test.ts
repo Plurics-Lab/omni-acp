@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -149,7 +150,11 @@ describe("createDaemon config resolution", () => {
     ).rejects.toMatchObject({ code: "bad_request" });
   });
 
-  it('rejects eventLog.driver "sqlite" at RUNTIME while still parsing it (§8.1)', async () => {
+  it('ACCEPTS eventLog.driver "sqlite" and opens persistence with it (M1, §8.1)', async () => {
+    // M0 parsed this and then refused it at runtime. M1 is the milestone that removes the
+    // refusal: the config SHAPE never changed, only that one line, and `createDaemon` now hands
+    // the driver to `openPersistence`. Reaching M1-WP-A's body IS the assertion — the failure
+    // below is that package's unimplemented store, not this one's rejection.
     expect(() =>
       DaemonConfig.parse({
         tokens: [{ id: "t", secret: SECRET }],
@@ -161,7 +166,17 @@ describe("createDaemon config resolution", () => {
         tokens: [{ id: "t", secret: SECRET }],
         eventLog: { driver: "sqlite" },
       }),
-    ).rejects.toThrow(/is M1; M0 supports "memory" only/);
+    ).rejects.toThrow(/M1-WP-A/);
+  });
+
+  it('keeps "memory" as the default, so createDaemon() leaves no database behind (M1-R17)', async () => {
+    const { daemon, dataDir } = await build();
+    expect(daemon.config.eventLog.driver).toBe("memory");
+    expect(daemon.info.persistence.driver).toBe("memory");
+    expect(daemon.info.persistence.file).toBeNull();
+    await daemon.stop();
+    // `omni-acp start` is what writes "sqlite"; an embedded `OmniACP.local()` must not.
+    expect(existsSync(join(dataDir, "events.db"))).toBe(false);
   });
 
   it("resolves dataDir to an absolute, ~-expanded path on daemon.config", async () => {

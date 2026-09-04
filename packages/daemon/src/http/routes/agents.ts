@@ -1,6 +1,8 @@
-import type { Hono } from "hono";
+import { ProbeRequestBody } from "@omni-acp/protocol";
+import type { Context, Hono } from "hono";
 import type { Daemon } from "../../types.js";
 import { authMiddleware, authOf } from "../auth-middleware.js";
+import { readJson } from "./index.js";
 
 /**
  * The agent catalog and the probe: H4 and H16.
@@ -10,9 +12,11 @@ import { authMiddleware, authOf } from "../auth-middleware.js";
  * `args` stay redacted through `redactArgs`, and `probed` is the cached summary or null — the
  * probe result must not become the leak `catalog.ts` closed.
  *
- * H16 is M1-WP-E's: `auth.assertAgent(id)` FIRST, so a forbidden agent 403s before a process
- * exists, then ONE throwaway process through `Supervisor.spawn`. It is not registered yet, for
- * the reason spelled out in `lease.ts`.
+ * H16 is three moves like every other route (D15 constraint 1): parse with zod, call ONE daemon
+ * method, serialize. Everything that makes it H16 — `auth.assertAgent(id)` FIRST so a forbidden
+ * agent 403s before a process exists, the single throwaway process through `Supervisor.spawn`,
+ * the shared in-flight probe, the cache — is `probe-service.ts`'s, behind `catalog.probe`. A
+ * route that checked the ACL itself would be the adapter making a policy decision.
  */
 export function registerAgentRoutes(app: Hono, daemon: Daemon): void {
   const auth = authMiddleware(daemon);
@@ -20,7 +24,29 @@ export function registerAgentRoutes(app: Hono, daemon: Daemon): void {
   // H4.
   app.get("/v1/agents", auth, (c) => c.json({ agents: daemon.catalog.list() }));
 
-  // H16 lands here (M1-WP-E). `authOf` is imported because that route reads the AuthContext for
-  // `assertAgent`, and an unused import is the kind of thing a rebase silently deletes.
-  void authOf;
+  // H16. An empty body is legal — every field of `ProbeRequestBody` is optional — so a bare
+  // `POST` with no `content-type` is the common case and must not be a 400.
+  app.post("/v1/agents/:id/probe", auth, async (c) =>
+    c.json(
+      await daemon.catalog.probe(
+        c.req.param("id"),
+        ProbeRequestBody.parse(await optionalJson(c)),
+        authOf(c.req.raw),
+      ),
+    ),
+  );
+}
+
+/**
+ * The request body, or `{}` when there is none.
+ *
+ * `readJson` insists on `application/json` (a daemon that accepts a JSON body under
+ * `text/plain` is one CSRF-shaped request away from being driven by a form post), and that rule
+ * stands. This only says that a probe with NOTHING to configure need not send a body at all —
+ * `curl -X POST .../probe` is the shape an operator actually types.
+ */
+async function optionalJson(c: Context): Promise<unknown> {
+  const contentType = c.req.header("content-type");
+  if (contentType === undefined || contentType.trim() === "") return {};
+  return await readJson(c);
 }

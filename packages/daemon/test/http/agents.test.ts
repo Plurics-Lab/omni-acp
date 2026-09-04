@@ -61,9 +61,9 @@ describe("GET /v1/agents does not serve credentials (H4, DESIGN §8)", () => {
         args: ["--model", "sonnet", "--api-key", "<redacted>", "--token=<redacted>"],
         source: "config",
         probed: null,
-        // Which quirk table WILL govern a worker created now (§5.1 AgentCatalogEntry).
-        // `unresolved` is the fingerprint sentinel until M1-WP-E computes the real sha256.
-        runtimeId: "claude@unresolved",
+        // Which quirk table WILL govern a worker created now (§5.1 AgentCatalogEntry): the
+        // agent id, then 12 hex characters of the real sha256 over command ⊕ args ⊕ version.
+        runtimeId: expect.stringMatching(/^claude@[0-9a-f]{12}$/) as unknown as string,
       },
     ]);
     // Belt and braces: the secret must not appear ANYWHERE in the response bytes.
