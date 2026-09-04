@@ -305,7 +305,14 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // (M1-PLAN WP-D acceptance 2). `WorkerHandle.close()` takes no `ClientRef`, so this is the
       // enforcement point, and it is Land-written for the same reason the rest of seam 3 is:
       // under the default `alwaysGrantedLease` it always grants, which is M0 unchanged.
-      entry.handle.lease.assertHolder(auth.asClientRef());
+      //
+      // §16.1 rule L3 is "the lease **or** `role:"admin"`", and the admin half has to be HERE:
+      // the lease does not know who is asking with what authority, which is why `lease(...)`
+      // below passes `admin` into `steal` rather than letting the lease infer it. Without this
+      // line an admin who does not hold the lease would start getting `423` on DELETE the moment
+      // WP-E flips `leaseFactory` to WP-D's enforcing lease — a behaviour change arriving through
+      // a Land-written line, invisible under the default `alwaysGrantedLease`.
+      if (auth.role !== "admin") entry.handle.lease.assertHolder(auth.asClientRef());
       // Idempotent by construction: the second DELETE awaits the FIRST close and returns its
       // body, rather than asking a closed worker to close again (H12).
       return await closeEntry(entry, "client_request");

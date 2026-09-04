@@ -525,6 +525,18 @@ export interface PermissionResponder {
 export interface ClientRef {
   readonly tokenId: TokenId;
   readonly clientId: ClientId | null;
+  /**
+   * The FENCING token this call carried (`Omni-Lease-Epoch`, §16.1 rule L7), and seam 3's other
+   * half (M1-PLAN §1.2): "the factory `registry.ts` passes in, PLUS the epoch on `ClientRef`".
+   *
+   * It rides on the identity rather than on each verb's parameters because every gated verb
+   * already takes a `ClientRef` and none of them takes an epoch — `prompt(content, who)`,
+   * `cancel(who)`, `wake(who, opts)` and `assertHolder(who, opts?)` are frozen exactly as they
+   * are, and only the VALUE gains a slot to travel in. `undefined` is "the client sent no
+   * fence", which L7 defines as no check; a PRESENT and stale epoch is `423` even from the right
+   * client id, which is the difference between a lease and a hint.
+   */
+  readonly epoch?: number;
 }
 
 export interface LeaseOptions {
@@ -661,6 +673,13 @@ export interface AuthContext {
   readonly tokenId: TokenId;
   readonly role: "user" | "admin";
   readonly clientId: ClientId | null;
+  /**
+   * `Omni-Lease-Epoch` as this request sent it (§16.1 rule L7), or null when it sent none.
+   *
+   * It is parsed once, next to the client id, and travels to the lease inside `asClientRef()`.
+   * A non-numeric header is `bad_request` at the boundary rather than a silently ignored fence.
+   */
+  readonly leaseEpoch: number | null;
   readonly agents: readonly string[] | "*";
   readonly cwdRoots: readonly string[];
   readonly maxWorkers: number;

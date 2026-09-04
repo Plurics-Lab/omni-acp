@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { OmniError } from "@omni-acp/protocol";
 import type { EventEnvelope, EventInput, EventLog, Seq, TurnId } from "@omni-acp/protocol";
+import type { tmpPersistence } from "./tmp-persistence.js";
 
 const TURN_A = `t_${"0".repeat(25)}1` as TurnId;
 const TURN_B = `t_${"0".repeat(25)}2` as TurnId;
@@ -204,4 +206,21 @@ export function runEventLogConformance(name: string, make: () => EventLog): void
       log.close();
     });
   });
+}
+
+/**
+ * The DURABLE half of the suite: §14.11's ten items, over a real sqlite file that is closed and
+ * REOPENED (`make().reopen()` — same file, new handle).
+ *
+ * It is a separate function rather than a flag on `runEventLogConformance` because M0's suite
+ * must keep running verbatim and unedited against BOTH drivers — that is what proves the ring
+ * stayed (§14.1, F11) — while these ten items are meaningless for `driver:"memory"`.
+ *
+ * Owned by M1-WP-A.
+ */
+export function runEventLogPersistenceConformance(
+  _name: string,
+  _make: typeof tmpPersistence,
+): void {
+  throw new OmniError("internal", "unimplemented: M1-WP-A");
 }

@@ -21,6 +21,9 @@ describe("M1-WP-B — the full v1->v2 map, the close-out ladder, the turn projec
     "the forced ladder drives rungs 1->5 in order under fakeClock(), with a usage_update mid-rung ordered BEFORE idle (the corpus 06 shape)",
   );
   it.todo(
+    "the ladder runs END-TO-END through a real Worker on a scripted agent: close_stdin observed by the fixture, drained from the process's own stdout EOF, a fatalStderr line promoted to omni.error before idle",
+  );
+  it.todo(
     "ALL M0 turn-lifecycle unit tests pass unmodified — the six M0 arms keep their semantics",
   );
   it.todo(

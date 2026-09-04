@@ -10,6 +10,7 @@ import {
   type ClientRef,
   type CloseResult,
   type DaemonId,
+  type EventEnvelope,
   type EventInput,
   type EventLog,
   type IdGen,
@@ -42,6 +43,7 @@ import {
   type SessionOpenResult,
   type SessionStrategy,
   type WorkerId,
+  type WorkerRow,
   type WorkerSnapshot,
   type WorkerState,
   type WorkerStatePayload,
@@ -83,6 +85,17 @@ export interface CreateWorkerDeps {
      * private field of this class, and this file is frozen after the Land step (review R13).
      */
     maxWakeFailures?: number;
+    /**
+     * BACKSTOP for §13.2's CLOSE_OUT ladder, and nothing more. The reducer owns every rung's
+     * deadline (rung 1's quiet window capped by `hardMs`, rung 3's `drainGraceMs`, rung 4's
+     * `cancelGraceMs`), and this only stops a reducer that never settles from holding
+     * `DELETE /v1/workers/{wid}` open forever. It must therefore be LARGER than the reducer's
+     * own budget: M1-WP-E passes `turn.hardMs + drainGraceMs + cancelGraceMs`.
+     *
+     * Optional for the same reason `wakeTimeoutMs` is: an M0 caller keeps its one budget, and
+     * the M0 slice never enters the ladder at all.
+     */
+    closeOutMs?: number;
   };
   /**
    * Optional, and the ONLY addition to CONTRACTS.md §5.3's `CreateWorkerDeps`.
@@ -135,6 +148,14 @@ type M1State = "starting" | "ready" | "running" | "hibernated" | "closed";
  * config-parse concern and this class must behave the same for a unit test that has no config.
  */
 const DEFAULT_MAX_WAKE_FAILURES = 3;
+
+/**
+ * `limits.closeOutMs`'s fallback: the backstop on §13.2's ladder for a caller that passes no
+ * budget. Deliberately generous — it is not a rung deadline, it is the answer to "the reducer
+ * never said `settled`", and a value below the reducer's own ladder budget would truncate a
+ * ladder that was working.
+ */
+const DEFAULT_CLOSE_OUT_MS = 10_000;
 
 /** Close reasons whose meaning is "the agent process is gone", as opposed to "we asked". */
 const DEATH_REASONS: ReadonlySet<WorkerCloseReason> = new Set<WorkerCloseReason>([
@@ -218,7 +239,54 @@ function stopReasonOf(response: unknown): StopReason {
   return "end_turn" as StopReason;
 }
 
-class Worker implements WorkerHandle {
+/**
+ * A persisted `WorkerSnapshot.state` narrowed to the states this class can occupy.
+ *
+ * `requires_action` is wire-stable and unemitted until M2, so a row carrying it did not come
+ * from this kernel; a state the kernel cannot enter must not be restored as one it can.
+ */
+function restoredState(state: WorkerState): M1State {
+  switch (state) {
+    case "starting":
+    case "ready":
+    case "running":
+    case "hibernated":
+    case "closed":
+      return state;
+    default:
+      throw new OmniError("internal", `cannot restore a worker in state "${state}"`);
+  }
+}
+
+/**
+ * The §15.6 fallback body for a `closed` row whose `closeResult` is missing — a boot that died
+ * mid-close. Deliberately PESSIMISTIC: we never proved the leader exited and never proved the
+ * tree was gone, and a `treeGone: true` we did not observe is the one thing §6.6 forbids.
+ */
+function pessimisticCloseResult(workerId: WorkerId, reason: WorkerCloseReason | null): CloseResult {
+  return {
+    workerId,
+    state: "closed",
+    // `orphaned` is the honest reading when the row carries none: a previous boot owned this
+    // worker and left no record of how it ended.
+    reason: reason ?? "orphaned",
+    leaderExited: false,
+    treeGone: false,
+    sessionClosed: false,
+  };
+}
+
+/**
+ * §14.8's "a rehydrated worker is the SAME `Worker` class, constructed in a non-`starting`
+ * initial state".
+ *
+ * EXPORTED for exactly that reason (review round 1, item 1): `worker/rehydrated.ts` cannot honour
+ * §14.8 by writing a second class — a second `close()` / `wake()` / `snapshot()` is precisely
+ * where the "DELETE after a restart returns a different body" bug lives — and it cannot reach
+ * this one without a name. It is NOT on `@omni-acp/core`'s barrel: `createWorker` and
+ * `createRehydratedWorker` stay the only two ways a consumer gets a `WorkerHandle`.
+ */
+export class Worker implements WorkerHandle {
   readonly #deps: CreateWorkerDeps;
   readonly #logger: Logger;
   readonly #createdAt: string;
@@ -278,6 +346,18 @@ class Worker implements WorkerHandle {
    */
   #replayWindow = 0;
 
+  /**
+   * True only while §13.2's CLOSE_OUT ladder is being driven. It exists because `#closing` gates
+   * tick delivery, and the ladder ADVANCES on ticks: without this flag the reducer would ask for
+   * a rung deadline the Worker has already stopped honouring, and every ladder would hang until
+   * its backstop.
+   */
+  #closeOutActive = false;
+  /** Resolved by `#afterStep` the moment the ladder reports `settled`. */
+  #closeOutWaiter: (() => void) | null = null;
+  /** `StderrTail.onLine`'s unsubscribe for the CURRENT process; null when there is none. */
+  #stderrUnsub: (() => void) | null = null;
+
   #tickTimer: TimerHandle | null = null;
   #cancelTimer: TimerHandle | null = null;
   #exitGraceTimer: TimerHandle | null = null;
@@ -305,14 +385,51 @@ class Worker implements WorkerHandle {
   #resolveClosed!: (r: CloseResult) => void;
   readonly closed: Promise<CloseResult>;
 
-  constructor(deps: CreateWorkerDeps) {
+  /**
+   * `restore` is §14.8's second construction: a handle over a PERSISTED row and its log, with no
+   * process and no `start()`. Absent, this is M0's constructor line for line — which is why no M0
+   * test moves.
+   */
+  constructor(deps: CreateWorkerDeps, restore?: { readonly row: WorkerRow }) {
     this.#deps = deps;
     this.#logger = deps.logger.child({ component: "worker", workerId: deps.workerId });
-    this.#createdAt = deps.clock.iso();
-    this.#updatedAt = this.#createdAt;
+    const row = restore?.row ?? null;
+    // A restored worker keeps the row's timestamps: `createdAt` is when the worker was created,
+    // not when this process happened to read it back.
+    this.#createdAt = row?.snapshot.createdAt ?? deps.clock.iso();
+    this.#updatedAt = row?.snapshot.updatedAt ?? this.#createdAt;
     this.closed = new Promise<CloseResult>((resolve) => {
       this.#resolveClosed = resolve;
     });
+    if (row === null) return;
+
+    const s = row.snapshot;
+    this.#state = restoredState(s.state);
+    // The row's state IS the last state written to the log, so the next transition reports the
+    // right `previous` — a rehydrated worker whose `previous` read null would announce itself as
+    // a brand-new worker in the middle of its own log.
+    this.#emittedState = s.state;
+    this.#sessionId = s.sessionId;
+    this.#capabilities = s.capabilities;
+    this.#currentTurnId = s.currentTurnId;
+    this.#closeReason = s.closeReason;
+    this.#generation = s.generation;
+    this.#crashed = s.crashed;
+    this.#hibernatedAt = s.hibernatedAt;
+    this.#wakeCount = s.wakeCount;
+    this.#wakeFailures = s.wakeFailures;
+    this.#resume = s.resume;
+    this.#orphan = s.orphan;
+
+    if (this.#state !== "closed") return;
+    // §15.6 level 3: `DELETE` after a restart returns the PERSISTED body byte-for-byte. Pre-
+    // resolving `#closePromise` is what makes that automatic — `close()` replays this object
+    // instead of running `#doClose` again and recomputing `treeGone: true` for a tree this
+    // process never proved gone, which is exactly the optimism §6.6 forbids.
+    this.#closing = true;
+    const result = row.closeResult ?? pessimisticCloseResult(deps.workerId, s.closeReason);
+    this.#closePromise = Promise.resolve(result);
+    this.#resolveClosed(result);
   }
 
   // ── identity ───────────────────────────────────────────────────────────────
@@ -509,17 +626,23 @@ class Worker implements WorkerHandle {
     this.#cancelTimer = this.#deps.clock.setTimer(this.#deps.limits.cancelGraceMs, () => {
       this.#cancelTimer = null;
       if (this.#state !== "running" || this.#currentTurnId !== turnId) return;
-      // The agent ignored `session/cancel`. It has had its cooperative chance, so the ladder
-      // starts at the force rung (§6.5) rather than offering another graceful window.
-      void this.#closeWith("cancel_timeout", {
-        force: true,
-        error: new OmniError(
-          "agent_timeout",
-          `the agent did not answer session/cancel within ${String(this.#deps.limits.cancelGraceMs)}ms`,
-        ),
-      }).catch((e: unknown) => {
-        this.#logger.error("cancel escalation failed", { error: String(e) });
-      });
+      // §13.2's fourth trigger. The agent ignored `session/cancel`, so the CLOSE_OUT ladder runs
+      // — the reducer decides which rungs are still worth offering, given that rung 4 has just
+      // been spent — and only then does the force rung run. With M0's slice `#runCloseOut`
+      // returns in the same tick and this is byte-for-byte M0's escalation.
+      void this.#runCloseOut(this.#deps.limits.closeOutMs ?? DEFAULT_CLOSE_OUT_MS)
+        .then(() =>
+          this.#closeWith("cancel_timeout", {
+            force: true,
+            error: new OmniError(
+              "agent_timeout",
+              `the agent did not answer session/cancel within ${String(this.#deps.limits.cancelGraceMs)}ms`,
+            ),
+          }),
+        )
+        .catch((e: unknown) => {
+          this.#logger.error("cancel escalation failed", { error: String(e) });
+        });
     });
   }
 
@@ -593,7 +716,10 @@ class Worker implements WorkerHandle {
     // 1. NO `session/close` — which is why this path does not go through `#doClose`. That call is
     //    the difference between hibernate and close: the pointer is the entire value being
     //    preserved, and `sessionCapabilities.close` on claude-acp is real and destructive.
-    // 2. stdin EOF, then the graceful ladder: the agent gets its normal shutdown.
+    // 2. §13.2's CLOSE_OUT ladder (hibernate is its second trigger), then stdin EOF and the
+    //    graceful ladder: the agent gets its normal shutdown, and the last chunk it was writing
+    //    lands in the log BEFORE the process goes away rather than being cut mid-turn.
+    await this.#runCloseOut(this.#deps.limits.closeOutMs ?? DEFAULT_CLOSE_OUT_MS);
     await this.#reclaimProcess({ force: false });
 
     // 3. The lease is released (DESIGN §3.2: 进程回收、lease 释放、记录保留). A holder cannot
@@ -817,10 +943,7 @@ class Worker implements WorkerHandle {
    * `EventLog.append` and nowhere else — `EventInput` cannot even name the field.
    */
   #step(input: Parameters<Normalizer["step"]>[0]): { input: EventInput; seq: number }[] {
-    const out: TurnOutput = this.#deps.normalizer.step(input);
-    const envelopes = this.#deps.log.appendAll(out.emit);
-    this.#rescheduleTick(out.scheduleTickAt);
-    this.#afterStep(out);
+    const { out, envelopes } = this.#stepOut(input);
     // `appendAll` returns exactly one envelope per input, in order (§8.2), so the pairing is
     // positional and total. The seq is COPIED off the envelope the log just stamped —
     // `EventLog.append` is its sole writer, and `seq-single-writer` wants that copy SPELLED, so
@@ -837,12 +960,91 @@ class Worker implements WorkerHandle {
     });
   }
 
+  /**
+   * `#step`, handing back the reducer's OWN output.
+   *
+   * The close-out ladder needs `action` / `settled` / `scheduleTickAt`, not the seqs, and it must
+   * see them from the very first step — `close_requested` that settles synchronously has to fall
+   * straight through to the kill path rather than wait for a callback that already fired.
+   */
+  #stepOut(input: Parameters<Normalizer["step"]>[0]): {
+    out: TurnOutput;
+    envelopes: readonly EventEnvelope[];
+  } {
+    const out: TurnOutput = this.#deps.normalizer.step(input);
+    const envelopes = this.#deps.log.appendAll(out.emit);
+    this.#rescheduleTick(out.scheduleTickAt);
+    this.#afterStep(out);
+    return { out, envelopes };
+  }
+
   /** `#step` for the paths where a throw must not escape into a timer or the SDK's dispatcher. */
   #feed(input: Parameters<Normalizer["step"]>[0]): void {
     try {
       this.#step(input);
     } catch (e) {
       this.#logger.error("normalizer step threw", { input: input.type, error: String(e) });
+    }
+  }
+
+  /**
+   * `#feed` for SEAM 1's three CLOSE_OUT inputs (`close_requested`, `drained`, `stderr_line`).
+   *
+   * They are fed unconditionally, because the ladder's decisions belong to the reducer and a
+   * Worker that decided when to offer them would be making them here. A reducer that does not
+   * implement them — M0's slice throws `unknown turn input` for all three — is a "no ladder
+   * yet", not an error: it is logged at DEBUG once per call site rather than as the `error`
+   * `#feed` would report, and the caller falls through to M0's path unchanged.
+   */
+  #feedLadder(input: Parameters<Normalizer["step"]>[0]): TurnOutput | null {
+    try {
+      return this.#stepOut(input).out;
+    } catch (e) {
+      this.#logger.debug("normalizer does not implement the close-out ladder", {
+        input: input.type,
+        error: String(e),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * §13.2's CLOSE_OUT ladder, driven to `settled` BEFORE any kill. The four triggers §13.2 names
+   * — `DELETE`, hibernate, daemon shutdown, cancel timeout — all enter through here.
+   *
+   * The Worker supplies the ladder's INPUTS and performs its rungs (`#perform`); every deadline
+   * and every decision is the reducer's. `budgetMs` is a backstop on a reducer that never
+   * settles, never a rung deadline.
+   *
+   * With M0's slice this returns in the same tick, having appended nothing: `close_requested`
+   * throws inside the reducer, `#feedLadder` answers null, and the caller runs M0's path — which
+   * is what keeps this amendment behaviour-neutral until M1-WP-B lands the ladder.
+   */
+  async #runCloseOut(budgetMs: number): Promise<void> {
+    if (this.#closeOutActive) return;
+    // Nothing to drain and nobody to cancel: the ladder's every rung is about a live process.
+    if (this.#proc === null || this.#agentGone) return;
+
+    this.#closeOutActive = true;
+    try {
+      const out = this.#feedLadder({ type: "close_requested", at: this.#deps.clock.now() });
+      if (out === null) return;
+      // Settled synchronously, or the reducer asked for nothing at all: either way there is no
+      // rung to wait for, and waiting would only add latency to a close.
+      if (out.settled !== null || (out.action === null && out.scheduleTickAt === null)) return;
+
+      let timer: TimerHandle | null = null;
+      await new Promise<void>((resolve) => {
+        this.#closeOutWaiter = resolve;
+        timer = this.#deps.clock.setTimer(budgetMs, () => {
+          this.#logger.warn("close-out ladder did not settle within its backstop", { budgetMs });
+          resolve();
+        });
+      });
+      (timer as TimerHandle | null)?.cancel();
+    } finally {
+      this.#closeOutWaiter = null;
+      this.#closeOutActive = false;
     }
   }
 
@@ -884,6 +1086,15 @@ class Worker implements WorkerHandle {
     const settledTurn = this.#currentTurnId;
     if (out.settled === null) return;
 
+    // The ladder reached its last rung: `#runCloseOut` stops waiting and its caller proceeds to
+    // the kill path. Resolved BEFORE the turn bookkeeping below, so a settle that arrives inside
+    // a close cannot be swallowed by the `#closing` guard.
+    const waiter = this.#closeOutWaiter;
+    if (waiter !== null) {
+      this.#closeOutWaiter = null;
+      waiter();
+    }
+
     // The turn is over. `settled` is the Normalizer's word for it, whichever of the quiet
     // window, the hard cap, an agent error or a death produced it.
     this.#cancelTimer?.cancel();
@@ -901,7 +1112,9 @@ class Worker implements WorkerHandle {
     const delay = Math.max(0, at - this.#deps.clock.now());
     this.#tickTimer = this.#deps.clock.setTimer(delay, () => {
       this.#tickTimer = null;
-      if (this.#closing) return;
+      // The CLOSE_OUT ladder advances on ticks, and it runs while `#closing` is already true
+      // (§13.2's triggers are all teardown). Suppressing them here is what would hang it.
+      if (this.#closing && !this.#closeOutActive) return;
       this.#feed({ type: "tick", at: this.#deps.clock.now() });
     });
   }
@@ -1000,6 +1213,11 @@ class Worker implements WorkerHandle {
     void proc.stdoutEnded.then(() => {
       if (this.#proc !== proc) return;
       this.#agentGone = true;
+      // SEAM 1's `drained`: stdout EOF is what rung 3 is waiting for, and §13.2 short-circuits
+      // it to `terminate` because nothing more can arrive. Fed BEFORE M0's exit-grace timer, so
+      // a ladder that is running gets the observation first; the reducer owns whether it means
+      // anything in the state it is actually in.
+      this.#feedLadder({ type: "drained", at: this.#deps.clock.now() });
       this.#onStdoutEnded();
     });
   }
@@ -1138,6 +1356,18 @@ class Worker implements WorkerHandle {
         this.#logger.debug("session/close failed; continuing to the kill", { error: String(e) });
       }
     }
+
+    // §13.2's CLOSE_OUT ladder — `DELETE` and daemon shutdown are its other two triggers — runs
+    // AFTER `session/close` and BEFORE the kill. After, because rung 2 sends stdin EOF and an
+    // agent whose stdin is closed can no longer answer a request; before, because the entire
+    // point of the ladder is that the last output lands while the process is still alive.
+    //
+    // Skipped on a FORCED close: `force` means every cooperative rung has already been offered
+    // (§6.5) — a crash, a failed handshake, a cancel escalation that already walked the ladder.
+    if (extras.force !== true) {
+      await this.#runCloseOut(this.#deps.limits.closeOutMs ?? DEFAULT_CLOSE_OUT_MS);
+    }
+    this.#unsubscribeStderr();
 
     let outcome: KillOutcome | null = null;
     if (this.#proc !== null) {
@@ -1311,8 +1541,27 @@ class Worker implements WorkerHandle {
     this.#link = link;
     this.#linkClosed = false;
     this.#agentGone = false;
+    // SEAM 1's `stderr_line`: §13.4's fourth signal, the descriptor-gated `fatalStderr` match.
+    // COMPLETE lines only (`StderrTail.onLine`), which is why the promotion can key on a pattern
+    // at all. The reducer decides what a line means; this only delivers it.
+    //
+    // One throw is enough to know this reducer has no arm for it (M0's slice), and an agent that
+    // writes to stderr in a loop must not produce one log line per write — so the subscription
+    // is dropped the first time the input is refused.
+    this.#stderrUnsub = proc.stderr.onLine((line) => {
+      if (this.#feedLadder({ type: "stderr_line", line, at: this.#deps.clock.now() }) === null) {
+        this.#unsubscribeStderr();
+      }
+    });
     this.#watchProcess(proc);
     return link;
+  }
+
+  /** Idempotent, and called on every path that gives a process back. */
+  #unsubscribeStderr(): void {
+    const unsub = this.#stderrUnsub;
+    this.#stderrUnsub = null;
+    unsub?.();
   }
 
   /**
@@ -1323,6 +1572,7 @@ class Worker implements WorkerHandle {
   async #reclaimProcess(o: { force: boolean }): Promise<void> {
     const proc = this.#proc;
     const link = this.#link;
+    this.#unsubscribeStderr();
     this.#proc = null;
     this.#link = null;
     this.#linkClosed = false;

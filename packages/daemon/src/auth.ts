@@ -105,11 +105,16 @@ function contains(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function createAuthContext(entry: TokenEntry, clientId: ClientId | null): AuthContext {
+function createAuthContext(
+  entry: TokenEntry,
+  clientId: ClientId | null,
+  leaseEpoch: number | null,
+): AuthContext {
   const context: AuthContext = {
     tokenId: entry.tokenId,
     role: entry.role,
     clientId,
+    leaseEpoch,
     agents: entry.agents,
     cwdRoots: entry.cwdRoots,
     maxWorkers: entry.maxWorkers,
@@ -164,10 +169,37 @@ function createAuthContext(entry: TokenEntry, clientId: ClientId | null): AuthCo
     },
 
     asClientRef(): ClientRef {
-      return { tokenId: entry.tokenId, clientId };
+      // The fence rides on the identity (§16.1 L7): every gated verb already takes a `ClientRef`
+      // and none of them takes an epoch, so this is where `Omni-Lease-Epoch` reaches the lease.
+      // OMITTED rather than null when the client sent none — `epoch?: number` means "no fence",
+      // and a null would have to be special-cased by every `assertHolder`.
+      return {
+        tokenId: entry.tokenId,
+        clientId,
+        ...(leaseEpoch === null ? {} : { epoch: leaseEpoch }),
+      };
     },
   };
   return context;
+}
+
+/**
+ * `Omni-Lease-Epoch`, the optional fencing token of §16.1 rule L7.
+ *
+ * Absent or empty ⇒ null ⇒ no check. Present and unparseable ⇒ `bad_request`: a fence the daemon
+ * silently ignored is worse than no fence at all, because the client believes it is protected.
+ */
+function readLeaseEpoch(headers: Headers): number | null {
+  const raw = headers.get(HEADER.leaseEpoch);
+  if (raw === null) return null;
+  const value = raw.trim();
+  if (value === "") return null;
+  // `Number()` accepts "0x10", " 1e3" and "Infinity"; an epoch is a non-negative integer counter
+  // and nothing else, so the shape is asserted before the value is.
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new OmniError("bad_request", "Omni-Lease-Epoch must be a non-negative integer");
+  }
+  return Number(value);
 }
 
 function readClientId(headers: Headers): ClientId | null {
@@ -217,13 +249,15 @@ export function createTokenStore(config: ResolvedDaemonConfig): TokenStore {
       // but the ordering is the contract's, and the 400 is now only reachable by a caller who
       // already holds a valid secret.
       const clientId = readClientId(headers);
-      return createAuthContext(matched, clientId);
+      return createAuthContext(matched, clientId, readLeaseEpoch(headers));
     },
 
     contextFor(tokenId: TokenId, clientId?: string | null): AuthContext {
       const entry = tableOf(config).get(tokenId);
       if (entry === undefined) throw unauthorized(`unknown token id "${tokenId}"`);
-      return createAuthContext(entry, clientId ?? null);
+      // The in-process half has no headers, so it carries no fence: `createDaemon({listen:null})`
+      // callers are not racing a stolen lease with a cached epoch.
+      return createAuthContext(entry, clientId ?? null, null);
     },
 
     has(tokenId: TokenId): boolean {

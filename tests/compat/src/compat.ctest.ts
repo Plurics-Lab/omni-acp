@@ -11,7 +11,7 @@ import { describe, it } from "vitest";
  */
 describe("compat suite", () => {
   it.todo(
-    "runCompatSuite is green over agents.ci.yaml (SDK example agent + ten fixtures) on three OSes",
+    "runCompatSuite is green over agents.ci.yaml (SDK example agent + the eight turn-completing fixtures; crash and orphan excluded) on three OSes",
   );
   it.todo("OMNI_COMPAT_REQUIRE=1 FAILS an empty selection — never green because it ran nothing");
   it.todo(

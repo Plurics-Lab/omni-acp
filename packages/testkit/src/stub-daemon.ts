@@ -28,6 +28,8 @@ function stubAuthContext(tokenId: string, clientId: string | null): AuthContext 
     tokenId,
     role: "admin",
     clientId,
+    // No headers here, so no fence (§16.1 L7). A test that wants one builds its own `ClientRef`.
+    leaseEpoch: null,
     agents: "*",
     cwdRoots: [],
     maxWorkers: 16,

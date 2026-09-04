@@ -236,7 +236,9 @@ omni-acp/
 └── tests/integration/  @omni-acp/integration-tests   PRIVATE
     │   └── src/*.itest.ts
 └── tests/compat/        @omni-acp/compat-tests        PRIVATE, M1
-    ├── agents.ci.yaml         hermetic: the SDK example agent + the ten testkit fixtures
+    ├── agents.ci.yaml         hermetic: the SDK example agent + the EIGHT turn-completing
+    │                          testkit fixtures (crash and orphan are excluded — neither
+    │                          completes a turn, which every case here asserts)
     ├── agents.local.yaml      real agents; ONE entry today (claude-acp); OMNI_COMPAT_REAL=1
     └── src/{config,runner,cases}.ts
 ```
@@ -2445,6 +2447,9 @@ export interface AuthContext {
   readonly tokenId: TokenId;
   readonly role: "user" | "admin";
   readonly clientId: ClientId | null;
+  /** M1: `Omni-Lease-Epoch` as sent, or null. Travels to the lease inside `asClientRef()`
+   *  (§16.1 L7). A non-numeric header is `bad_request`, never a silently ignored fence. */
+  readonly leaseEpoch: number | null;
   readonly agents: readonly string[] | "*";
   readonly cwdRoots: readonly string[];
   readonly maxWorkers: number;
@@ -2772,6 +2777,12 @@ export function createNormalizer(o: {
 }): Normalizer;
 
 // worker/      — WP-C
+/** SEAM 2's third verb (M1-PLAN §1.2), Land-written and frozen. `worker.ts` EXPORTS its `Worker`
+ *  class and its constructor takes `restore?: { row: WorkerRow }`, so §14.8's "the same `Worker`
+ *  class constructed in a non-`starting` initial state" is constructible from another file. For a
+ *  `closed` row it pre-resolves the close with `row.closeResult`, which is what makes §15.6's
+ *  byte-for-byte `DELETE` replay automatic rather than a second implementation. NOT on the barrel. */
+export class Worker implements WorkerHandle { constructor(deps: CreateWorkerDeps, restore?: { row: WorkerRow }); }
 export function createSessionStrategy(o: { descriptor: RuntimeDescriptor; clock: Clock; logger: Logger }): SessionStrategy;
 /** PURE, rule-numbered, no I/O. The table test in §15.4 is written against exactly this. */
 export function classifyResume(a: ResumeAttempt): ResumeReport;
@@ -2821,6 +2832,9 @@ export interface CreateWorkerDeps {
     wakeTimeoutMs?: number;
     /** §15.5's cap on consecutive TRANSIENT wake failures; absent ⇒ 3, the config default. */
     maxWakeFailures?: number;
+    /** SEAM 1's backstop on §13.2's ladder — the answer to "the reducer never said `settled`",
+     *  never a rung deadline, so it must EXCEED `hardMs + drainGraceMs + cancelGraceMs`. */
+    closeOutMs?: number;
   };
 }
 
@@ -2832,9 +2846,15 @@ export interface WorkerRegistryOptions {
 }
 ```
 
+`Worker` also owns SEAM 1's **input** side, Land-written: `close_requested` from `#doClose` (after
+`session/close`, before the kill, skipped on a forced close), from `#doHibernate` and from `cancel()`'s
+escalation timer; `drained` from the process's own `stdoutEnded`; `stderr_line` from `StderrTail.onLine`.
+Without producers §13.2's ladder is a reducer arm that unit-tests and never runs.
+
 `Worker.hibernate()` / `Worker.wake()` are Land-written **state transitions** that delegate every
 session decision to `SessionStrategy` (§15.2, §15.3); `registry.delete()` and the `lease()` façade
-row are Land-written **enforcement points** that call the injected lease. What each work package
+row are Land-written **enforcement points** that call the injected lease — `delete()` under an
+`auth.role !== "admin"` guard, which is §16.1 rule L3's "the lease **or** admin" half. What each work package
 then implements is its own file: WP‑C the strategy, the timer and `classifyResume`; WP‑D
 `createLease`; WP‑E the store, the rehydration and the daemon wiring.
 
@@ -4484,7 +4504,7 @@ reason + source) is written unconditionally, uploaded as a CI artifact, and rend
 | `cancel-late-update` | cancel | corpus 14: an update arriving **after** `session/cancel` is ordered **before** `idle` |
 | `tool-merge` | tools | a sparse `tool_call_update` never clears `kind` / `locations` / `title` (corpus finding 3) |
 | `permission-deny` | permission | only an **offered** `optionId` is ever sent; `deniedToolCalls` non-empty while `stopReason === "end_turn"` (corpus findings 6, 7) |
-| `hibernate-wake` | resume | a small `idleTimeoutMs` forces `hibernated`; `supervisor.live.size` drops; the next prompt wakes with `resume.outcome === "landed"`; `seq` continues |
+| `hibernate-wake` | resume | a small `idleTimeoutMs` forces `hibernated`; the snapshot's `process` goes `null` **and the recorded pid answers `waitGone`** — the compat suite cannot reach `supervisor.live.size` (`createSupervisor` is in `@omni-acp/core`, which `tests/compat` does not depend on, and `createDaemon` never exposes its supervisor), and a dead pid is the stronger claim anyway (review round 1, item 5); the next prompt wakes with `resume.outcome === "landed"`; `seq` continues |
 | `resume-cwd-mismatch` | resume | resume with a foreign cwd ⇒ **`unknown`, never `rejected_permanent`**; the pointer survives. **This case is what turns F15's unrecorded README claim into reproducible evidence** |
 | `lease` | — | a second client's `prompt` is `423` with `body.lease.holder`; the observer keeps streaming; `steal` bumps the epoch; a stale epoch is `423` |
 | `unknown-method` | — | an invented method returns the descriptor's `unknownMethodErrorCode` with `data.method` |

@@ -31,7 +31,7 @@ packages/*/package.json   packages/*/tsconfig.json   packages/*/vitest.config.ts
 packages/*/src/index.ts                          ← re-export barrels, re-export-only
 packages/protocol/src/{contracts,acp,ids,errors,events,worker,control-plane,config}.ts
 packages/protocol/src/{lease,resume,runtime}.ts  ← NEW, types only
-packages/core/src/worker/worker.ts               ← ONE edit, then frozen (§1.2 seam 1 + 2)
+packages/core/src/worker/worker.ts               ← Land-edited (§1.2 seams 1 + 2), then frozen
 packages/daemon/src/http/routes/{index,workers}.ts   ← the split of routes.ts; per-feature route
                                                         modules are owned by their work package
 packages/daemon/src/types.ts                     ← re-export-only, like the barrels above
@@ -77,6 +77,26 @@ of `close_stdin` / `drain` / `cancel` / `terminate`, which the Land step writes.
 interface is needed** — putting the ladder in the reducer keeps it unit-testable with `fakeClock()` and no
 process, which is the whole point.
 
+**Seam 1 has an INPUT side too, and it is Land-written** (review round 1, item 2). A ladder with no
+producers is a reducer arm that can be unit-tested and can never run: `TurnInput`'s `close_requested`,
+`drained` and `stderr_line` had **zero** callers, and all four of §13.2's triggers live in the frozen
+file. So the Land step also wrote, in `worker.ts`:
+
+- `#runCloseOut(budgetMs)` — feeds `close_requested` and waits for the reducer to report `settled`,
+  bounded by the new optional `limits.closeOutMs` (a backstop on a reducer that never settles, never a
+  rung deadline). It is called by `#doClose` (after `session/close`, before the kill, and **skipped on a
+  forced close** — `force` means every cooperative rung was already offered), by `#doHibernate` (before
+  the process is reclaimed) and by `cancel()`'s escalation timer (which previously jumped to rung 5 with
+  rungs 1‑4 skipped);
+- `drained`, fed from `#watchProcess`'s `stdoutEnded` — §13.2's "stdout EOF during rung 3";
+- `stderr_line`, fed from `StderrTail.onLine` in `#openProcess` (complete lines only, unsubscribed in
+  `#reclaimProcess` / `#doClose`) — §13.4's fourth signal;
+- tick delivery is no longer suppressed while `#closing` if the ladder is the thing running, because the
+  ladder ADVANCES on ticks.
+
+With M0's reducer all three inputs throw `unknown turn input`; `#feedLadder` answers `null`, logs once at
+debug, and every caller falls through to M0's path — which is why no M0 test moves.
+
 **Seam 2 — `SessionStrategy` is injected.** After M1, `worker.ts` never names `initialize`, `session/new`,
 `session/load` or `session/resume` again: it holds a `SessionStrategy` and calls `open()` on create and
 `reopen()` on wake, and its `hibernate()`/`wake()` are ~60 lines of state transition that delegate. WP‑C
@@ -97,9 +117,28 @@ owns the strategy (`worker/{session-open,wake,resume-classify,hibernate,rehydrat
 - the state widening (`M1State`, `#generation`, `#crashed`, `#hibernatedAt`, `#wakeFailures`,
   `#replayWindow` as a refcount) and the `AcpLinkLike` adapter a strategy is handed.
 
+**Seam 2 is "open + reopen + RESTORE"** (review round 1, item 1). The third verb was missing: §14.8 requires
+a rehydrated worker to be "the same `Worker` class constructed in a non-`starting` initial state", and the
+class was neither exported nor constructible in any state but `starting`. So `worker.ts` took **one further
+Land edit**:
+
+- `class Worker` is **exported** (it is not on `@omni-acp/core`'s barrel — `createWorker` and
+  `createRehydratedWorker` stay the only two ways a consumer gets a handle);
+- its constructor takes an optional second argument `restore?: { row: WorkerRow }` which seeds `#state`,
+  `#emittedState`, `#sessionId`, `#capabilities`, `#currentTurnId`, `#closeReason`, `#generation`,
+  `#crashed`, `#hibernatedAt`, `#wakeCount`, `#wakeFailures`, `#resume`, `#orphan` and the row's
+  timestamps — and, for an already-`closed` row, **pre-resolves `#closePromise` with the persisted
+  `CloseResult`**, so `DELETE` after a restart replays that body byte-for-byte (§15.6 level 3) instead of
+  recomputing an optimistic `treeGone`. A `closed` row with no `closeResult` (a boot that died mid-close)
+  gets the deliberately pessimistic fallback §15.6 names.
+
+Absent the argument the constructor is M0's line for line, so no M0 test moves.
+
 WP‑C therefore writes `SessionStrategy`, `createHibernateTimer`, `attemptResume`, `classifyResume`,
-`createRehydratedWorker` and every test — and edits **no** frozen file. `performWake`'s first parameter is
-the `AcpLinkLike`, so its signature can reach `SessionStrategy.reopen`.
+`createRehydratedWorker` (which now has a class to construct, and grows `RehydrateDeps` — its own file —
+into whatever `CreateWorkerDeps` a row plus the daemon's catalog cannot supply) and every test — and edits
+**no** frozen file. `performWake`'s first parameter is the `AcpLinkLike`, so its signature can reach
+`SessionStrategy.reopen`.
 
 **Seam 3 — the lease needs no interface, but it does need an injection point.** `Worker.prompt()` and
 `Worker.cancel()` **already** call `lease.assertHolder(who)` as their first statement (CONTRACTS F22), and
@@ -109,11 +148,27 @@ the Land step added the same first line to `Worker.wake()`. D5 enforcement is th
 **Landed** (review R14): `WorkerRegistryOptions.leaseFactory` and `DaemonDeps.leaseFactory`, with
 `registry.ts` calling `o.leaseFactory?.(owner, workerId) ?? alwaysGrantedLease(owner, workerId)` at the one
 construction site; `registry.delete()` calling `assertHolder` (the `423` on `DELETE` has no other home,
-because `WorkerHandle.close()` takes no `ClientRef`); and the registry's `lease()` façade row written and
+because `WorkerHandle.close()` takes no `ClientRef`, and **guarded by `auth.role !== "admin"`**, which is
+§16.1 rule L3's other half — review round 1, item 4); and the registry's `lease()` façade row written and
 dispatching acquire / release / steal onto that lease. Under the default `alwaysGrantedLease` every one of
 those is M0's behaviour unchanged. WP‑D implements `createLease` in its own files; WP‑E flips the default
 in `create-daemon.ts`. Neither edits the other's hunk, and WP‑D still touches **zero** core worker files —
 so nobody should "helpfully" add an interface.
+
+**And the epoch, which completes seam 3** (review round 1, item 3). The sentence above says "plus the epoch
+on `ClientRef`", and that half had not landed: every link in the chain — `ClientRef`, `AuthContext`,
+`auth.verify()`, `HEADER.leaseEpoch` — is frozen, so §16.1 rule L7 ("present and stale ⇒ `423`, **even from
+the right client id**") was unreachable for every gated verb. Landed now:
+
+- `ClientRef.epoch?: number` and `AuthContext.leaseEpoch: number | null`
+  (`packages/protocol/src/contracts.ts`);
+- `auth.verify()` parses `HEADER.leaseEpoch` — a non-numeric value is `bad_request`, because a fence the
+  daemon silently ignored is worse than no fence — and `asClientRef()` spreads it in.
+
+Every frozen signature is untouched: `prompt(content, who)`, `cancel(who)`, `wake(who, opts)` and
+`assertHolder(who, opts?)` are exactly as they were, and only the VALUE gained a slot to travel in. WP‑D's
+`createLease` reads `who.epoch ?? opts?.epoch` inside `assertHolder`; `alwaysGrantedLease` ignores it, so
+the default is M0's behaviour unchanged.
 
 ### 1.3 Land step exit criteria
 
@@ -191,6 +246,18 @@ reads one story rather than two.
     feature; `http-has-no-logic` now scans `src/http/**` RECURSIVELY (a non-recursive scan would have gone
     silently vacuous after the routes split); and the new `sse-is-unchanged` pins `sse.ts`'s sha256.
 11. **The lockfile** (S1): see §1.3 criterion 6 — one importer row, no new external package.
+12. **Round 1 of the contract review took one further Land pass**
+    (`docs/review/2026-09-04-m1-contract-review.md`, items 1‑8), and it is what finished the three seams
+    rather than adding behaviour. In `worker.ts`: the exported `Worker` class plus the constructor's
+    `restore?: { row }` argument (seam 2's third verb, §1.2), and seam 1's three producers with
+    `#runCloseOut` / `#feedLadder` and the new optional `limits.closeOutMs`. In
+    `packages/protocol/src/contracts.ts`: `ClientRef.epoch?` and `AuthContext.leaseEpoch`, with
+    `daemon/src/auth.ts` parsing `Omni-Lease-Epoch` (seam 3's other half). In `daemon/src/registry.ts`:
+    `delete()`'s admin bypass (§16.1 L3). And one **stub that §5.7 declared and the Land step missed** —
+    `runEventLogPersistenceConformance` in `packages/testkit/src/event-log-conformance.ts`, now landed
+    throwing `unimplemented: M1-WP-A` and added to `exports-are-stable.itest.ts`'s frozen testkit list, so
+    WP‑A acceptance 2 and §14.11 have a symbol to fill. Every one of these is behaviour-neutral under the
+    M0 slice, and the suite is still **980 passed / 2 skipped**.
 
 ---
 
@@ -265,7 +332,8 @@ the data-dir lock.
 **Owns exclusively**
 
 ```
-packages/core/src/normalizer/**           normalizer.ts turn-lifecycle.ts map/** vendor/**
+packages/core/src/normalizer/**           normalizer.ts turn-lifecycle.ts map/** vendor/dialects.ts
+  MINUS vendor/registry.ts                ← WP-E's (it is the DESCRIPTOR's registry; see WP-E)
 packages/core/test/normalizer/**          incl. golden/
 packages/protocol/src/turn.ts             ← Land-written, transferred here; the ONLY protocol/src file
                                             any work package owns
@@ -280,8 +348,9 @@ packages/testkit/test/fixture-agents.test.ts
 **dependsOn**: none (Land only).
 
 **Description.** CONTRACTS §12 and §13: the three-layer split, all 29 map rows, `messageId` pass-through
-with marked synthesis, the diff rewrite, the v2 permission mapping, the vendor registry's dialects, the two
-close-out ladders, and `reduceTurn`'s `verdict` / `warnings` / `deniedToolCalls` / `vendorPatch` /
+with marked synthesis, the diff rewrite, the v2 permission mapping, the two vendor **dialects**
+(`vendor/dialects.ts` — the `_meta` readers; the vendor REGISTRY next to it is WP-E's, review round 1
+item 6), the two close-out ladders, and `reduceTurn`'s `verdict` / `warnings` / `deniedToolCalls` / `vendorPatch` /
 `tokens`. Plus the corpus loader, the four gap-filling fixture agents, and the wire-replay agent.
 
 **Acceptance**
@@ -300,12 +369,19 @@ close-out ladders, and `reduceTurn`'s `verdict` / `warnings` / `deniedToolCalls`
    responder **refuses** to answer with an `optionId` the agent did not offer (corpus `09`).
 6. The forced ladder drives rungs 1→5 in order under `fakeClock()`, with a `usage_update` arriving mid-rung
    ordered **before** `idle` (the corpus `06` shape).
-7. **All M0 `turn-lifecycle` unit tests pass unmodified.** The six M0 arms keep their semantics exactly.
-8. `verdict` never depends on agent prose; the `no-agent-prose` and `descriptor-is-the-only-branch` guards
+7. **The ladder runs end-to-end through a REAL `Worker`**, not only through the reducer: on a scripted
+   agent, a `DELETE` (and a hibernate) walks rungs 1→5 in the log, `close_stdin` is observed by the
+   fixture, `drained` arrives from the process's own stdout EOF, and a `fatalStderr` line promotes to
+   `omni.error` before `idle`. Seam 1's INPUT side is Land-written (`close_requested` from `#doClose` /
+   `#doHibernate` / the cancel escalation, `drained` from `#watchProcess`, `stderr_line` from
+   `StderrTail.onLine`), so a ladder that passes the reducer's unit tests and cannot run in a Worker is a
+   failure of this bullet, not of the Land step (review round 1, item 2).
+8. **All M0 `turn-lifecycle` unit tests pass unmodified.** The six M0 arms keep their semantics exactly.
+9. `verdict` never depends on agent prose; the `no-agent-prose` and `descriptor-is-the-only-branch` guards
    pass and are each demonstrated failing on a planted violation.
-9. The eight named golden cases of §12.8 are green; the six generated envelope goldens pass
-   `corpus:emit --check` in CI; the `.expected.json` files are hand-written.
-10. `reduceTurn` is still pure, still deterministic, still de-duplicates by `(workerId, seq)`, and now
+10. The eight named golden cases of §12.8 are green; the six generated envelope goldens pass
+    `corpus:emit --check` in CI; the `.expected.json` files are hand-written.
+11. `reduceTurn` is still pure, still deterministic, still de-duplicates by `(workerId, seq)`, and now
     **skips `replay: true` envelopes**.
 
 ---
@@ -388,7 +464,9 @@ carrying the holder, and the three-route module.
 1. `runLeaseConformance` is green against the `Lease` object **and** against the HTTP surface, so the two
    cannot drift.
 2. A non-holder's `prompt` / `cancel` / `hibernate` / `wake` / `DELETE` is `423` with `body.lease.holder`
-   and `body.lease.epoch`.
+   and `body.lease.epoch` — **and an admin who does not hold the lease still SUCCEEDS on `DELETE`**
+   (§16.1 rule L3 is "the lease **or** `role:"admin"`", and `registry.delete()` carries the admin half
+   because the lease cannot know who is asking with what authority; review round 1, item 4).
 3. An observer's SSE stream receives **every** envelope of the holder's turn, including `omni.lease`.
    `attach` and `GET` are never `423`.
 4. `steal` transfers, bumps the epoch, appends an audited envelope carrying `reason`, and the previous
@@ -411,6 +489,10 @@ carrying the holder, and the three-route module.
 ```
 packages/core/src/runtime/**              descriptor.ts known.ts merge.ts probe.ts
                                           classify.ts extensions.ts
+packages/core/src/normalizer/vendor/registry.ts   ← the ONE normalizer file WP-E owns: it is
+                                          keyed by descriptor and learns `-32601` per process
+                                          (§17.3), and it stays under `normalizer/**` so the
+                                          `descriptor-is-the-only-branch` guard keeps scanning it
 packages/core/test/runtime/**
 packages/daemon/src/**   MINUS index.ts, types.ts and http/routes/{index,workers,lease}.ts
                          create-daemon.ts registry.ts catalog.ts boot-recovery.ts
@@ -524,10 +606,10 @@ files.
 | ---- | ----- |
 | root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `tests/compat/{package.json,tsconfig.json,vitest.config.ts}` | **Land (frozen)** |
 | `packages/core/src/{event-log,persist}/**`, `packages/core/test/{event-log,persist}/**`, `packages/testkit/src/{event-log-conformance,tmp-persistence}.ts`, `packages/testkit/test/event-log-conformance.test.ts` | **WP‑A** |
-| `packages/core/src/normalizer/**`, `packages/core/test/normalizer/**`, `packages/protocol/src/turn.ts`, `packages/protocol/test/{turn,turn-golden}.test.ts`, `packages/protocol/test/{transcripts,types}/**`, `packages/testkit/src/{corpus,wire-agent}.ts`, `packages/testkit/fixtures/agents/**`, `packages/testkit/test/fixture-agents.test.ts` | **WP‑B** |
+| `packages/core/src/normalizer/**` (minus `vendor/registry.ts`), `packages/core/test/normalizer/**`, `packages/protocol/src/turn.ts`, `packages/protocol/test/{turn,turn-golden}.test.ts`, `packages/protocol/test/{transcripts,types}/**`, `packages/testkit/src/{corpus,wire-agent}.ts`, `packages/testkit/fixtures/agents/**`, `packages/testkit/test/fixture-agents.test.ts` | **WP‑B** |
 | `packages/core/src/worker/**` (minus `worker.ts`), `packages/core/src/process/**`, `packages/core/test/{worker,process}/**` | **WP‑C** |
 | `packages/core/src/lease/**`, `packages/core/test/lease/**`, `packages/daemon/src/http/routes/lease.ts`, `packages/daemon/test/http/lease.test.ts`, `packages/testkit/src/lease-conformance.ts`, `packages/client/src/lease.ts`, `packages/client/test/lease.test.ts` | **WP‑D** |
-| `packages/core/src/runtime/**`, `packages/core/test/runtime/**`, `packages/daemon/src/**` (minus `index.ts`, `types.ts` and `http/routes/{index,workers,lease}.ts`), `packages/daemon/test/**` (minus `http/lease.test.ts`), `packages/testkit/src/fake-runtime.ts` | **WP‑E** |
+| `packages/core/src/runtime/**`, `packages/core/src/normalizer/vendor/registry.ts`, `packages/core/test/runtime/**`, `packages/daemon/src/**` (minus `index.ts`, `types.ts` and `http/routes/{index,workers,lease}.ts`), `packages/daemon/test/**` (minus `http/lease.test.ts`), `packages/testkit/src/fake-runtime.ts` | **WP‑E** |
 | `packages/client/src/**` (minus `index.ts`, `lease.ts`), `packages/client/test/**` (minus `lease.test.ts`), `packages/cli/{src,test}/**`, `tests/compat/src/**`, `tests/compat/agents.{ci,local}.yaml`, `tests/integration/src/**`, `packages/testkit/test/arch/**` | **WP‑F** |
 
 Every path not listed keeps its M0 owner and its M0 content; an M1 work package that needs one edited files
@@ -610,9 +692,14 @@ Assert `state === "ready"`, `capabilities.raw` non-empty, `runtimeId` stable acr
   and only then waits for `state === "hibernated"` (budget 5 s). The prompt is not decoration: a worker
   whose session was opened by `session/new` and never prompted has **nothing to recall**, and corpus `07`
   confirms replay carries only conversational content (review R16).
-- **Assert the hibernation.** `process === null`, `sessionId !== null`, `hibernatedAt !== null`,
-  `supervisor.live.size` dropped by one, `lease.holder === null` (hibernate releases), and exactly one
-  `omni.worker_state{state:"hibernated", reason:"hibernate"}` in the log.
+- **Assert the hibernation.** Read the worker's `process.pid` from its snapshot BEFORE the wait, then:
+  `process === null`, `sessionId !== null`, `hibernatedAt !== null`, `await waitGone(pid)` — the process
+  really went away, not merely the daemon's reference to it — `lease.holder === null` (hibernate
+  releases), and exactly one `omni.worker_state{state:"hibernated", reason:"hibernate"}` in the log.
+  Not `supervisor.live.size`: `createSupervisor` lives in `@omni-acp/core`, which `tests/compat` does not
+  depend on, and `createDaemon` builds its supervisor internally and never exposes it — so that assertion
+  was unreachable from this suite (review round 1, item 5). `waitGone` / `isAlive` are testkit exports the
+  suite already has, and a dead pid is strictly stronger evidence than a shrunken map.
 - `A.prompt("What token did I ask you to remember?")` — this must **auto-wake**.
 - **Assert the resume outcome.** The envelope sequence is `wake` → `resumed`, the `resumed` envelope carries
   `resume.outcome === "landed"` with a `rule` and a `durationMs`, `generation === 2`, `seq` **continues**
@@ -647,8 +734,10 @@ worker is adopted with `generation` preserved; a `DELETE` of the already-closed 
 **persisted** `CloseResult` byte-for-byte.
 
 **Step 6 — teardown.** Every worker closed; on POSIX `treeGone === true`, on Windows `treeGone === false`
-with `leaderExited === true` and the **reported** value asserted against `waitGone(pid)`;
-`supervisor.live.size === 0`; no temp dir and no orphan process left on any OS.
+with `leaderExited === true` and the **reported** value asserted against `waitGone(pid)`; every worker's
+final snapshot has `process === null` and every pid the script recorded answers `waitGone`, which is the
+observable form of "no process is left" (`supervisor.live.size` is not reachable from `tests/compat` —
+review round 1, item 5); no temp dir and no orphan process left on any OS.
 
 **Companion integration files** (M0's set, plus M1's):
 

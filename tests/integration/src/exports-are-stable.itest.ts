@@ -469,6 +469,7 @@ const EXPECTED: Record<string, readonly string[]> = {
     "nullLogger",
     "parseSse",
     "runEventLogConformance",
+    "runEventLogPersistenceConformance",
     "runLeaseConformance",
     "scriptedAgent",
     "sdkExampleAgentPath",
