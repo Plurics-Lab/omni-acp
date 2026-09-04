@@ -123,6 +123,18 @@ export interface TurnStatus {
 // `TurnResult.usage` is the `usage_update` shape `{used, size, cost?}`; taking the former would
 // be a type pun that happens to compile).
 
+/**
+ * The three `_meta` keys the Normalizer stamps and this fold reads back (§12.5, §13.2, §13.4).
+ *
+ * They are the ONLY channel between a descriptor-driven layer and this one. `reduceTurn` is pure
+ * over envelopes and holds no descriptor, so it cannot know that a rate limit lives at one
+ * vendor `_meta` pointer and a patch at another — and it must not: the moment it did, "the
+ * descriptor is the only branch" (§17.1) would stop being true of the projection.
+ */
+const V1_DIFF_META = "omni/v1Diff";
+const VENDOR_PATCH_META = "omni/vendorPatch";
+const WARNINGS_META = "omni/warnings";
+
 /** Only reachable when `reduceTurn` is asked about a turn no envelope mentions. */
 const UNKNOWN_WORKER_ID = "w_unknown" as WorkerId;
 
@@ -174,6 +186,17 @@ interface Fold {
   usage: { used: number; size: number; cost?: { amount: number; currency: string } } | null;
   interactions: InteractionRecord[];
   error: OmniErrorBody | null;
+  /** M1 (§13.4). The v2 `Usage` block off `state_update{idle}.usage` — a DIFFERENT shape from
+   *  `usage`, which stays sourced from the last `usage_update` (F4, F21). */
+  tokens: TurnResult["tokens"] | null;
+  /** M1 (§12.5). Reconstructed by the Normalizer from a descriptor-registered vendor extension
+   *  and carried on `state_update{idle}._meta`, because this fold holds no descriptor. */
+  vendorPatch: TurnResult["vendorPatch"];
+  /** M1 (§13.4). The advisories the Normalizer stamped on `idle`, before this fold adds its own. */
+  streamWarnings: TurnWarning[];
+  /** Tool calls THIS daemon denied, from our OWN `omni.policy_decision` — never from prose. */
+  denied: string[];
+  deniedTitles: Map<string, string>;
 }
 
 function record(v: unknown): Record<string, unknown> | null {
@@ -190,6 +213,66 @@ function errorBody(b: OmniErrorBody): OmniErrorBody {
   return b.acp === undefined
     ? { code: b.code, message: b.message }
     : { code: b.code, message: b.message, acp: b.acp };
+}
+
+/** `state_update{idle}.usage` — the v2 `Usage` block, and only when it really is one (F21). */
+function readTokens(raw: unknown): TurnResult["tokens"] | null {
+  const u = record(raw);
+  if (u === null) return null;
+  const total = u["totalTokens"];
+  const input = u["inputTokens"];
+  const output = u["outputTokens"];
+  if (typeof total !== "number" || typeof input !== "number" || typeof output !== "number") {
+    return null;
+  }
+  const read = u["cachedReadTokens"];
+  const write = u["cachedWriteTokens"];
+  return {
+    totalTokens: total,
+    inputTokens: input,
+    outputTokens: output,
+    ...(typeof read === "number" ? { cachedReadTokens: read } : {}),
+    ...(typeof write === "number" ? { cachedWriteTokens: write } : {}),
+  };
+}
+
+function readVendorPatch(raw: unknown): TurnResult["vendorPatch"] {
+  const p = record(raw);
+  if (p === null) return null;
+  const text = str(p["text"]);
+  const source = str(p["source"]);
+  if (text === null || source === null || p["format"] !== "git_patch") return null;
+  return { format: "git_patch", text, source };
+}
+
+const WARNING_SOURCES: ReadonlySet<string> = new Set([
+  "usage_meta",
+  "stderr",
+  "policy",
+  "tool_status",
+]);
+
+function readWarnings(raw: unknown): TurnWarning[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((item) => {
+    const w = record(item);
+    if (w === null) return [];
+    const code = str(w["code"]);
+    const message = str(w["message"]);
+    const source = str(w["source"]);
+    if (code === null || message === null || source === null || !WARNING_SOURCES.has(source)) {
+      return [];
+    }
+    const detail = record(w["detail"]);
+    return [
+      {
+        code,
+        message,
+        source: source as TurnWarning["source"],
+        ...(detail === null ? {} : { detail }),
+      },
+    ];
+  });
 }
 
 function upsertToolCall(f: Fold, payload: Record<string, unknown>): void {
@@ -254,6 +337,15 @@ function applySessionUpdate(f: Fold, seq: Seq, payload: Record<string, unknown>)
         f.terminal = "idle";
         f.endSeq = seq;
         f.stopReason = str(payload["stopReason"]);
+        // §13.2's SETTLE, M1's two additions. Both are DAEMON-authored: `idle` is synthesized by
+        // the Normalizer, which is the only layer that holds a descriptor, so this fold can read
+        // a vendor extension's result without knowing any vendor's `_meta` spelling (§13.4).
+        f.tokens = readTokens(payload["usage"]) ?? f.tokens;
+        const meta = record(payload["_meta"]);
+        if (meta !== null) {
+          f.vendorPatch = readVendorPatch(meta[VENDOR_PATCH_META]) ?? f.vendorPatch;
+          f.streamWarnings.push(...readWarnings(meta[WARNINGS_META]));
+        }
       }
       return;
     }
@@ -310,6 +402,11 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
     usage: null,
     interactions: [],
     error: null,
+    tokens: null,
+    vendorPatch: null,
+    streamWarnings: [],
+    denied: [],
+    deniedTitles: new Map(),
   };
 
   // Identity first, then order.
@@ -327,6 +424,12 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
   const seen = new Set<string>();
   const unique: EventEnvelope[] = [];
   for (const e of envelopes) {
+    // M1, ruling M1-R5: a REPLAYED envelope is history the agent re-emitted while resuming a
+    // session, not something that happened in this turn. It is stored and streamed (marked), so
+    // every consumer can see it — but folding it would concatenate a previous conversation into
+    // `text` and count its tool calls as this turn's. F16 confirms the window is exactly
+    // request-to-response, so the mark is reliable; the SDK filters on the same field.
+    if (e.replay === true) continue;
     const identity = `${e.workerId}\u0000${e.seq}`;
     if (seen.has(identity)) continue;
     seen.add(identity);
@@ -366,7 +469,7 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
       case "acp.session_update":
         applySessionUpdate(f, e.seq, e.payload as unknown as Record<string, unknown>);
         break;
-      case "omni.policy_decision":
+      case "omni.policy_decision": {
         // ONE envelope kind carries the whole record: `title` rides on the policy decision
         // (review R9) and `at` is the envelope's `ts`.
         f.interactions.push({
@@ -377,7 +480,24 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
           rule: e.payload.rule,
           at: e.ts,
         });
+        // §13.4's FIRST signal, and the one we trust totally: we are the party that denied. The
+        // join is by `toolCallId`, which the mapper lifted off the request — never from the
+        // agent's English `rawOutput`, which is what `no-agent-prose` exists to forbid.
+        const toolCallId = e.payload.toolCallId;
+        if (e.payload.decision === "deny" && toolCallId !== null && toolCallId !== undefined) {
+          if (!f.denied.includes(toolCallId)) f.denied.push(toolCallId);
+        }
+        // D4 rule 4: nothing acceptable was offered, so the daemon answered `-32603`. That is a
+        // policy outcome rather than a tool failure, and it is an advisory on the turn.
+        if (e.payload.decision === "error") {
+          f.streamWarnings.push({
+            code: "permission_not_offered",
+            message: "no acceptable permission option was offered",
+            source: "policy",
+          });
+        }
         break;
+      }
       case "omni.error":
         f.error = errorBody(e.payload);
         break;
@@ -409,28 +529,42 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
     return [view];
   });
 
-  // F5: the 12-line deterministic extraction, over the FINAL content of each tool call —
+  // F5: the deterministic extraction, over the FINAL content of each tool call —
   // `ToolCallUpdate.content` replaces the collection, so folding intermediate copies in would
-  // double-count a re-sent diff.
+  // double-count a re-sent diff. §12.5: the v2 shape is read FIRST and the v1 shape second,
+  // because a client may fold a buffer that spans an upgrade and a persisted log can hold both.
   const changes: FileChange[] = [];
   for (const call of toolCalls) {
     for (const item of call.content) {
       if (item.type !== "diff") continue;
-      const d = item as unknown as Record<string, unknown>;
-      const path = str(d["path"]);
-      const newText = str(d["newText"]);
-      if (path === null || newText === null) continue;
-      const oldText = str(d["oldText"]);
-      changes.push({
-        path,
-        // The v2 field wins when the payload carries one; otherwise the derivation the contract
-        // states verbatim. Neither is a guess about CONTENT — see `fragment`.
-        operation: str(d["operation"]) ?? (oldText === null ? "add" : "modify"),
-        oldText,
-        newText,
-        fragment: d["fragment"] === true,
-      });
+      const change = readDiffBlock(item as unknown as Record<string, unknown>);
+      if (change !== null) changes.push(change);
     }
+  }
+
+  // §13.4's SECOND signal: a schema'd enum, so it is trusted totally. "Final" means the status
+  // after the fold, which is what `tool_call_update`'s absent-means-unchanged semantics produce.
+  const failedToolCalls = toolCalls.filter((c) => c.status === "failed").map((c) => c.toolCallId);
+  // Only ids this turn actually mentions: a policy decision whose tool call never appeared is
+  // still a real denial, so it is kept — dropping it would under-report what we refused.
+  const deniedToolCalls = f.denied;
+
+  const warnings: TurnWarning[] = [...f.streamWarnings];
+  for (const id of deniedToolCalls) {
+    warnings.push({
+      code: "tool_denied",
+      message: `tool call ${id} was denied by policy`,
+      source: "policy",
+      detail: { toolCallId: id },
+    });
+  }
+  for (const id of failedToolCalls) {
+    warnings.push({
+      code: "tool_failed",
+      message: `tool call ${id} ended with status failed`,
+      source: "tool_status",
+      detail: { toolCallId: id },
+    });
   }
 
   return {
@@ -440,18 +574,71 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
     text: f.text,
     toolCalls,
     changes,
+    // STILL null in M1 (D8, ruling M1-R11): only a provider that can compare against the actual
+    // disk may fill it, and that is M2's git provider.
     patch: null,
-    vendorPatch: null,
+    vendorPatch: f.vendorPatch,
     ...(f.usage === null ? {} : { usage: f.usage }),
+    ...(f.tokens === null ? {} : { tokens: f.tokens }),
     interactions: f.interactions,
-    // M1-WP-B owns §13.4's promotion rules (rate-limit `_meta`, failed/denied tool calls, the
-    // descriptor-gated stderr signal). Until then the only evidence the M0 fold already holds is
-    // `error`, and reporting it is the honest floor: never a fabricated "ok" over a failure.
-    verdict: f.error === null ? "ok" : "failed",
-    warnings: [],
-    failedToolCalls: [],
-    deniedToolCalls: [],
+    // §13.4, with NO AGENT PROSE anywhere: a denial is our own `omni.policy_decision`, a failure
+    // is a schema'd enum, and an error is an envelope we wrote. `end_turn` is not consulted, and
+    // could not be: corpus findings 6 and 7 show a denied tool call and an invented `optionId`
+    // both ending `stopReason: "end_turn"`.
+    verdict:
+      f.error !== null
+        ? "failed"
+        : failedToolCalls.length > 0 || deniedToolCalls.length > 0
+          ? "partial"
+          : "ok",
+    warnings,
+    failedToolCalls,
+    deniedToolCalls,
     error: f.error,
+  };
+}
+
+/**
+ * One `ToolCallContent{type:"diff"}` → one `FileChange`, or null.
+ *
+ * The v2 shape is `{changes:[{operation, path}], patch?}` and has NO `oldText`/`newText` at all,
+ * so the Normalizer carries the v1 text under `_meta["omni/v1Diff"]` (§12.5) and this reads it
+ * back. That is the ONLY source of the text `FileChange` requires: a genuinely-v2 diff carrying
+ * no text contributes no `FileChange`, exactly as M0 skipped a diff block with no `newText`,
+ * because inventing `newText: ""` would tell a consumer the file is now empty.
+ */
+function readDiffBlock(d: Record<string, unknown>): FileChange | null {
+  const v1 = record(record(d["_meta"])?.[V1_DIFF_META]);
+  const v2Changes = Array.isArray(d["changes"]) ? (d["changes"] as unknown[]) : null;
+
+  if (v2Changes !== null) {
+    const first = record(v2Changes[0]);
+    const path = first === null ? null : str(first["path"]);
+    if (first === null || path === null || v1 === null) return null;
+    const newText = str(v1["newText"]);
+    if (newText === null) return null;
+    return {
+      path,
+      operation: str(first["operation"]) ?? (str(v1["oldText"]) === null ? "add" : "modify"),
+      oldText: str(v1["oldText"]),
+      newText,
+      // From the DESCRIPTOR, stamped by the Normalizer. A consumer that writes a FRAGMENT to
+      // `path` corrupts the file (F19), so this is never derived and never defaulted to true.
+      fragment: v1["fragment"] === true,
+    };
+  }
+
+  // The v1 shape, still legal on a persisted log written before the map landed.
+  const path = str(d["path"]);
+  const newText = str(d["newText"]);
+  if (path === null || newText === null) return null;
+  const oldText = str(d["oldText"]);
+  return {
+    path,
+    operation: str(d["operation"]) ?? (oldText === null ? "add" : "modify"),
+    oldText,
+    newText,
+    fragment: d["fragment"] === true,
   };
 }
 

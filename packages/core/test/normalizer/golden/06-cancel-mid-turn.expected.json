@@ -1,0 +1,21 @@
+{
+  "scenario": "06-cancel-mid-turn",
+  "note": "session/cancel on the first chunk. One usage_update arrives AFTER the cancel and BEFORE the response.",
+  "stopReason": "cancelled",
+  "verdict": "ok",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 2,
+    "agent_message_chunk": 1
+  },
+  "toolCalls": [],
+  "changes": [],
+  "failedToolCalls": [],
+  "deniedToolCalls": [],
+  "textIncludes": ["one"],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": []
+}

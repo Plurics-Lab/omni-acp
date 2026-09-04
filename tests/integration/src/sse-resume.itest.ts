@@ -105,7 +105,9 @@ describe("SSE resume", () => {
     const lateChunk = union.filter(
       (e) =>
         e.turnId === accepted.turnId &&
-        e.payloadVersion === 1 &&
+        // Ruling M1-R10 flipped `payloadVersion` to 2 for a mapped `agent_message_chunk`; the
+        // chunk itself is what this case is about, so it is matched by kind and content.
+        e.kind === "acp.session_update" &&
         JSON.stringify(e.payload).includes("tail arriving after the response"),
     );
     expect(lateChunk).toHaveLength(1);

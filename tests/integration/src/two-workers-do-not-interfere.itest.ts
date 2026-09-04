@@ -158,8 +158,13 @@ describe("two workers do not interfere", () => {
 
       // `state_update{running}` is appended before the prompt bytes reach stdin, which is what
       // makes `PromptAccepted.seq - 1` a sound subscription cursor (§7.1).
+      // Selected by KIND, not by `payloadVersion`: ruling M1-R10 flips the field to 2 for every
+      // update the normalizer lands on a known v2 arm, so "payloadVersion === 1" no longer means
+      // "the agent sent it". This is the same set, asked for directly.
       const agentUpdates = mine.filter(
-        (e) => e.kind === "acp.session_update" && e.payloadVersion === 1,
+        (e) =>
+          e.kind === "acp.session_update" &&
+          (e.payload as { sessionUpdate?: string }).sessionUpdate !== "state_update",
       );
       expect(agentUpdates.length).toBeGreaterThan(0);
       for (const update of agentUpdates) {

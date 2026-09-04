@@ -1,0 +1,22 @@
+{
+  "scenario": "07-session-load",
+  "note": "session/load with replay, then a prompt. Exactly two updates land inside the request-to-response window (F16).",
+  "stopReason": "end_turn",
+  "verdict": "ok",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "user_message_chunk": 1,
+    "agent_message_chunk": 3,
+    "available_commands_update": 2,
+    "usage_update": 4
+  },
+  "toolCalls": [],
+  "changes": [],
+  "failedToolCalls": [],
+  "deniedToolCalls": [],
+  "textIncludes": ["You asked me to reply"],
+  "replayEnvelopes": 2,
+  "vendorPatchIncludes": []
+}

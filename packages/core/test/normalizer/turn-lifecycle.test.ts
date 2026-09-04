@@ -520,11 +520,32 @@ describe("normalizer: the crash rule (CONTRACTS.md §7.3)", () => {
   });
 });
 
-describe("normalizer: verbatim pass-through (CONTRACTS.md §7.5)", () => {
-  it("forwards the agent's object BY IDENTITY, preserving _meta, and stamps payloadVersion 1", () => {
+/**
+ * §7.5 IS SUPERSEDED BY §12 — the two cases below are its M1 successors, and they are the only
+ * two tests in this file that M1 changed.
+ *
+ * M0 forwarded EVERY `session/update` verbatim at `payloadVersion: 1`, and §7.5 said so; §12
+ * replaces that with the per-field map and ruling M1-R10 flips `payloadVersion` to 2 wherever the
+ * map lands on a known v2 arm. A `tool_call` carrying a real `toolCallId` is therefore now a
+ * `tool_call_update` at 2 — which is precisely the flip §7.5 predicted ("when M1 flips them to 2
+ * the client's already-written v2 branch takes over with no wire break").
+ *
+ * What the M0 cases were PROTECTING is not weakened, it is moved to where §12 puts it:
+ *
+ *   - forwarding BY IDENTITY, `_meta` included, is now §12.3 row 18's guarantee for an
+ *     UNRECOGNIZED kind — and it is asserted here by object identity, exactly as before;
+ *   - the three v1-only variants are still not half-translated: a payload that cannot produce
+ *     its v2 arm comes back as the very object the agent sent, at `payloadVersion: 1`.
+ *
+ * Every other test in this file — the whole `TurnInput` × state cross-product, the quiet window,
+ * the hard cap, the crash rule, the purity check and the config validation — is M0's, unmodified,
+ * which is M1-WP-B acceptance bullet 8.
+ */
+describe("normalizer: pass-through by identity (CONTRACTS.md §12.3 row 18)", () => {
+  it("forwards an UNRECOGNIZED kind BY IDENTITY, preserving _meta, and stamps payloadVersion 1", () => {
     const meta = { "vendor.io/trace": "abc" };
     const update = {
-      sessionUpdate: "tool_call",
+      sessionUpdate: "vendor.io/telemetry",
       toolCallId: "call-1",
       title: "Read file",
       _meta: meta,
@@ -544,9 +565,11 @@ describe("normalizer: verbatim pass-through (CONTRACTS.md §7.5)", () => {
     ).toHaveProperty("_meta", meta);
   });
 
-  it("forwards the three v1-only variants unchanged rather than half-translating them", () => {
-    // `tool_call`, `plan` and `current_mode_update` genuinely differ in v2 and are LEFT ALONE
-    // in M0; `payloadVersion: 1` is the flag that keeps that honest (§7.5).
+  it("does not half-translate a v1-only kind it cannot land on its v2 arm", () => {
+    // `tool_call` without a `toolCallId`, `plan` without `entries`, `current_mode_update`
+    // without `currentModeId`: each names a row of §12.3, and each is missing the field its
+    // target arm REQUIRES. §12.2's rule — test the target shape before rewriting — makes all
+    // three pass through by identity rather than becoming a v2 payload that is not one.
     const n = make();
     n.step(promptSent(TURN_A, T0));
     for (const sessionUpdate of ["tool_call", "plan", "current_mode_update"]) {
@@ -555,6 +578,23 @@ describe("normalizer: verbatim pass-through (CONTRACTS.md §7.5)", () => {
       expect(e?.payloadVersion).toBe(1);
       expect(e?.kind === "acp.session_update" && e.payload).toBe(update);
     }
+  });
+
+  it("DOES map the same three rows once their target arm is satisfiable", () => {
+    // The other half of the flip, so the case above cannot be satisfied by a mapper that gave up
+    // on these kinds entirely.
+    const n = make();
+    n.step(promptSent(TURN_A, T0));
+    const meta = { "vendor.io/trace": "abc" };
+    const [e] = n.step(
+      agentUpdate(T0 + 1, { sessionUpdate: "tool_call", toolCallId: "call-1", _meta: meta }),
+    ).emit;
+    expect(e?.payloadVersion).toBe(2);
+    const payload = (e?.kind === "acp.session_update" ? e.payload : {}) as Record<string, unknown>;
+    expect(payload["sessionUpdate"]).toBe("tool_call_update");
+    // The rename is the WHOLE rewrite: `_meta` survives by identity, and no field is invented.
+    expect(payload["_meta"]).toBe(meta);
+    expect(Object.keys(payload).sort()).toEqual(["_meta", "sessionUpdate", "toolCallId"]);
   });
 });
 

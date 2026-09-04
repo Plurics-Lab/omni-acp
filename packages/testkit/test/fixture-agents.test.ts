@@ -1,9 +1,11 @@
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { client as acpClient, ndJsonStream } from "@agentclientprotocol/sdk";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable, Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
-import { fixtureAgentPath, isAlive, waitGone } from "@omni-acp/testkit";
+import { fixtureAgentPath, isAlive, waitGone, wireAgentPath } from "@omni-acp/testkit";
 import { launchFixture, type LaunchedFixture } from "./support/launch-fixture.js";
 
 /**
@@ -318,3 +320,369 @@ describe("the documented env knobs, pinned so downstream work packages can rely 
     expect(stderr).toContain("MARKER_FILE is required");
   });
 });
+
+// ── M1's four gap-filling fixtures, and the wire replayer (CONTRACTS.md §5.7) ─
+//
+// Each one exists because the research README's "Known gaps" section says the only real agent
+// available never produced that shape. They are the ONLY exercise those rows of §12.3 get, so
+// "it launches and emits what its header says" has to be an assertion here rather than a claim
+// in the file that needs it.
+
+describe("fixtures/agents/plan.mjs", () => {
+  it("emits v1 `plan` twice, then a `plan_update` with a `{plan}` body", async () => {
+    // The corpus gap: NO `plan` update was emitted in two attempts (this build has no todo
+    // tool), so §12.3 rows 7 and 8 have no real-agent ground truth at all.
+    const agent = launch("plan");
+    const sessionId = await agent.handshake();
+    const res = await agent.cx.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    expect(res).toEqual({ stopReason: "end_turn" });
+    // The response and the last notification travel on one pipe, and the SDK may resolve the
+    // request before it has drained what follows it — which is the whole reason the quiet window
+    // exists (§7.2). Waiting here is the test's version of it.
+    for (let i = 0; i < 20 && agent.updates.length < 4; i++) await sleep(25);
+
+    const kinds = agent.updates.map((u) => u["sessionUpdate"]);
+    expect(kinds).toEqual(["plan", "plan", "plan_update", "agent_message_chunk"]);
+
+    // Two v1 `plan`s with DIFFERENT entry sets: what pins `planId` being stable across the turn.
+    const plans = agent.updates.filter((u) => u["sessionUpdate"] === "plan");
+    expect(plans).toHaveLength(2);
+    expect(JSON.stringify(plans[0]?.["entries"])).not.toBe(JSON.stringify(plans[1]?.["entries"]));
+
+    // Row 8's `=` branch: `{plan:{type,planId,entries}}`, which is what SDK 1.4.0's **v1**
+    // schema already requires — see the correction in the fixture's header.
+    const updates = agent.updates.filter((u) => u["sessionUpdate"] === "plan_update");
+    expect(updates).toHaveLength(1);
+    expect((updates[0]?.["plan"] as { type: string }).type).toBe("items");
+    expect(updates[0]).not.toHaveProperty("entries");
+  });
+
+  it("PLAN_EMIT_V2=0 sends row 8's `{entries}` body, and a v1 client SILENTLY DROPS it", async () => {
+    // The correction to §12.3 row 8, asserted rather than assumed. SDK 1.4.0's **v1** schema
+    // already types `PlanUpdate` as `{plan: PlanUpdateContent}`, so `{sessionUpdate:"plan_update",
+    // entries:[…]}` is not a v1 shape either: the client deserializes it, fails, and drops it —
+    // no notification, no error, nothing on stderr. The map still handles the shape, because a
+    // non-SDK agent can put anything on a pipe; it simply cannot arrive through this SDK.
+    const agent = launch("plan", { PLAN_EMIT_V2: "0" });
+    const sessionId = await agent.handshake();
+    await agent.cx.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    for (let i = 0; i < 20 && agent.updates.length < 3; i++) await sleep(25);
+    await sleep(150);
+
+    expect(agent.updates.map((u) => u["sessionUpdate"])).toEqual([
+      "plan",
+      "plan",
+      "agent_message_chunk",
+    ]);
+    expect(agent.stderrText()).toBe("");
+  });
+});
+
+describe("fixtures/agents/thought.mjs", () => {
+  it("emits agent_thought_chunk with AND without messageId, in runs", async () => {
+    // Two gaps at once: thoughts are never emitted at the default effort, and every recorded
+    // chunk carries an id — so §12.4's SYNTHESIS half has no real-agent sample either.
+    const agent = launch("thought");
+    const sessionId = await agent.handshake();
+    await agent.cx.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    expect(agent.updates.map((u) => u["sessionUpdate"])).toEqual([
+      "agent_thought_chunk",
+      "agent_thought_chunk",
+      "agent_message_chunk",
+      "agent_thought_chunk",
+      "agent_thought_chunk",
+    ]);
+    // Four without, one with. The run structure is the point: two thoughts, a kind change, a
+    // thought again — which is three synthesized ids, not one and not four.
+    const withId = agent.updates.filter((u) => u["messageId"] !== undefined);
+    expect(withId).toHaveLength(1);
+    expect(withId[0]?.["messageId"]).toBe("thought-from-the-agent");
+  });
+});
+
+describe("fixtures/agents/mode.mjs", () => {
+  it("returns `modes` from session/new and emits v1 `current_mode_update`", async () => {
+    // The gap: `session/set_mode` on claude-acp produced the v2 `config_option_update` instead,
+    // so §12.3 row 11 has no v1-side sample. Row 11 also cannot build its select without the
+    // handshake's `modes.availableModes`, which is why the fixture returns one.
+    const agent = launch("mode");
+    await agent.cx.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const session = (await agent.cx.request("session/new", {
+      cwd: process.cwd(),
+      mcpServers: [],
+    })) as { sessionId: string; modes?: { currentModeId: string; availableModes: unknown[] } };
+
+    expect(session.modes?.currentModeId).toBe("default");
+    expect(session.modes?.availableModes).toHaveLength(3);
+
+    await agent.cx.request("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    const modeUpdates = agent.updates.filter((u) => u["sessionUpdate"] === "current_mode_update");
+    expect(modeUpdates.map((u) => u["currentModeId"])).toEqual(["default", "acceptEdits"]);
+    // And NOT the v2 spelling: this fixture exists precisely to produce the one claude-acp never did.
+    expect(agent.updates.some((u) => u["sessionUpdate"] === "config_option_update")).toBe(false);
+  });
+
+  it("MODE_NO_MODES=1 returns no catalogue, which is row 11's honest `options: []` branch", async () => {
+    const agent = launch("mode", { MODE_NO_MODES: "1" });
+    await agent.cx.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const session = (await agent.cx.request("session/new", {
+      cwd: process.cwd(),
+      mcpServers: [],
+    })) as { modes?: unknown };
+    expect(session.modes).toBeUndefined();
+  });
+});
+
+describe("fixtures/agents/hybrid.mjs", () => {
+  it("is a v1/v2 HYBRID: protocolVersion 1, `configOptions` on session/new, `usage_update` on the wire", async () => {
+    // F24, made launchable. A mapper that switched on a version number would mangle this agent.
+    const agent = launch("hybrid");
+    const init = (await agent.cx.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {},
+    })) as { protocolVersion: number };
+    expect(init.protocolVersion).toBe(1);
+
+    const session = (await agent.cx.request("session/new", {
+      cwd: process.cwd(),
+      mcpServers: [],
+    })) as { sessionId: string; configOptions?: unknown[]; modes?: unknown };
+    expect(session.configOptions).toHaveLength(1);
+    expect(session.modes).toBeDefined();
+
+    const res = (await agent.cx.request("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    })) as { stopReason: string; usage?: { totalTokens: number } };
+    expect(res.stopReason).toBe("end_turn");
+    // F21: the v2 `Usage` block on the prompt RESPONSE.
+    expect(res.usage?.totalTokens).toBe(30);
+
+    expect(agent.updates.map((u) => u["sessionUpdate"])).toEqual([
+      "config_option_update",
+      "tool_call",
+      "usage_update",
+      "tool_call_update",
+      "agent_message_chunk",
+    ]);
+  });
+
+  it("fails a tool call ON ITS OWN MERITS — the corpus's last gap", async () => {
+    // Every recorded failure was a DENIED permission. This one asks for no permission at all and
+    // still ends `status: "failed"`, which is what makes `verdict: partial` provable from the
+    // status enum alone.
+    const agent = launch("hybrid");
+    const sessionId = await agent.handshake();
+    await agent.cx.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    const final = agent.updates.find((u) => u["status"] === "failed");
+    expect(final?.["toolCallId"]).toBe("hybrid-call-1");
+    expect(String(final?.["rawOutput"])).toContain("ENOENT");
+  });
+
+  it("HYBRID_EOF_MARKER records stdin EOF, which is how a test observes §13.2 rung 2", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omni-hybrid-"));
+    const marker = join(dir, "rungs.txt");
+    try {
+      const agent = launch("hybrid", { HYBRID_EOF_MARKER: marker });
+      await agent.handshake();
+      expect(existsSync(marker)).toBe(false);
+
+      const exit = new Promise<number | null>((r) => agent.child.once("exit", r));
+      agent.child.stdin.end();
+      expect(await exit).toBe(0);
+      expect(readFileSync(marker, "utf8")).toBe("eof\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("HYBRID_IGNORE_EOF=1 records the EOF and STAYS ALIVE, so stdout never ends", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omni-hybrid-"));
+    const marker = join(dir, "rungs.txt");
+    try {
+      const agent = launch("hybrid", { HYBRID_EOF_MARKER: marker, HYBRID_IGNORE_EOF: "1" });
+      await agent.handshake();
+      agent.child.stdin.end();
+      await sleep(250);
+      expect(readFileSync(marker, "utf8")).toBe("eof\n");
+      expect(agent.child.exitCode).toBeNull();
+      expect(agent.child.stdout.readableEnded).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("HYBRID_FATAL_STDERR=1 writes ONE COMPLETE line, which is what §13.4 keys on", async () => {
+    const agent = launch("hybrid", { HYBRID_FATAL_STDERR: "1" });
+    const sessionId = await agent.handshake();
+    await agent.cx.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    for (let i = 0; i < 20 && !agent.stderrText().includes("\n"); i++) await sleep(25);
+    expect(agent.stderrText()).toBe("FATAL: hybrid fixture cannot continue\n");
+  });
+
+  it("HYBRID_NEVER_ANSWER=1 emits every update and then hangs, so a ladder has a live turn", async () => {
+    const agent = launch("hybrid", { HYBRID_NEVER_ANSWER: "1" });
+    const sessionId = await agent.handshake();
+    const prompt = agent.cx
+      .request("session/prompt", { sessionId, prompt: [{ type: "text", text: "go" }] })
+      .then(() => "answered");
+    expect(await Promise.race([prompt, sleep(300).then(() => "still waiting")])).toBe(
+      "still waiting",
+    );
+    expect(agent.updates).toHaveLength(5);
+  });
+
+  it("HYBRID_RATE_LIMIT puts a status under the fixture's OWN `_meta` pointer", async () => {
+    const agent = launch("hybrid", { HYBRID_RATE_LIMIT: "rejected" });
+    const sessionId = await agent.handshake();
+    await agent.cx.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    const usage = agent.updates.find((u) => u["sessionUpdate"] === "usage_update");
+    expect(
+      (usage?.["_meta"] as Record<string, { status: string }>)["hybrid.test/rateLimit"],
+    ).toEqual({ status: "rejected", utilization: 0.9 });
+  });
+});
+
+describe("fixtures/agents/wire.mjs — the corpus over a REAL pipe", () => {
+  it("replays a recorded transcript's updates, in order, with the recorded bytes", async () => {
+    // §12.7's "Wire-level" note: every other corpus test hands `mapUpdate` an object a
+    // `JSON.parse` in the test produced. This one makes the same bytes arrive the way they
+    // actually arrived — through the frame limiter and the SDK's own client.
+    const child = spawn(process.execPath, [wireAgentPath()], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, WIRE_TRANSCRIPT: "02-tool-read" },
+      windowsHide: true,
+    }) as ChildProcessWithoutNullStreams;
+    try {
+      const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
+      const updates: Record<string, unknown>[] = [];
+      const connection = acpClient({ name: "wire-driver" })
+        .onNotification("session/update", (ctx) => {
+          updates.push(ctx.params.update as unknown as Record<string, unknown>);
+        })
+        .connect(stream);
+
+      const init = (await connection.agent.request("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })) as { agentCapabilities?: { loadSession?: boolean } };
+      // The RECORDED handshake body, so `mapCapabilities` sees the shape the real agent sent.
+      expect(init.agentCapabilities?.loadSession).toBe(true);
+
+      const session = (await connection.agent.request("session/new", {
+        cwd: process.cwd(),
+        mcpServers: [],
+      })) as { sessionId: string };
+      const res = (await connection.agent.request("session/prompt", {
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "go" }],
+      })) as { stopReason: string };
+
+      expect(res.stopReason).toBe("end_turn");
+      // The transcript's own count and kinds, over a real pipe.
+      expect(updates).toHaveLength(16);
+      expect(updates.filter((u) => u["sessionUpdate"] === "tool_call")).toHaveLength(1);
+      expect(updates.filter((u) => u["sessionUpdate"] === "tool_call_update")).toHaveLength(3);
+      // …and it is the RECORDED object, not a reconstruction: the tool call id is the real one.
+      expect(updates.find((u) => u["sessionUpdate"] === "tool_call")?.["toolCallId"]).toBe(
+        "toolu_01QAxu6j2Q52J8pYPMBXHRUm",
+      );
+      connection.close();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((r) => child.once("exit", r));
+    }
+  }, 20_000);
+
+  it("carries a 12.7 KB `available_commands_update` through the framer intact (F13)", async () => {
+    const child = spawn(process.execPath, [wireAgentPath()], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, WIRE_TRANSCRIPT: "01-plain-answer" },
+      windowsHide: true,
+    }) as ChildProcessWithoutNullStreams;
+    try {
+      const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
+      const updates: Record<string, unknown>[] = [];
+      const connection = acpClient({ name: "wire-driver" })
+        .onNotification("session/update", (ctx) => {
+          updates.push(ctx.params.update as unknown as Record<string, unknown>);
+        })
+        .connect(stream);
+      await connection.agent.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const session = (await connection.agent.request("session/new", {
+        cwd: process.cwd(),
+        mcpServers: [],
+      })) as { sessionId: string };
+      await connection.agent.request("session/prompt", {
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "go" }],
+      });
+
+      const commands = updates.filter((u) => u["sessionUpdate"] === "available_commands_update");
+      expect(commands).toHaveLength(2);
+      // The single largest line in the corpus, arriving as ONE frame.
+      expect(JSON.stringify(commands[0]).length).toBeGreaterThan(10_000);
+      connection.close();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((r) => child.once("exit", r));
+    }
+  }, 20_000);
+
+  it("WIRE_TRANSCRIPT is required, and its absence is EX_USAGE", async () => {
+    const { code, stderr } = await runRawPath(wireAgentPath(), { WIRE_TRANSCRIPT: "" });
+    expect(code).toBe(64);
+    expect(stderr).toContain("WIRE_TRANSCRIPT is required");
+  });
+
+  it("a transcript that does not exist is EX_NOINPUT, not a silent empty replay", async () => {
+    const { code, stderr } = await runRawPath(wireAgentPath(), { WIRE_TRANSCRIPT: "99-nope" });
+    expect(code).toBe(66);
+    expect(stderr).toContain("cannot read transcript 99-nope");
+  });
+});
+
+/** `runRaw`, for an agent whose path is not a `FixtureAgentName`. */
+function runRawPath(
+  path: string,
+  env: Record<string, string>,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...env },
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (d: string) => (stdout += d));
+    child.stderr.on("data", (d: string) => (stderr += d));
+    child.on("error", () => {});
+    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+    child.stdin.end();
+  });
+}

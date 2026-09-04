@@ -3,21 +3,15 @@ import type {
   PermissionOption,
   RuntimeDescriptor,
 } from "@omni-acp/protocol";
-
-function record(v: unknown): Record<string, unknown> | null {
-  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
-}
-
-function str(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
-}
+import { record, str, type Json } from "./json.js";
 
 /**
  * The offered options, defensively narrowed.
  *
  * `PermissionOptionKind` is a closed enum in the schema, and D4 rule 6 requires an UNKNOWN kind
  * to survive far enough to be treated as a non-grant — so the shape check is structural and the
- * option objects are passed through by identity.
+ * option objects are passed through BY IDENTITY. The field is `optionId`, not `id` (corpus
+ * finding 5), and the three observed options pass through untouched, in order.
  */
 function options(raw: unknown): readonly PermissionOption[] {
   if (!Array.isArray(raw)) return [];
@@ -31,21 +25,55 @@ function options(raw: unknown): readonly PermissionOption[] {
 }
 
 /**
- * v1 `{sessionId, toolCall, options}` → v2 `{title, subject, options}` (CONTRACTS.md §12.6).
+ * `title`, in the EVIDENCE order §12.6 fixes, never empty because v2 requires a string:
+ *
+ *   1. `_meta.permission.title` — present on BOTH observed requests, and the agent's own
+ *      human-facing label for the action.
+ *   2. `toolCall.title` — the schema'd field.
+ *   3. a constructed `"<kind>: <name|toolCallId>"`, which is the last thing that is still TRUE
+ *      about the request rather than a placeholder.
+ *
+ * The order matters for a policy engine, not just for a UI: `title` is what
+ * `omni.policy_decision` records and therefore what an audit reads back (review R9).
+ */
+function titleOf(request: Json, toolCall: Json | null): string {
+  const fromMeta = str(record(record(request["_meta"])?.["permission"])?.["title"]);
+  if (fromMeta !== null && fromMeta !== "") return fromMeta;
+
+  const top = str(request["title"]);
+  if (top !== null && top !== "") return top;
+
+  const fromToolCall = toolCall === null ? null : str(toolCall["title"]);
+  if (fromToolCall !== null && fromToolCall !== "") return fromToolCall;
+
+  if (toolCall === null) return "permission request";
+  const kind = str(toolCall["kind"]) ?? "tool_call";
+  const what = str(toolCall["name"]) ?? str(toolCall["toolCallId"]);
+  return what === null ? kind : `${kind}: ${what}`;
+}
+
+/**
+ * v1 `{sessionId, toolCall, options, _meta}` → v2 `{sessionId, title, subject, options, _meta}`
+ * (CONTRACTS.md §12.6), and the RESPONDER RECEIVES THE MAPPED FORM (ruling M1-R14).
  *
  * PURE and IDEMPOTENT: a request that already carries a v2 `subject` comes back with that
- * subject by identity, so `map(map(x))` is `map(x)`. `toolCall` is passed BY IDENTITY into the
+ * subject BY IDENTITY, so `map(map(x))` is `map(x)`. `toolCall` is passed BY IDENTITY into the
  * subject, so `kind` / `locations` / `content` / `rawInput` — what M2's rule engine matches on —
  * arrive unmodified, and `_meta` survives for the vendor extractors.
  *
- * Owned by M1-WP-B, which adds the descriptor's `permissionRequestShape` quirk, the golden
- * cases, and the idempotency property test over all 216 recorded updates. What is here is the
- * subset the M0 permission path (F1: the SDK example agent asks mid-turn and waits forever)
- * needs in order to keep working under ruling M1-R14 — no descriptor branch, no invention.
+ * `options` is NEVER RESHAPED, including an unknown `kind`, which D4 rule 6 needs in order to
+ * fail closed. And `toolCallId` is lifted out here rather than in the responder: it is the join
+ * §13.4 needs to turn "we denied" into `TurnResult.deniedToolCalls` without ever reading the
+ * agent's English `rawOutput`.
+ *
+ * The descriptor's `permissionRequestShape` quirk is READ rather than branched on: both shapes
+ * are handled structurally, and the quirk is the recorded claim about which one to expect. A
+ * disagreement between the claim and the wire is a fact about the descriptor, not a reason to
+ * refuse a request the agent is waiting on (F1: it waits forever).
  */
 export function mapPermissionRequest(
   req: unknown,
-  _descriptor: RuntimeDescriptor,
+  descriptor: RuntimeDescriptor,
 ): MappedPermissionRequest {
   const r = record(req) ?? {};
 
@@ -57,12 +85,11 @@ export function mapPermissionRequest(
 
   const subjectToolCall = existing === null ? toolCall : record(existing["toolCall"]);
   const meta = record(r["_meta"]);
+  void descriptor.quirks.permissionRequestShape;
 
   return {
     sessionId: str(r["sessionId"]) ?? "",
-    // v1 has no top-level title; `toolCall.title` is the only place it is recoverable (§7.4).
-    title:
-      str(r["title"]) ?? (subjectToolCall === null ? "" : (str(subjectToolCall["title"]) ?? "")),
+    title: titleOf(r, subjectToolCall),
     subject,
     options: options(r["options"]),
     toolCallId: subjectToolCall === null ? null : str(subjectToolCall["toolCallId"]),

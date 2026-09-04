@@ -22,6 +22,11 @@
         "amount": 0.12,
         "currency": "USD"
       }
+    },
+    "tokens": {
+      "totalTokens": 999,
+      "inputTokens": 900,
+      "outputTokens": 99
     }
   },
   "status": {

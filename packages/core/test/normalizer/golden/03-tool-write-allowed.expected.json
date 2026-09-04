@@ -1,0 +1,36 @@
+{
+  "scenario": "03-tool-write-allowed",
+  "note": "Write + permission ALLOW, answered allow-once. Carries the creation diff.",
+  "stopReason": "end_turn",
+  "verdict": "ok",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 6,
+    "agent_message_chunk": 8,
+    "tool_call_update": 5
+  },
+  "toolCalls": [
+    {
+      "id": "toolu_01UqACvgrmqvqmbALS7hDmKR",
+      "kind": "edit",
+      "status": "completed"
+    }
+  ],
+  "changes": [
+    {
+      "path": "/tmp/acp-ws-wa-VxS6ru/hello.txt",
+      "operation": "add",
+      "oldText": null,
+      "newText": "hello",
+      "fragment": true
+    }
+  ],
+  "failedToolCalls": [],
+  "deniedToolCalls": [],
+  "textIncludes": ["Creating the file now.", "hello.txt"],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": ["new file mode 100644", "--- /dev/null", "+hello"]
+}

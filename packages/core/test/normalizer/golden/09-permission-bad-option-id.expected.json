@@ -1,0 +1,33 @@
+{
+  "scenario": "09-permission-bad-option-id",
+  "note": "The recorded run answered with an optionId the agent never offered; every tool call ended failed and the turn still ended end_turn.",
+  "stopReason": "end_turn",
+  "verdict": "partial",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 9,
+    "agent_message_chunk": 7,
+    "tool_call_update": 8
+  },
+  "toolCalls": [
+    {
+      "id": "toolu_015zSJykjeArSWhgHPxF6PUT",
+      "kind": "edit",
+      "status": "failed"
+    },
+    {
+      "id": "toolu_014kKXnFQnMYyYwz6jqiPTCY",
+      "kind": "execute",
+      "status": "failed"
+    }
+  ],
+  "changes": [],
+  "failedToolCalls": ["toolu_015zSJykjeArSWhgHPxF6PUT", "toolu_014kKXnFQnMYyYwz6jqiPTCY"],
+  "deniedToolCalls": [],
+  "textIncludes": ["Writing the file now.", "denied by the permission system"],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": []
+}
