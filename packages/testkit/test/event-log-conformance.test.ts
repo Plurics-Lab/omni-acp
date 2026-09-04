@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { runEventLogConformance } from "@omni-acp/testkit";
+import { runEventLogConformance, tmpPersistence } from "@omni-acp/testkit";
+import { OmniError } from "@omni-acp/protocol";
 import { referenceEventLog } from "./support/reference-event-log.js";
 
 /**
@@ -25,5 +26,31 @@ describe("runEventLogConformance", () => {
     expect(log.tail).toBe(13);
     expect(log.read(0)[0]?.seq).toBe(13);
     log.close();
+  });
+});
+
+describe("tmpPersistence", () => {
+  it("refuses to run without its factories, and says exactly why", async () => {
+    // `@omni-acp/testkit` depends on `@omni-acp/protocol` and nothing else (CONTRACTS.md §3.1),
+    // and `@omni-acp/core` dev-depends on THIS package — so the import that would let the
+    // harness open a database on its own is both forbidden and a cycle. Re-implementing
+    // `openPersistence` here would give `runEventLogPersistenceConformance` a SECOND SQLite
+    // driver to pass instead of the shipped one, which is the one thing a conformance suite
+    // must never do. So the package under test injects its own, and calling it bare is a loud
+    // error rather than a harness that silently proves nothing.
+    //
+    // `@omni-acp/core`'s `test/event-log/m1-acceptance.test.ts` is where the injected form runs
+    // §14.11's ten items against the real driver.
+    const bare = tmpPersistence as unknown as () => Promise<unknown>;
+    let thrown: unknown = null;
+    try {
+      await bare();
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(OmniError);
+    expect((thrown as OmniError).code).toBe("internal");
+    expect((thrown as OmniError).message).toContain("openPersistence");
+    expect((thrown as OmniError).message).toContain("§3.1");
   });
 });

@@ -11,15 +11,22 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".."
  * The three files allowed to put a value in a `seq` property, each for a reason that is not
  * "it was already there":
  *
- *  - `memory-log.ts` IS the assigner. That is the whole point of the guard.
+ *  - `log-core.ts` IS the assigner. That is the whole point of the guard. It was
+ *    `memory-log.ts` through M0; §14.1 moved the ring, the subscribers and the ONE `seq`
+ *    assigner into the shared core so that BOTH drivers sit on identical behaviour, and
+ *    `memory-log.ts` became a wrapper that assigns nothing. The allowlist moved with the code —
+ *    which is exactly what the third test below exists to force.
  *  - `events.ts` declares the wire schema. `seq: z.number().int().positive()` validates a
  *    number that arrived from the network; it never produces one.
  *  - `fake-clock.ts` numbers pending TIMERS so `advance()` can fire same-deadline callbacks in
  *    creation order. Unrelated to the event log, and the testkit is never in the daemon's data
  *    path.
+ *
+ * `persist/event-store.ts` is deliberately NOT here: the durable store is TOLD what the seq is
+ * (§5.1) and only ever copies `e.seq` out of the envelope it was handed.
  */
 const ALLOWED = new Set([
-  "packages/core/src/event-log/memory-log.ts",
+  "packages/core/src/event-log/log-core.ts",
   "packages/protocol/src/events.ts",
   "packages/testkit/src/fake-clock.ts",
 ]);
@@ -162,6 +169,8 @@ describe("guard: seq-single-writer", () => {
   it("scans a real corpus", () => {
     expect(sources.length).toBeGreaterThan(20);
     expect(sources.map((s) => s.path)).toContain("packages/core/src/event-log/memory-log.ts");
+    expect(sources.map((s) => s.path)).toContain("packages/core/src/event-log/log-core.ts");
+    expect(sources.map((s) => s.path)).toContain("packages/core/src/persist/event-store.ts");
     expect(sources.map((s) => s.path)).toContain("packages/daemon/src/http/sse.ts");
   });
 
