@@ -1,6 +1,7 @@
-import { readdir, stat } from "node:fs/promises";
+import { join } from "node:path";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   OmniError,
   ProbeConfig,
@@ -84,6 +85,32 @@ const AGENT_ID = "claude";
  * red depending on which one happened to be mid-`mkdtemp`, and reporting a leak in `probe.ts`
  * either way. Narrowing to the agent id is what makes it an assertion about the code under test.
  */
+/**
+ * The three "leaves no temp directory behind" assertions diff a listing of `os.tmpdir()`. Even
+ * narrowed to `omni-probe-<AGENT_ID>-`, that is a listing of a directory OTHER processes write
+ * to (a sibling vitest worker running a copy of this file, a CI job on the same runner), and a
+ * `mkdtemp` landing between the `before` and `after` snapshots read as a leak in `probe.ts`.
+ * `os.tmpdir()` re-reads `TMPDIR` (POSIX) / `TEMP`+`TMP` (win32) on every call, so this file
+ * points them at a private `mkdtemp` for its lifetime: the listing is then ours alone. Each
+ * vitest file runs in its own worker, so mutating `process.env` here is not visible to siblings.
+ */
+const SAVED_TMP_ENV = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+let privateTmpRoot: string | null = null;
+beforeAll(async () => {
+  privateTmpRoot = await mkdtemp(join(tmpdir(), "omni-probe-test-"));
+  process.env.TMPDIR = privateTmpRoot;
+  process.env.TEMP = privateTmpRoot;
+  process.env.TMP = privateTmpRoot;
+});
+afterAll(async () => {
+  for (const k of ["TMPDIR", "TEMP", "TMP"] as const) {
+    const v = SAVED_TMP_ENV[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  if (privateTmpRoot) await rm(privateTmpRoot, { recursive: true, force: true });
+});
+
 async function probeTempDirs(): Promise<string[]> {
   const entries = await readdir(tmpdir());
   return entries.filter((e) => e.startsWith(`omni-probe-${AGENT_ID}-`));
