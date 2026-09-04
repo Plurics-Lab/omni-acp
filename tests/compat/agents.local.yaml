@@ -75,4 +75,36 @@ agents:
       - image_content
       - authenticate
       - tool_failure_on_merits
+  - id: codex-acp
+    source: command
+    enabled: true
+    command: npx
+    args: ["-y", "@agentclientprotocol/codex-acp@1.8.0"]
+    windows:
+      { command: "${execPath}", args: ["${npxResolved:@agentclientprotocol/codex-acp@1.8.0}"] }
+    # The adapter advertises only an api-key authMethod, but on this machine the ChatGPT login in
+    # ~/.codex/auth.json is picked up by the bundled Codex binary without any authenticate call
+    # (observed 2026-09-04: initialize 1.6 s, session/new 2.0 s, a PONG turn 5.8 s end_turn).
+    requires: { login: "codex" }
+    # `permission` is deliberately ABSENT. Observed 2026-09-04 (docs/research/transcripts/codex-acp-1.8.0):
+    # codex-acp never sent session/request_permission for a file write — not in the default `agent`
+    # mode, not after set_config_option{mode:"read-only"} / set_mode, not with INITIAL_AGENT_MODE, and
+    # not for a path outside the workspace. It only asks when its own sandbox refuses a command, which
+    # a compat case cannot provoke deterministically.
+    provides: [tools, cancel]
+    budgets:
+      initializeMs: 60000
+      resumeMs: 60000
+      turnMs: 300000
+    expect:
+      protocolVersion: 1
+      capabilities: { loadSession: true }
+      resumeMethod: session/resume
+    skip:
+      - {
+          case: permission-deny,
+          reason: "codex-acp 1.8.0 auto-approves file edits in every mode incl. read-only and for paths outside the workspace; no request_permission is ever sent (2026-09-04 probes)",
+        }
+    unverified:
+      - permission
   # add the next runtime here. Zero code changes.
