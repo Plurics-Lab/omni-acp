@@ -22,7 +22,7 @@ import { createTokenStore } from "../src/auth.js";
 import { createCatalog } from "../src/catalog.js";
 import { createWorkerRegistry } from "../src/registry.js";
 import type { AuthContext, WorkerRegistry } from "../src/types.js";
-import { coreScript, someWorkerId } from "./fake-core.js";
+import { coreScript, normalizerOptions, someWorkerId } from "./fake-core.js";
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./fake-core.js");
@@ -75,10 +75,11 @@ async function harness(over?: {
   const supervisor = fakeSupervisor();
   const envelopes: { workerId: string; envelope: EventEnvelope }[] = [];
 
+  const catalog = createCatalog(config);
   const registry = createWorkerRegistry({
     daemonId: DAEMON_ID,
     config,
-    catalog: createCatalog(config),
+    catalog,
     supervisor,
     responder: { decide: () => ({ response: null, record: {} as never }) },
     clock: fakeClock(),
@@ -92,6 +93,7 @@ async function harness(over?: {
   return {
     registry,
     supervisor,
+    catalog,
     config,
     user: tokens.contextFor("user", "cli"),
     other: tokens.contextFor("other"),
@@ -134,6 +136,29 @@ describe("WorkerRegistry.create (H5, H14)", () => {
     const h = await harness();
     const handle = await h.registry.create(request({ cwd: join(root, ".", "") }), h.user);
     expect(handle.snapshot().cwd).toBe(root);
+  });
+
+  it("builds the Normalizer with the descriptor, the cwd and a LAZY modes thunk (§12.3 row 11)", async () => {
+    normalizerOptions.length = 0;
+    const h = await harness();
+    const handle = await h.registry.create(request({ cwd: join(root, ".", "") }), h.user);
+
+    expect(normalizerOptions).toHaveLength(1);
+    const o = normalizerOptions[0]!;
+    // The RESOLVED quirk table (§17.2). Without it the map runs against `DEFAULT_V1_PROFILE`,
+    // reads no vendor extension, and every agent looks like a generic v1 one.
+    expect(o["descriptor"]).toEqual(h.catalog.descriptor("example"));
+    // §12.5: the realpath'd cwd, so a reconstructed vendor patch names paths `git apply` takes.
+    expect(o["cwd"]).toBe(root);
+
+    // LAZY, and that is the whole point: the catalogue only exists after `session/new`, which is
+    // after this options object was built. A thunk that had captured a value would be null here
+    // forever, and row 11 would emit `options: []` for the life of every worker.
+    const modes = o["modes"] as () => Record<string, unknown> | null;
+    expect(typeof modes).toBe("function");
+    expect(modes()).toEqual(handle.snapshot().capabilities?.modes);
+    expect(modes()).not.toBeNull();
+    expect((modes() as { availableModes?: unknown[] }).availableModes).toHaveLength(2);
   });
 
   it("rejects an unknown agent with 400 and a bad cwd with 403 — and spawns nothing", async () => {

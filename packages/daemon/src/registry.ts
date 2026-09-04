@@ -381,6 +381,11 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           cancelGraceMs: o.config.turn.cancelGraceMs,
           descriptor: runtime,
           ids: { synth: (prefix: string) => `${prefix}_${o.ids.request()}` },
+          // The row's `capabilities` are the PERSISTED ones until this worker wakes and
+          // handshakes again, at which point the handle carries the fresh catalogue. Reading
+          // through the entry each time is what makes both true without a second thunk.
+          modes: () => entries.get(workerId)?.handle.snapshot().capabilities?.modes ?? null,
+          cwd: row.snapshot.cwd,
         }),
         responder: o.responder,
         limits: {
@@ -618,6 +623,20 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const runtime = o.catalog.descriptor(req.agent);
       const runtimeId = o.catalog.list().find((e) => e.id === req.agent)?.runtimeId;
 
+      /**
+       * The handshake's `modes` catalogue, read LAZILY (M1-WP-B's `NormalizerOptions.modes`).
+       *
+       * §12.3 row 11 synthesizes the `mode` config option from it, and without it the map emits
+       * `options: []` — honest, but empty. The catalogue only exists after `session/new`, which
+       * is after the Normalizer is constructed, so the thunk closes over the handle this
+       * `createWorker` is about to return. Every `mapUpdate` that could read a non-empty answer
+       * runs after that assignment; the replay between a `session/load` request and its response
+       * is the one window where it is still null, and `options: []` is the right answer there.
+       */
+      let built: WorkerHandle | null = null;
+      const modesOf = (): Readonly<Record<string, unknown>> | null =>
+        built?.snapshot().capabilities?.modes ?? null;
+
       try {
         const handle = await createWorker(
           {
@@ -641,6 +660,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               // Deterministic per worker: the map stays PURE by taking its ids from outside
               // (§5.7), and `IdGen.request()` is the daemon's one id source.
               ids: { synth: (prefix: string) => `${prefix}_${o.ids.request()}` },
+              modes: modesOf,
+              // §12.5: a reconstructed vendor patch names paths `git apply` accepts, which it
+              // cannot do without the directory the agent's relative paths are relative to.
+              cwd,
             }),
             responder: o.responder,
             lease: leaseFor(auth.asClientRef(), workerId, log),
@@ -664,6 +687,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           },
           signal,
         );
+        built = handle;
 
         const entry: Entry = {
           id: workerId,

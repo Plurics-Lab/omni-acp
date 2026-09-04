@@ -1,7 +1,7 @@
-import { readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   DaemonConfig,
@@ -128,11 +128,16 @@ describe("ProbeService — one throwaway process (§17.4, H16)", () => {
   });
 
   it("leaves no temp directory behind", async () => {
-    const before = (await readdir(tmpdir())).filter((e) => e.startsWith("omni-probe-claude"));
     const f = await fixture();
     await f.service.probe("claude", {}, auth());
-    const after = (await readdir(tmpdir())).filter((e) => e.startsWith("omni-probe-claude"));
-    expect(after).toEqual(before);
+
+    // The workspace THIS probe made, named by the process it launched into it — not a
+    // before/after scan of the shared `os.tmpdir()`, which races every other test file probing
+    // an agent called "claude" in a parallel worker and made this case flaky.
+    const cwd = f.supervisor.spawnCalls[0]?.cwd;
+    expect(cwd).toBeDefined();
+    expect(basename(cwd!)).toMatch(/^omni-probe-claude/);
+    expect(existsSync(cwd!), `${String(cwd)} must be removed once the probe is done`).toBe(false);
   });
 
   it("403s a forbidden agent BEFORE any process exists", async () => {

@@ -382,6 +382,18 @@ const CAPABILITIES = {
   loadSession: false,
   promptCapabilities: null,
   supportsSessionClose: false,
+  /**
+   * v1 `NewSessionResponse.modes`, which a real handshake produces and §12.3 row 11 needs to
+   * synthesize the `mode` config option. Present here so the registry's lazy `modes` thunk has
+   * something to find — a double that answered `null` would make that wiring untestable.
+   */
+  modes: {
+    currentModeId: "default",
+    availableModes: [
+      { id: "default", name: "Manual" },
+      { id: "acceptEdits", name: "Accept edits" },
+    ],
+  } as Readonly<Record<string, unknown>>,
 };
 
 export async function testCreateWorker(
@@ -666,7 +678,18 @@ export async function testCreateWorker(
 }
 
 /** A normalizer that synthesizes nothing: the fake worker writes the lifecycle itself. */
-export function testNormalizer(): Normalizer {
+/**
+ * Every options object the registry handed to `createNormalizer`, newest last.
+ *
+ * The registry is the ONLY producer of a real `NormalizerOptions` in this repo, and several of
+ * its fields (`modes`, `cwd`, `descriptor`) are the difference between the map reading the
+ * resolved quirk table and reading `DEFAULT_V1_PROFILE`. A double that swallowed them silently
+ * would let that wiring rot with every test still green.
+ */
+export const normalizerOptions: Record<string, unknown>[] = [];
+
+export function testNormalizer(o?: Record<string, unknown>): Normalizer {
+  if (o !== undefined) normalizerOptions.push(o);
   return {
     sourceProtocolVersion: 1,
     slice: "m0-lifecycle",
