@@ -442,7 +442,7 @@ GET    /v1/fs/read?path= · /v1/fs/list?path=        # 受 cwd 白名单约束
 
 - **未知方法透传**：client→agent 不认识的方法原样转发；agent→client 不认识的请求回 `-32601`（别让 agent 干等）。`_meta` 全程保留。
 - **厂商扩展**：`session/set_model` / `session/set_options` / `session/notification` 等由 Runtime 描述符登记，Normalizer 按描述符处理（`set_model` 失败 → fail；`set_options` 失败 → warn）。
-- **turn 收尾顺序**：等静默窗口 → 关 stdin → 带 grace 排空 stdout/stderr → cancel。直接在 prompt 响应处 cancel 会丢最后一段回答。
+- **turn 收尾顺序**：等静默窗口 → cancel → 关 stdin → 带 grace 排空 stdout/stderr → terminate。直接在 prompt 响应处 cancel 会丢最后一段回答。（更正，见 CONTRACTS 裁决 M1-R4a：`session/cancel` 走的是 agent 的 stdin，先关 stdin 再 cancel 等于没发；静默窗口仍在最前，语料 finding 14 的理由不变。）
 - **`end_turn` ≠ 成功**：stderr 出现 429 / token 过期等终态错误时把状态提升为 failed。
 - **mcpCapabilities 过滤**：`initialize` 返回的 `mcpCapabilities` 决定哪些 http/sse 条目能进 `session/new`；有些 runtime 不声明该块但接受 stdio，描述符里登记容忍。
 

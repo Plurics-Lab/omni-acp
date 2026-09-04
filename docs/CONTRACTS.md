@@ -138,7 +138,7 @@ M0 rows L1–L13 stand unchanged and are not restated except where M1 alters the
 | L20 | **`422 not_resumable` and `423 lease_held` become reachable.** No new error codes: DESIGN §5.4's table is unchanged and both codes were reserved in M0 (§9).                                                                                                                                                                          |
 | L21 | **Runtime descriptors** (builtin ⊕ config ⊕ probe), a **vendor-extension registry with preference order over several spellings per capability** and `-32601` learning, and error classification keyed on **code + a JSON pointer into `data`** — never on message text (F17, F18). §17.                                              |
 | L22 | **`POST /v1/agents/{id}/probe`** + an on-disk probe cache, and `AgentCatalogEntry.probed` populated from it. §17.5.                                                                                                                                                                                                                   |
-| L23 | **Turn close-out: two ladders** — `settle` (per turn: quiet window, unchanged from M0) and `close_out` (teardown: quiet → close stdin → drain → `session/cancel` → terminate). `closeStdin()` still never appears at turn end (§13, ruling M1-R4).                                                                                     |
+| L23 | **Turn close-out: two ladders** — `settle` (per turn: quiet window, unchanged from M0) and `close_out` (teardown: quiet → `session/cancel` → close stdin → drain → terminate; the cancel precedes the stdin EOF because it travels on stdin, ruling M1-R4a). `closeStdin()` still never appears at turn end (§13, ruling M1-R4).                                                                                     |
 | L24 | **Config-driven compat suite** (`tests/compat/`) — the agent list is YAML, one real entry today (`claude-acp`), and adding an agent is a YAML edit with **zero code changes**, proven by a test. Skips are reported with a source and a reason; a skip with no source is a failure. §18.                                              |
 
 ### 2.3 What is OUT of M1 — deferred, one line each
@@ -3450,6 +3450,7 @@ design doc, the design doc is what gets amended (M1-R4).
 | M1-R2 | Restoring `head` after a restart | **`max(durable head_seq, max(seq))`** (P2). `max(seq)` alone resets to 0 after total eviction and restarts one worker's sequence at 1; `head_seq` alone is stale between debounced flushes. Named regression test that fails on a planted `max(seq)`. |
 | M1-R3 | `available_commands_update` — 87.8 % of update bytes (F13) | **Stream in full, store by content digest** (P1's mechanism), with **drop-before-append** as the descriptor escape hatch (P2's rule), and **store-but-do-not-stream forbidden** (P2's argument, against P3). Digesting costs nothing (23 payloads → 2), loses no capability, and keeps `read(0)` deep-equal; withholding a stored envelope from the live tail would make `?since=` and the live stream disagree, which is the one corruption `?since=` exists to prevent. |
 | M1-R4 | DESIGN §6.2's close-out chain vs CONTRACTS §6.5's "`closeStdin` only in `terminate()`" | **Two ladders** (P1's framing, P3's independent confirmation). `settle` per turn = quiet window only; `close_out` on teardown = quiet → stdin → drain → cancel → terminate. Read per-turn, §6.2 kills turn 2; read as forced termination it is exactly right. §6.5 stands unchanged. |
+| M1-R4a | The shipped CLOSE_OUT ladder runs `quiet → cancel → close_stdin → drain → terminate`, transposing rungs 2 and 4 of M1-R4's chain | **The documents are amended, not the code.** `session/cancel` is a REQUEST and it travels on the agent's stdin; rung `close_stdin` means "no more requests are coming", so a cancel spelled after it reaches nobody and its write rejects into a floating promise in `worker.ts`'s `#perform`. The transposition keeps every rung, every grace and every deadline, and keeps corpus finding 14's reason intact because the quiet window is still first. Evidence, as tests rather than argument: `packages/core/test/normalizer/ladder.test.ts` drives the five rungs at the documented deadlines, and `packages/core/test/e2e/close-out-ladder.test.ts` asserts the order FROM THE AGENT'S SIDE — the agent receives `session/cancel` while its stdin is still open. §13.2 and DESIGN §6.2 are rewritten to match. |
 | M1-R5 | Replay envelopes: mark, dedup, or drop? | **Mark by default** (`replay: true`, stored + streamed); `drop_duplicates` is opt-in config. Dedup correctness rests on a single agent at a single version (F14, verified but narrow), and a false-positive drop **silently loses real history** — including a session created by another tool, where replay is the *only* source — whereas a marked duplicate is filterable by every consumer. `reduceTurn` skips replay; the SDK filters it; `ResumeReport.replayDropped` makes the choice visible. The envelope field stays the literal `true` M0 reserved; the audit lives on `ResumeReport`. |
 | M1-R6 | The `-32002` cwd mismatch: `unknown` (P1/P2) or `rejected_transient` (P3)? | **`unknown`, with `hint: "cwd_mismatch"`.** Both keep the pointer, so the *action* is identical; `unknown` is the honest label for "we could not tell" while `transient` asserts a cause. **And a correction the proposals missed**: F15 — that response appears in **no committed transcript**. It becomes a unit-test regression lock *plus* a compat case that re-observes it live, rather than a quirk asserted from a note. |
 | M1-R7 | `rejected_permanent` ⇒ `422`, or P2's `onResumeRejected: "new_session"`? | **`422` only; no `new_session` in M1.** A context-free session that *looks* resumed is undetectable from the outside; D2 says clear the pointer and rebuild *by policy*, and the policy layer is M2. One fewer knob to re-litigate. |
@@ -3682,7 +3683,7 @@ long-lived across turns where multica's processes are one-shot, and M0 ships a t
 
 Both are right about different things. Read as a **per-turn** sequence, §6.2 is wrong: closing stdin ends
 the process's ability to receive the next `session/prompt`. Read as the **forced-termination** order it is
-exactly right, and it is what M0's cancel path is missing. **M1 ships both, named** (ruling M1-R4), and
+exactly right, and it is what M0's cancel path is missing. **M1 ships both, named** (rulings M1-R4 and M1-R4a), and
 §6.5's rule is unchanged: `closeStdin()` never appears at turn end.
 
 ### 13.2 The two ladders
@@ -3696,16 +3697,22 @@ SETTLE — every turn. Unchanged from M0 §7.2 except that `idle` now carries `u
 CLOSE_OUT — teardown only: DELETE, hibernate, daemon shutdown, cancel timeout.
   close_requested
     rung 1  quiet window, capped at hardMs        # let the last chunk land
-    rung 2  action "close_stdin"                  # EOF: no more requests are coming
-    rung 3  action "drain", wait drainGraceMs for stdoutEnded, FORWARDING everything
-    rung 4  action "cancel" → session/cancel, wait cancelGraceMs
+    rung 2  action "cancel" → session/cancel, wait cancelGraceMs
+    rung 3  action "close_stdin"                  # EOF: no more requests are coming
+    rung 4  action "drain", wait drainGraceMs for stdoutEnded, FORWARDING everything
     rung 5  action "terminate" → §6.5's escalation ladder (SIGTERM → grace → SIGKILL / taskkill)
 ```
 
-Corpus finding 14 is what forces rungs 1 and 4 into that order: in scenario `06` a `usage_update` arrived
+Rungs 2 and 4 are **transposed** relative to this document's first draft and to DESIGN §6.2 — see ruling
+M1-R4a. `session/cancel` is carried on the agent's **stdin**, so a cancel sent after the `close_stdin` rung
+reaches nobody: rung `close_stdin`'s own comment ("EOF: no more requests are coming") forbids a later rung
+that sends one.
+
+Corpus finding 14 is what forces the QUIET window to come first: in scenario `06` a `usage_update` arrived
 53 ms **after** our `session/cancel` and ~4 ms before the prompt response. Cancelling at the response
 boundary — or emitting `idle` the instant `session/prompt` resolves — orders that update *after* an event
-that belongs to the turn.
+that belongs to the turn. That reason is untouched by the transposition, because the quiet window is still
+rung 1.
 
 `CloseOutAction` is the **only** side effect the reducer requests; the Worker performs it. The reducer stays
 pure, which is what keeps the whole ladder unit-testable with `fakeClock()` and no process, and it means

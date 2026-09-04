@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { createBaselineResponder } from "@omni-acp/core";
-import type { MappedPermissionRequest, PermissionOption } from "@omni-acp/protocol";
-import { fakeClock } from "@omni-acp/testkit";
+import type {
+  EventEnvelope,
+  InteractionPayload,
+  MappedPermissionRequest,
+  PermissionDecision,
+  PermissionOption,
+  PolicyDecisionPayload,
+} from "@omni-acp/protocol";
+import { fakeClock, scriptedAgent } from "@omni-acp/testkit";
+import { flush, harness, OWNER, TEXT } from "./support/harness.js";
 
 const option = (optionId: string, kind: string, name = optionId): PermissionOption =>
   ({ optionId, kind, name }) as PermissionOption;
@@ -168,5 +176,118 @@ describe("createBaselineResponder — the recorded decision", () => {
     expect(d.response).toBeNull();
     expect(d.record.offered).toEqual([]);
     expect(d.record.title).toBe("");
+  });
+});
+
+/**
+ * §12.6: D4 rule 1 is enforced "at the one place that emits the answer", not only inside the
+ * responder that happens to be wired.
+ *
+ * `createBaselineResponder` is structurally safe — it picks from `offeredOptions(req)` — but
+ * `DaemonDeps.responder` is a public injection point and it is the seam M2's policy engine lands
+ * on. Corpus 09 is the recording of what a violation costs and, crucially, of why it cannot be
+ * caught downstream: the agent failed every tool call and still ended the turn `end_turn`, so
+ * `stopReason` reports nothing. The invariant therefore has to be a property of the BOUNDARY.
+ */
+describe("the Worker refuses to forward an unoffered optionId (§12.6, D4 rule 1)", () => {
+  /** The rogue responder from `normalizer/permission.test.ts`, as a wired dependency. */
+  const rogue = {
+    decide(req: MappedPermissionRequest): PermissionDecision {
+      const invented = "undefined";
+      return {
+        response: { outcome: { outcome: "selected", optionId: invented } },
+        record: {
+          requestId: "planted",
+          title: req.title,
+          decision: "allow",
+          rule: "planted:invented-option",
+          optionId: invented,
+          offered: req.options,
+          toolCallId: req.toolCallId,
+        },
+      } as PermissionDecision;
+    },
+  };
+
+  it("answers -32603 rather than sending the invented id", async () => {
+    const h = harness();
+    const agent = scriptedAgent();
+    h.supervisor.enqueue(agent);
+    const w = await h.create({ overrides: { responder: rogue } });
+
+    const accepted = await w.prompt([TEXT("please edit")], OWNER);
+    await flush();
+    const answer = await agent.requestPermission([
+      option("allow", "allow_once"),
+      option("reject", "reject_once"),
+    ]);
+
+    // The agent sees rule 4's answer — an internal error — and NEVER the id nobody offered.
+    // Not `outcome: "cancelled"` either (rule 5): cancelling would kill the whole turn over one
+    // action our own responder got wrong.
+    expect(answer).toEqual({ error: -32603 });
+
+    const decision = h.log.all.find((e: EventEnvelope) => e.kind === "omni.policy_decision");
+    const dp = (decision as EventEnvelope).payload as PolicyDecisionPayload;
+    // Recorded as an ERROR, with no optionId: the audit trail must not claim we allowed
+    // something, and must not carry an id that was never on the menu.
+    expect(dp.decision).toBe("error");
+    expect(dp.optionId).toBeNull();
+    expect(dp.rule).toBe("planted:invented-option");
+    expect(dp.offered.map((o) => o.optionId)).toEqual(["allow", "reject"]);
+
+    const interaction = h.log.all.find((e: EventEnvelope) => e.kind === "acp.interaction");
+    const ip = (interaction as EventEnvelope).payload as InteractionPayload;
+    expect(ip.status).toBe("failed");
+    expect(ip.answer).toEqual({ optionId: null, by: "baseline" });
+    expect(interaction?.turnId).toBe(accepted.turnId);
+
+    agent.resolvePrompt("end_turn");
+    await flush();
+    h.clock.advance(250);
+    await flush();
+    await w.close("client_request");
+  });
+
+  it("still forwards an OFFERED id — the check is the menu, not the responder's identity", async () => {
+    const h = harness();
+    const agent = scriptedAgent();
+    h.supervisor.enqueue(agent);
+    // A responder that picks a real option, by a rule of its own: it must go through untouched,
+    // or the boundary check would be a second policy rather than an invariant.
+    const w = await h.create({
+      overrides: {
+        responder: {
+          decide: (req: MappedPermissionRequest): PermissionDecision =>
+            ({
+              response: { outcome: { outcome: "selected", optionId: "allow" } },
+              record: {
+                requestId: "picked",
+                title: req.title,
+                decision: "allow",
+                rule: "test:picks-allow",
+                optionId: "allow",
+                offered: req.options,
+                toolCallId: req.toolCallId,
+              },
+            }) as PermissionDecision,
+        },
+      },
+    });
+
+    await w.prompt([TEXT("please edit")], OWNER);
+    await flush();
+    expect(
+      await agent.requestPermission([
+        option("allow", "allow_once"),
+        option("reject", "reject_once"),
+      ]),
+    ).toBe("allow");
+
+    agent.resolvePrompt("end_turn");
+    await flush();
+    h.clock.advance(250);
+    await flush();
+    await w.close("client_request");
   });
 });

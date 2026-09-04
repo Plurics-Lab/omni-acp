@@ -81,7 +81,7 @@ export function createLease(o: LeaseOptions): Lease {
 
   /** null = unheld. Stored in WIRE form: a holder is an identity, never a cached fence. */
   let holder: ClientRefWire | null = null;
-  let epoch = 0;
+  let epoch = o.initialEpoch ?? 0;
   let acquiredAtMs: number | null = null;
   /** The TTL in force for the CURRENT holder — `acquire({ttlMs})` overrides the config's. */
   let ttlMs = config.ttlMs;
@@ -102,11 +102,15 @@ export function createLease(o: LeaseOptions): Lease {
    * The epoch starts at 1 rather than 0 when somebody holds it, so that "epoch" reads as "how
    * many times control has been taken" and a fence of 0 — the value `alwaysGrantedLease` reports
    * for a lease that can never be contested — is never accidentally valid here.
+   *
+   * `initialEpoch` (a REHYDRATED worker, §16.1 rule L7) shifts that baseline rather than
+   * replacing it: the seeded holder still counts as one more taking, so an unseeded holder-ful
+   * lease is still born at epoch 1 and nothing outside boot adoption changes.
    */
   const seedHolder = o.initialHolder ?? null;
   if (seedHolder !== null) {
     holder = toWire(seedHolder);
-    epoch = 1;
+    epoch += 1;
     acquiredAtMs = clock.now();
     lastUseMs = acquiredAtMs;
     expiresAtMs = ttlMs > 0 ? acquiredAtMs + ttlMs : null;

@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
-  blankOutNonCode,
+  locate,
   packageSources,
+  sourceFile,
   type SourceFile,
 } from "../../../testkit/test/arch/source-scan.js";
 
@@ -57,7 +59,7 @@ const DECLARATION_KEYWORDS = new Set([
 ]);
 
 export function plant(path: string, text: string): SourceFile {
-  return { path, absolute: path, text, code: blankOutNonCode(text) };
+  return sourceFile({ path, absolute: path, text });
 }
 
 function lineOf(text: string, index: number): number {
@@ -82,7 +84,11 @@ export function moduleReferences(file: SourceFile): string[] {
     if (/\btypeof\s+import\s*\(\s*$/.test(before)) continue;
     // `import type … from "node:child_process"` — erased before it reaches a runtime.
     if (/\bimport\s+type\b[^;]*\bfrom\s*$/.test(before)) continue;
-    hits.push(`${file.path}:${String(lineOf(file.text, at))}`);
+    // `locate` rather than `path:line`: a violation carries the hash and byte length of the
+    // bytes this scan read, plus the 80 characters around the match. A guard that reports an
+    // impossible hit — the specifier occurs only inside a backtick-quoted doc comment, which
+    // `MODULE_SPECIFIER` cannot match — must say whether it read the file the repository holds.
+    hits.push(locate(file, at, lineOf(file.text, at)));
   }
   return hits;
 }
@@ -131,7 +137,7 @@ export function spawnCallSites(file: SourceFile): string[] {
     const openParen = file.code.indexOf("(", identifierAt + name.length);
     if (openParen === -1) continue;
     if (isDeclaration(file.code, identifierAt, openParen)) continue;
-    hits.push(`${file.path}:${String(lineOf(file.code, identifierAt))} (${name})`);
+    hits.push(`${locate(file, identifierAt, lineOf(file.code, identifierAt))} (${name})`);
   }
   return hits;
 }
@@ -186,6 +192,24 @@ describe("guard: no-direct-spawn", () => {
         expect(violations([file])).not.toEqual([]);
       });
     }
+
+    it("names the BYTES it scanned, so an impossible hit is attributable", () => {
+      // A red here once reported a violation at a line whose only occurrence of the specifier is
+      // backtick-quoted inside a doc comment — a match `MODULE_SPECIFIER` cannot produce from the
+      // file as it is on disk. The evidence a reader needs is therefore ON the violation: the
+      // hash and byte length of the text this process read, and the characters around the match.
+      // The next such red either names a real import (reproducible by hashing the file) or shows
+      // that the scanned bytes were not the file's, which is a toolchain report, not a fix here.
+      const source = `import { spawn } from "node:child_process";\nspawn("x", []);\n`;
+      const file = plant("packages/daemon/src/planted.ts", source);
+      const hit = violations([file])[0] ?? "";
+      expect(hit).toContain("packages/daemon/src/planted.ts:1");
+      expect(hit).toContain(`sha256=${file.sha256.slice(0, 16)}`);
+      expect(hit).toContain(`bytes=${String(file.bytes)}`);
+      expect(hit).toContain("node:child_process");
+      // The hash is of the text, not of the path or of some cached copy.
+      expect(file.sha256).toBe(createHash("sha256").update(source, "utf8").digest("hex"));
+    });
 
     it("would NOT have caught it inside the allowlisted file", () => {
       const file = plant(ALLOWED, `import { spawn } from "node:child_process";\nspawn(a, b);\n`);

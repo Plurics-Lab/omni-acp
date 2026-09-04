@@ -36,6 +36,7 @@ import {
   type WorkerHandle,
   type CloseOutAction,
   type MappedPermissionRequest,
+  type PermissionDecision,
   type AcpLinkLike,
   type OrphanRecord,
   type ResumeReport,
@@ -368,6 +369,19 @@ export class Worker implements WorkerHandle {
   /** `StderrTail.onLine`'s unsubscribe for the CURRENT process; null when there is none. */
   #stderrUnsub: (() => void) | null = null;
 
+  /**
+   * §16.1 rule L6: "Expiry never fires mid-turn. `pinExpiry()` is taken when the turn goes
+   * `running` and released when it settles."
+   *
+   * The un-pin handle for the CURRENT turn, or null when no turn is running. It lives here
+   * rather than in the Normalizer because the LEASE is the Worker's dependency and the turn's
+   * lifetime is exactly `#state === "running"` — the window in which no gated verb is called, so
+   * `renewOnUse` renews nothing and a 15-minute default TTL would otherwise expire under a
+   * 16-minute turn, hand the worker to a peer mid-answer, and 423 the client that is still
+   * reading the stream it started.
+   */
+  #leasePin: (() => void) | null = null;
+
   #tickTimer: TimerHandle | null = null;
   #cancelTimer: TimerHandle | null = null;
   #exitGraceTimer: TimerHandle | null = null;
@@ -502,6 +516,26 @@ export class Worker implements WorkerHandle {
     };
   }
 
+  /**
+   * Rule L6's release half. Idempotent twice over — the handle `pinExpiry()` returns ignores a
+   * second call, and the field is nulled here — so every exit from `running` may call it
+   * blindly: the two early returns in `prompt()`, the settle in `#afterStep`, hibernate, and
+   * `#doClose`.
+   */
+  #unpinLease(): void {
+    const release = this.#leasePin;
+    if (release === null) return;
+    this.#leasePin = null;
+    try {
+      release();
+    } catch (e) {
+      // A lease that cannot un-pin must not fail a turn that has already ended. The worst case
+      // is a lease that outlives its TTL until the next sweep, which is strictly safer than an
+      // exception escaping a settle path.
+      this.#logger.warn("releasing the turn's lease pin failed", { error: String(e) });
+    }
+  }
+
   // ── the wire ───────────────────────────────────────────────────────────────
 
   async prompt(content: readonly unknown[], who: ClientRef): Promise<PromptAccepted> {
@@ -537,6 +571,10 @@ export class Worker implements WorkerHandle {
     const turnId = this.#deps.ids.turn();
     this.#state = "running";
     this.#currentTurnId = turnId;
+    // Rule L6, taken at the same instant the turn becomes `running` and before the first thing
+    // that can throw: a pin held over an aborted admission is released by the catch below, but a
+    // pin taken after one would leave the window this exists to close.
+    this.#leasePin = this.#deps.lease.pinExpiry();
 
     // §7.1: the running marker is appended BEFORE the prompt bytes reach stdin, and `append` is
     // synchronous while the write is not — so appending first is sufficient, and it is what
@@ -553,11 +591,13 @@ export class Worker implements WorkerHandle {
     } catch (e) {
       this.#state = "ready";
       this.#currentTurnId = null;
+      this.#unpinLease();
       throw OmniError.from(e);
     }
     if (running === undefined) {
       this.#state = "ready";
       this.#currentTurnId = null;
+      this.#unpinLease();
       throw new OmniError(
         "internal",
         "normalizer did not synthesize state_update{running} for prompt_sent",
@@ -1139,7 +1179,13 @@ export class Worker implements WorkerHandle {
     this.#cancelTimer?.cancel();
     this.#cancelTimer = null;
     this.#currentTurnId = null;
-    if (this.#state === "running" && !this.#closing) {
+    // Rule L6's "released when it settles" — before the state envelope, so a subscriber that
+    // reads `ready` and immediately re-reads the lease never sees a pin over a finished turn.
+    this.#unpinLease();
+    // `#hibernating` joins `#closing` here for the same reason it exists in `prompt()`: a worker
+    // already on its way to `hibernated` (§15.1's `running -> hibernated, agent_crashed` row)
+    // must not announce `ready` on the way past.
+    if (this.#state === "running" && !this.#closing && !this.#hibernating) {
       this.#setState("ready", "turn_end", { turnId: settledTurn });
     }
   }
@@ -1190,8 +1236,36 @@ export class Worker implements WorkerHandle {
     // The envelope below still carries the RAW request verbatim — `acp.interaction` is the audit
     // record, and an audit of a reshaped object audits our reshaping (§7.5).
     const mapped: MappedPermissionRequest = this.#deps.normalizer.mapPermissionRequest(req);
-    const decision = this.#deps.responder.decide(mapped);
+    const decided = this.#deps.responder.decide(mapped);
     const turnId = this.#currentTurnId;
+
+    // §12.6: D4 rule 1 ("only ever select an optionId the agent actually offered") is enforced
+    // HERE, at the one place that emits the answer, and not only inside the responder that
+    // happens to be wired today. `DaemonDeps.responder` is a public injection point and it is
+    // the seam M2's policy engine lands on; corpus 09 is the recording of what a violation
+    // costs, and its lesson is that it CANNOT be caught downstream — the agent failed every
+    // tool call and still ended the turn `end_turn`, so `stopReason` reports nothing. A rule
+    // that only one implementation upholds is a property of that implementation.
+    //
+    // The violation is folded into rule 4's existing answer — `response: null`, the record
+    // stamped `decision: "error"` with `optionId: null`, and -32603 on the wire — because that
+    // is the shape a caller and an auditor already know how to read. Never the invented id
+    // (rule 1), and never `outcome: "cancelled"` (rule 5): cancelling would kill the whole turn
+    // over one action our own responder got wrong.
+    const offeredIds = new Set(mapped.options.map((o) => o.optionId));
+    const selected = decided.record.optionId;
+    const forged = decided.response !== null && (selected === null || !offeredIds.has(selected));
+    const decision: PermissionDecision = forged
+      ? { response: null, record: { ...decided.record, decision: "error", optionId: null } }
+      : decided;
+    if (forged) {
+      this.#logger.error("the permission responder selected an option the agent never offered", {
+        rule: decided.record.rule,
+        optionId: selected,
+        offered: [...offeredIds],
+      });
+    }
+
     const answered = decision.response !== null;
     const optionId = decision.record.optionId;
 
@@ -1224,10 +1298,13 @@ export class Worker implements WorkerHandle {
 
     if (decision.response === null) {
       // D4 rule 4: nothing acceptable was offered, so we answer with a JSON-RPC error rather
-      // than inventing an option id (rule 1) or cancelling the whole turn (rule 5).
+      // than inventing an option id (rule 1) or cancelling the whole turn (rule 5). The forged
+      // case above lands here too, with its own message, because the ANSWER is the same one.
       throw AcpRequestError.internalError(
         { offered: decision.record.offered },
-        "no acceptable permission option was offered",
+        forged
+          ? "the selected permission option was not offered"
+          : "no acceptable permission option was offered",
       );
     }
     return decision.response;
@@ -1319,6 +1396,19 @@ export class Worker implements WorkerHandle {
       detail: { code: exit?.code ?? null, signal: exit?.signal ?? null },
     });
 
+    // §15.1's `running -> hibernated` row, and DESIGN §3.2's 进程崩溃：agent 支持 resume →
+    // 转 hibernated 并标记 crashed. A resumable agent that dies mid-turn keeps its session
+    // pointer and sleeps; only a NON-resumable one closes. This is the same convergence boot
+    // adoption already performs on an abandoned row (`boot-recovery.ts` `adoptRow`), and without
+    // it a crash loses a session that a daemon RESTART would have preserved — the next prompt is
+    // a 410 rather than a wake.
+    if (!clean && this.#mayHibernateAfterCrash()) {
+      void this.#hibernateAfterCrash(error, stderrTail).catch((e: unknown) => {
+        this.#logger.error("hibernate after agent death failed", { error: String(e) });
+      });
+      return;
+    }
+
     void this.#closeWith(reason, {
       error,
       stderrTail,
@@ -1327,6 +1417,63 @@ export class Worker implements WorkerHandle {
     }).catch((e: unknown) => {
       this.#logger.error("close after agent death failed", { error: String(e) });
     });
+  }
+
+  /**
+   * The exact predicate `boot-recovery.ts`'s `isResumable` applies to an abandoned ROW, asked of
+   * a LIVE worker: a session pointer to resume with, a strategy that knows how to reopen it, and
+   * a spelling the agent advertised at handshake. A `starting` worker is excluded — a handshake
+   * that died has no session yet, and its failure edges (`spawn_failed`, `handshake_error`) are
+   * closes by §15.1.
+   */
+  #mayHibernateAfterCrash(): boolean {
+    if (this.#closing || this.#hibernating) return false;
+    if (this.#state !== "ready" && this.#state !== "running") return false;
+    if (this.#sessionId === null || this.#deps.session === undefined) return false;
+    return (this.#capabilities?.resume.method ?? null) !== null;
+  }
+
+  /**
+   * `running`/`ready` -> `hibernated`, reason `agent_crashed`, `crashed: true` (§15.1).
+   *
+   * The ORDER is §15.2's, minus the cooperative rungs there is nobody left to cooperate with:
+   *
+   *  1. the `omni.error` FIRST (§7.3: cause before consequence). It goes through
+   *     `#appendCloseError`, so a mid-turn death settles the turn through the Normalizer's
+   *     `process_gone` rather than fabricating an idle the agent never reported (§7.3).
+   *  2. the process tree, reclaimed with `force` — the leader is already gone, so rung 0 without
+   *     it would REPORT a surviving tree instead of reclaiming it (§6.7's zombie).
+   *  3. the lease, released: a holder cannot control a worker with no process (D5, §15.2 step 3).
+   *  4. the state envelope, carrying `crashed: true` and this generation.
+   *
+   * NO `session/close`: the pointer is the entire value being preserved, exactly as in
+   * `#doHibernate`.
+   */
+  async #hibernateAfterCrash(error: OmniError, stderrTail: string): Promise<void> {
+    // Synchronous, before the first await: `prompt()` reads `#hibernating` as "busy", so a
+    // prompt landing mid-reclaim cannot be handed a link that is already gone (§15.2).
+    this.#hibernating = true;
+    this.#tickTimer?.cancel();
+    this.#tickTimer = null;
+    this.#cancelTimer?.cancel();
+    this.#cancelTimer = null;
+    this.#exitGraceTimer?.cancel();
+    this.#exitGraceTimer = null;
+    try {
+      this.#appendCloseError(error, stderrTail, "agent_crashed");
+      this.#currentTurnId = null;
+      this.#unpinLease();
+      await this.#reclaimProcess({ force: true });
+      this.#deps.lease.releaseForHibernate();
+      this.#hibernatedAt = this.#deps.clock.iso();
+      this.#setState("hibernated", "agent_crashed", {
+        turnId: null,
+        generation: this.#generation,
+        crashed: true,
+      });
+    } finally {
+      this.#hibernating = false;
+    }
   }
 
   // ── close ──────────────────────────────────────────────────────────────────
@@ -1359,6 +1506,9 @@ export class Worker implements WorkerHandle {
   async #doClose(reason: WorkerCloseReason, extras: CloseExtras): Promise<CloseResult> {
     const previous = this.#state;
     this.#closeReason = reason;
+    // A close is an exit from `running` too, and the ladder below can await for seconds: a pin
+    // held across it would keep a dead worker's lease un-expirable (rule L6).
+    this.#unpinLease();
     this.#tickTimer?.cancel();
     this.#tickTimer = null;
     this.#cancelTimer?.cancel();

@@ -1,12 +1,16 @@
-import { mkdtemp, realpath } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HEADER, type AgentListResponse, type ProbeResponse } from "@omni-acp/protocol";
 import { fakeSupervisor, nullLogger, seqIds, type FakeSupervisor } from "@omni-acp/testkit";
 import { createDaemon } from "../../src/create-daemon.js";
 import type { Daemon } from "../../src/types.js";
 import { asScriptedAgent, probeFixtureAgent } from "../probe-agent.js";
+import { removeTempRoots, tempRoot } from "../support/temp-dirs.js";
+
+/** ~800 leaked `/tmp` directories per full run without this; see `support/temp-dirs.ts`. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./../fake-core.js");
@@ -27,7 +31,7 @@ async function build(o?: { agents?: unknown[] }): Promise<{
   supervisor: FakeSupervisor;
   dataDir: string;
 }> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "omni-http-probe-")));
+  const root = await tempRoot("omni-http-probe-");
   const dataDir = join(root, "data");
   const supervisor = fakeSupervisor();
   for (let i = 0; i < 4; i += 1) supervisor.enqueue(asScriptedAgent(probeFixtureAgent()));

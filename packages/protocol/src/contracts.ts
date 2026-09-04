@@ -545,6 +545,16 @@ export interface LeaseOptions {
   readonly config: ResolvedLeaseConfig;
   /** The creator, when `CreateWorkerRequest.lease` is `"take"`; null for `"observe"`. */
   readonly initialHolder?: ClientRef | null;
+  /**
+   * The epoch this lease RESUMES from. Ruling M1-R8 drops the HOLDER across a restart — a lease
+   * over a dead process is meaningless — but §16.1 rule L7 says the epoch is monotonic per
+   * worker, and boot adoption has already written `snapshot.lease.epoch + 1` into the row AND
+   * into the in-band `omni.lease{how:"daemon_restart"}` envelope the client reads. A rehydrated
+   * lease that restarted the count at 0 would hand the SAME number to two different generations,
+   * so a log replay would read 1 → 2 → 1 and `isStaleEpoch`'s exact equality would accept a fence
+   * from before the crash. Absent ⇒ 0, which is every non-rehydrated lease.
+   */
+  readonly initialEpoch?: number;
   /** Where `omni.lease` envelopes go. Absent ⇒ the audit trail is the `onChange` callback only. */
   readonly onEvent?: (e: LeaseEventPayload) => void;
 }

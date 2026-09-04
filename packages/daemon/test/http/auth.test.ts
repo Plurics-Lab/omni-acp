@@ -1,12 +1,16 @@
-import { mkdtemp, realpath } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HEADER } from "@omni-acp/protocol";
 import { fakeSupervisor, nullLogger, seqIds } from "@omni-acp/testkit";
 import { createDaemon } from "../../src/create-daemon.js";
 import type { Daemon } from "../../src/types.js";
 import { someWorkerId } from "../fake-core.js";
+import { removeTempRoots, tempRoot } from "../support/temp-dirs.js";
+
+/** ~800 leaked `/tmp` directories per full run without this; see `support/temp-dirs.ts`. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./../fake-core.js");
@@ -32,7 +36,7 @@ const AUTHENTICATED: { method: string; path: string }[] = [
 ];
 
 async function daemonWithToken(): Promise<Daemon> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "omni-http-auth-")));
+  const root = await tempRoot("omni-http-auth-");
   return await createDaemon(
     {
       dataDir: join(root, "data"),

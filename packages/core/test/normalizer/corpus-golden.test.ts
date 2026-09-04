@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,46 @@ import { emitScenario, GOLDEN_TURN, goldenNames } from "./support/emit.js";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIR = join(HERE, "golden");
 const EMIT = process.env["OMNI_CORPUS_EMIT"] === "1";
+
+/** `packages/core/test/normalizer` -> `<repo>/docs/research/transcripts/claude-acp-0.73.0`. */
+const TRANSCRIPTS = join(
+  HERE,
+  "..",
+  "..",
+  "..",
+  "..",
+  "docs",
+  "research",
+  "transcripts",
+  "claude-acp-0.73.0",
+);
+
+const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+
+/**
+ * The sha256 of every transcript this tier maps, checked in.
+ *
+ * It exists to make a red here ATTRIBUTABLE. The two inputs to `--check` are the recorded
+ * transcript and the checked-in envelope file, and a mismatch between the generated envelopes
+ * and the golden is normally a map regression — which is exactly what it should be reported as.
+ * But a failure has been observed whose generated value could not be produced from the corpus by
+ * any code path in this repository (a `title` upper-cased, with no `toUpperCase` anywhere in the
+ * tree). If the bytes this process reads are ever not the bytes on disk, this assertion fails
+ * FIRST, and says so, instead of the diff being read as a regression in `mapToolCall`.
+ *
+ * Updating a value here is a deliberate corpus change: the transcripts are the M1 ground truth
+ * and re-recording one is a decision, never a fixture refresh.
+ */
+const TRANSCRIPT_SHA256: Readonly<Record<string, string>> = {
+  "01-plain-answer": "40bcb3d5608b604b02b1af3088847661223977c3c54d09d2a54fb58299993bcf",
+  "02-tool-read": "326f3dca47156cd83b5c77cf479c03d41959ce150bc513aff540817e0f012fa7",
+  "03-tool-write-allowed": "de4d6d87c1bbc681d4ab93586fdd60561a20f0a215b3763f18064016dc1adb75",
+  "04-tool-write-denied": "4f2ddde0a1cb2aea8a9d37bed4e9da661b553aaddda6e03cb180e4597ec856ac",
+  "06-cancel-mid-turn": "688be99f90d07e55f980e51b25a593b01c585980d3bfcc909cf6351dd948033e",
+  "07-session-load": "1da0040c7d787c73fac45517b86d291de01672cc12c6eeb7e6e92f42f3391675",
+  "09-permission-bad-option-id": "e5751f54f6240932713ffb05e3e11fffaeb11e3351edb194e6dc0de2bc820844",
+  "10-tool-edit-existing": "3cccbae53f86e25f0d914f9b26745b06e0e6d2cf650b6e80794fcdfcbb34d994",
+};
 
 /**
  * The hand-written expectation. It is deliberately NOT a whole `TurnResult` dump: what §12.7(b)(8)
@@ -73,6 +114,17 @@ function generated(name: string): EventEnvelope[] {
   }
   expect(existsSync(file) ? "present" : `MISSING ${file}`).toBe("present");
 
+  // The INPUT first: a generation that ran over something other than the recorded transcript is
+  // not a map regression, and must not be reported as one.
+  const transcript = readFileSync(join(TRANSCRIPTS, `${name}.jsonl`), "utf8");
+  const transcriptHash = sha256(transcript);
+  expect(
+    transcriptHash,
+    `the transcript this process read is not the transcript on disk for ${name} ` +
+      `(${String(transcript.length)} chars). Re-recording the corpus is a deliberate change; ` +
+      "anything else is a read that did not return the file's bytes.",
+  ).toBe(TRANSCRIPT_SHA256[name]);
+
   // `--check`: the checked-in file must be identical to what the generator produces now.
   //
   // Compared through ONE canonical serialization rather than byte for byte, because the
@@ -81,7 +133,23 @@ function generated(name: string): EventEnvelope[] {
   // fail on every `pnpm format` instead of on a map change. Every byte that carries MEANING is
   // still compared: a changed key, value, order or count shows up here as a reviewable diff
   // rather than as a silently-updated fixture.
-  expect(canonical(JSON.parse(readFileSync(file, "utf8")))).toBe(canonical(envelopes));
+  const first = readFileSync(file, "utf8");
+  const fresh = canonical(envelopes);
+  if (canonical(JSON.parse(first)) === fresh) return envelopes;
+
+  // A real diff arrives here. Both inputs are re-read and reported alongside it — NOT retried:
+  // the assertion below still compares the same two values and still fails. What the second read
+  // buys is the answer to "did this process see the files the repository holds", which is the
+  // question a diff nobody can reproduce leaves open.
+  const second = readFileSync(file, "utf8");
+  const why = [
+    `golden ${name}: the checked-in envelopes differ from a fresh generation.`,
+    `  golden     sha256 (first read) = ${sha256(first)} (${String(first.length)} chars)`,
+    `  golden     sha256 (re-read)    = ${sha256(second)} (${String(second.length)} chars)`,
+    `  transcript sha256              = ${transcriptHash} (matches the checked-in value)`,
+    "If the two golden hashes differ from each other, this is not a map change.",
+  ].join("\n");
+  expect(canonical(JSON.parse(second)), why).toBe(fresh);
   return envelopes;
 }
 

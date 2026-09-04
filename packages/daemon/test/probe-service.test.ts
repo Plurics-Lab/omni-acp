@@ -1,8 +1,7 @@
 import { existsSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   DaemonConfig,
   OmniError,
@@ -16,6 +15,12 @@ import { systemClock } from "../src/clock.js";
 import { createProbeCache } from "../src/probe-cache.js";
 import { createProbeService, type ProbeService } from "../src/probe-service.js";
 import { asScriptedAgent, probeFixtureAgent } from "./probe-agent.js";
+import { removeTempRoots, tempRoot } from "./support/temp-dirs.js";
+
+/** See `support/temp-dirs.ts`: these suites leaked ~800 `/tmp` directories per full run. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 const clock = systemClock();
 
@@ -56,7 +61,7 @@ async function fixture(o?: {
   probe?: Record<string, unknown>;
   dataDir?: string;
 }): Promise<Fixture> {
-  const dataDir = o?.dataDir ?? (await mkdtemp(join(tmpdir(), "omni-probe-svc-")));
+  const dataDir = o?.dataDir ?? (await tempRoot("omni-probe-svc-"));
   const config = DaemonConfig.parse({
     dataDir,
     tokens: [{ id: "t", secretSha256: "a".repeat(64) }],
@@ -377,7 +382,7 @@ describe("ProbeService — per-request and per-agent config", () => {
   it("a per-request `timeoutMs` bounds the probe", async () => {
     const supervisor = fakeSupervisor();
     supervisor.enqueue(asScriptedAgent(probeFixtureAgent({ hangOn: "initialize" })));
-    const dataDir = await mkdtemp(join(tmpdir(), "omni-probe-svc-"));
+    const dataDir = await tempRoot("omni-probe-svc-");
     const config = DaemonConfig.parse({
       dataDir,
       tokens: [{ id: "t", secretSha256: "a".repeat(64) }],

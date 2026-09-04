@@ -672,8 +672,10 @@ function advance(
       // Transposing the two keeps every rung, every grace and every deadline, keeps corpus
       // finding 14's reason intact (the quiet window still comes FIRST, so a `usage_update` that
       // arrives after our cancel still lands before `idle`), and makes each rung deliverable.
-      // Recorded as an amendment request against DESIGN §6.2 and CONTRACTS §13.2 in M1-WP-B's
-      // hand-off notes — with the evidence, which is a test rather than an argument.
+      // AMENDED, not merely reported: CONTRACTS ruling M1-R4a records the transposition, §13.2's
+      // CLOSE_OUT block and its L23 row now spell `quiet -> cancel -> close_stdin -> drain ->
+      // terminate`, and DESIGN §6.2's 收尾顺序 bullet carries the same correction — so the
+      // documents and this file agree, and the evidence cited is a test rather than an argument.
       const cancelDeadline = at + cfg.cancelGraceMs;
       const rung2: TurnLifecycleState = { ...next, rung: 2, deadline: cancelDeadline };
       return { state: rung2, output: output(emit, rung2, cancelDeadline, null, "cancel") };

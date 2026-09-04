@@ -1,8 +1,7 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, realpath } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DaemonConfig,
   HEADER,
@@ -17,6 +16,12 @@ import { createDaemon } from "../src/create-daemon.js";
 import { DAEMON_ID_FILE } from "../src/ids-file.js";
 import type { Daemon, DaemonEvent } from "../src/types.js";
 import { coreScript } from "./fake-core.js";
+import { removeTempRoots, tempRoot } from "./support/temp-dirs.js";
+
+/** ~800 leaked `/tmp` directories per full run without this; see `support/temp-dirs.ts`. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./fake-core.js");
@@ -49,7 +54,7 @@ async function build(over?: Partial<DaemonConfigInput>): Promise<{
   root: string;
   dataDir: string;
 }> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "omni-daemon-")));
+  const root = await tempRoot("omni-daemon-");
   const dataDir = join(root, "data");
   const supervisor = fakeSupervisor();
   const daemon = await createDaemon(

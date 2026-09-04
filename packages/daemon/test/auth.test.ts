@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
-import { mkdtemp, mkdir, realpath, symlink } from "node:fs/promises";
+import { mkdir, realpath, symlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   DaemonConfig,
   HEADER,
@@ -13,22 +13,19 @@ import {
   type WorkerSnapshot,
 } from "@omni-acp/protocol";
 import { createTokenStore } from "../src/auth.js";
+import { removeTempRoots, tempRoot as makeTempRoot, trackTempDir } from "./support/temp-dirs.js";
 
 const SECRET = "user-secret-value-0123456789";
 const ADMIN_SECRET = "admin-secret-value-0123456789";
 
-const roots: string[] = [];
+const tempRoot = (): Promise<string> => makeTempRoot("omni-auth-");
 
-async function tempRoot(): Promise<string> {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "omni-auth-")));
-  roots.push(dir);
-  return dir;
-}
-
-afterAll(() => {
-  // The directories are inside `os.tmpdir()`; the OS reclaims them. Nothing here may run `rm -rf`
-  // on a path a test computed — that is the one cleanup mistake that eats a developer's disk.
-  roots.length = 0;
+// Removed rather than left for the OS to reclaim. The rule this file used to state — never
+// `rm -rf` a path a test computed — is kept by `support/temp-dirs.ts`, which removes ONLY the
+// `mkdtemp` directories it handed out itself. Leaving them behind cost ~50 directories per run
+// here and ~800 across the daemon suites, which on a tmpfs `/tmp` is unbounded growth.
+afterEach(async () => {
+  await removeTempRoots();
 });
 
 function config(over?: Partial<Parameters<typeof DaemonConfig.parse>[0]>): ResolvedDaemonConfig {
@@ -224,7 +221,7 @@ describe("AuthContext.assertCwd (D18, H14)", () => {
     const root = await tempRoot();
     const sibling = `${root}-evil`;
     await mkdir(sibling);
-    roots.push(sibling);
+    trackTempDir(sibling);
     const auth = createTokenStore(
       DaemonConfig.parse({ tokens: [{ id: "t", secret: SECRET, cwdRoots: [root] }] }),
     ).contextFor("t");

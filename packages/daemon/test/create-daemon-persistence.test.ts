@@ -1,7 +1,6 @@
-import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HEADER,
   type AgentCapabilitiesSnapshot,
@@ -17,6 +16,12 @@ import { createDaemon } from "../src/create-daemon.js";
 import type { Daemon } from "../src/types.js";
 import { someWorkerId } from "./fake-core.js";
 import { fakePersistence, type FakePersistence } from "./fake-persistence.js";
+import { removeTempRoots, tempRoot } from "./support/temp-dirs.js";
+
+/** ~800 leaked `/tmp` directories per full run without this; see `support/temp-dirs.ts`. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./fake-core.js");
@@ -30,7 +35,7 @@ async function build(o?: {
   persistence?: PersistenceHandle | null;
   config?: Partial<DaemonConfigInput>;
 }): Promise<{ daemon: Daemon; supervisor: FakeSupervisor; dataDir: string; root: string }> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "omni-daemon-persist-")));
+  const root = await tempRoot("omni-daemon-persist-");
   const dataDir = join(root, "data");
   const supervisor = fakeSupervisor();
   const daemon = await createDaemon(
@@ -74,16 +79,21 @@ const processInfo = (fingerprint: string | null): ProcessInfo => ({
   fingerprint,
 });
 
-function abandonedRow(o?: { id?: number; fingerprint?: string | null }): WorkerRow {
+function abandonedRow(o?: {
+  id?: number;
+  fingerprint?: string | null;
+  cwd?: string;
+  agentId?: string;
+}): WorkerRow {
   const workerId = someWorkerId(o?.id ?? 70);
   const snapshot = {
     workerId,
     daemonId: `d_${"0".repeat(25)}1`,
     ref: `x:${workerId}`,
     sessionId: "sess-old",
-    agentId: "claude",
+    agentId: o?.agentId ?? "claude",
     state: "ready",
-    cwd: "/work",
+    cwd: o?.cwd ?? "/work",
     label: null,
     ownerTokenId: "t",
     createdAt: "2026-09-03T22:00:00.000Z",
@@ -107,7 +117,7 @@ function abandonedRow(o?: { id?: number; fingerprint?: string | null }): WorkerR
 
   return {
     snapshot,
-    agentId: "claude",
+    agentId: o?.agentId ?? "claude",
     bootId: "boot_the_one_that_died",
     closeResult: null,
     lastActiveMs: 1_000,
@@ -198,6 +208,119 @@ describe("createDaemon — the boot sequence (§14, §15.7)", () => {
     const { daemon } = await build({ persistence: store });
     expect(daemon.info.persistence.lastSweep).toBeNull();
     expect(store.sweeps).toBe(0);
+    await daemon.stop();
+  });
+});
+
+/**
+ * §2.1 H14's second sentence, and §15.7: "A wake also re-runs the full ACL check against the
+ * current config — a restart must not resurrect a worker the present ACL forbids."
+ *
+ * `create()` is not the only door a process comes through: a hibernated row (here, one boot
+ * adoption converged) is resurrected by `wake`, and by `prompt`, which auto-wakes inside
+ * `Worker.prompt`. Both take the agent id and the cwd from the ROW, so a token whose `agents` or
+ * `cwdRoots` the operator has since narrowed would otherwise still spawn exactly the agent it is
+ * no longer allowed, in exactly the directory it is no longer allowed.
+ *
+ * `GET` stays 200 throughout: D13's visibility is about OWNERSHIP, and a worker a token may look
+ * at but no longer resume is the honest answer — a 404 would deny an operator the record.
+ */
+describe("createDaemon — a wake re-runs the ACL (H14, §15.7)", () => {
+  const wake = (daemon: Daemon, id: string): Promise<Response> =>
+    daemon.fetch(
+      new Request(`http://daemon.invalid/v1/workers/${id}/wake`, {
+        method: "POST",
+        headers: { [HEADER.auth]: `Bearer ${SECRET}` },
+      }),
+    );
+
+  const prompt = (daemon: Daemon, id: string): Promise<Response> =>
+    daemon.fetch(
+      new Request(`http://daemon.invalid/v1/workers/${id}/prompt`, {
+        method: "POST",
+        headers: { [HEADER.auth]: `Bearer ${SECRET}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: [{ type: "text", text: "hi" }] }),
+      }),
+    );
+
+  const get = (daemon: Daemon, id: string): Promise<Response> =>
+    daemon.fetch(
+      new Request(`http://daemon.invalid/v1/workers/${id}`, {
+        headers: { [HEADER.auth]: `Bearer ${SECRET}` },
+      }),
+    );
+
+  /** The row this token created when the ACL was wider, adopted into `hibernated` on this boot. */
+  async function adopted(o: {
+    tokens: unknown[];
+    agents?: unknown[];
+    rowCwd: (root: string) => string;
+    rowAgentId?: string;
+  }): Promise<{ daemon: Daemon; id: string }> {
+    const store = fakePersistence({ bootId: CURRENT_BOOT });
+    const root = await tempRoot("omni-daemon-acl-");
+    store.seed(
+      abandonedRow({
+        id: 72,
+        cwd: o.rowCwd(root),
+        ...(o.rowAgentId === undefined ? {} : { agentId: o.rowAgentId }),
+      }),
+    );
+    const { daemon } = await build({
+      persistence: store,
+      config: {
+        tokens: o.tokens as never,
+        agents: (o.agents ?? [
+          { id: "claude", command: process.execPath, args: ["-e", "0"] },
+          { id: "other", command: process.execPath, args: ["-e", "0"] },
+        ]) as never,
+      },
+    });
+    const id = String(someWorkerId(72));
+    expect(store.rows.get(someWorkerId(72))?.snapshot.state).toBe("hibernated");
+    return { daemon, id };
+  }
+
+  it("wake and prompt are 403 once the token's `agents` no longer allows the row's agent", async () => {
+    const { daemon, id } = await adopted({
+      // The operator narrowed `t` to `other` and reloaded. The agent still EXISTS in the
+      // catalog — `catalog.get` throwing already covers a removed agent — so this is the case
+      // H14 names and the one nothing else catches.
+      tokens: [{ id: "t", secret: SECRET, role: "admin", agents: ["other"], cwdRoots: ["/"] }],
+      rowCwd: (root) => root,
+    });
+
+    expect((await wake(daemon, id)).status).toBe(403);
+    expect((await prompt(daemon, id)).status).toBe(403);
+    // The record is still readable: the ACL governs resurrection, not visibility (D13).
+    expect((await get(daemon, id)).status).toBe(200);
+    await daemon.stop();
+  });
+
+  it("wake and prompt are 403 once the row's cwd is outside the token's roots", async () => {
+    const { daemon, id } = await adopted({
+      // `cwdRoots` no longer contains the directory the worker was created in. `assertCwd`
+      // re-`realpath`s, so a cwd that has since been deleted or symlinked out fails the same
+      // way — which is §15.7's intended behaviour, not an accident of caching.
+      tokens: [{ id: "t", secret: SECRET, role: "admin", cwdRoots: [tmpdir()] }],
+      rowCwd: () => "/work",
+    });
+
+    expect((await wake(daemon, id)).status).toBe(403);
+    expect((await prompt(daemon, id)).status).toBe(403);
+    expect((await get(daemon, id)).status).toBe(200);
+    await daemon.stop();
+  });
+
+  it("the SAME row wakes when the ACL still allows it — the check is the narrowing, not the path", async () => {
+    const { daemon, id } = await adopted({
+      tokens: [{ id: "t", secret: SECRET, role: "admin", agents: ["claude"], cwdRoots: ["/"] }],
+      rowCwd: (root) => root,
+    });
+
+    // Not a 403. (What it IS depends on the worker double this suite wires; the ACL is the
+    // subject, and a control that never passes would make the two 403s above meaningless.)
+    expect((await wake(daemon, id)).status).not.toBe(403);
     await daemon.stop();
   });
 });

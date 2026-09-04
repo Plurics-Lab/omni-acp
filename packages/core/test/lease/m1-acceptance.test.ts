@@ -467,13 +467,14 @@ describe("acceptance 9 — M0's two-workers-do-not-interfere.itest.ts still pass
     //  2. `alwaysGrantedLease` is still the fallback when no factory is supplied, which is the
     //     behaviour every core-level harness in this repo depends on.
     const registry = readFileSync(join(REPO_TEST_ROOT, "daemon/src/registry.ts"), "utf8");
-    // Three arguments, not two: rule L9's `omni.lease` envelope needs the worker's own log, and
-    // the registry is the only frame that has one. `DaemonDeps.leaseFactory` stays frozen at two
-    // and stays assignable.
+    // FOUR arguments, not two: rule L9's `omni.lease` envelope needs the worker's own log, and
+    // the registry is the only frame that has one; rule L7's epoch is monotonic per worker, so a
+    // REHYDRATED lease resumes from the row's persisted value rather than restarting at 0.
+    // `DaemonDeps.leaseFactory` stays frozen at two and stays assignable.
     // Whitespace-insensitive: the expression is one prettier reflow away from failing a literal
     // substring match, and what this asserts is the DELEGATION, not the line breaks.
     expect(registry.replace(/\s+/g, " ")).toContain(
-      "o.leaseFactory?.(owner, workerId, log) ?? alwaysGrantedLease(",
+      "o.leaseFactory?.(owner, workerId, log, initialEpoch) ?? alwaysGrantedLease(",
     );
     // A CALL, not the word: `registry.ts`'s own comment names `createLease` as the thing WP-D
     // implements elsewhere, and a guard that fired on its own rationale would teach the next

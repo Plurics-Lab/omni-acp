@@ -1,7 +1,6 @@
-import { mkdir, mkdtemp, realpath, symlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, realpath, symlink } from "node:fs/promises";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HEADER, SSE_CONTROL, type CloseResult, type WorkerSnapshot } from "@omni-acp/protocol";
 import {
   collectSse,
@@ -13,6 +12,12 @@ import {
 import { createDaemon } from "../../src/create-daemon.js";
 import type { Daemon } from "../../src/types.js";
 import { coreScript, someWorkerId } from "../fake-core.js";
+import { removeTempRoots, tempRoot } from "../support/temp-dirs.js";
+
+/** ~800 leaked `/tmp` directories per full run without this; see `support/temp-dirs.ts`. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./../fake-core.js");
@@ -33,8 +38,8 @@ interface Fixture {
 }
 
 async function fixture(over?: { maxWorkers?: number; tokenMaxWorkers?: number }): Promise<Fixture> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "omni-http-")));
-  const outside = await realpath(await mkdtemp(join(tmpdir(), "omni-outside-")));
+  const root = await tempRoot("omni-http-");
+  const outside = await tempRoot("omni-outside-");
   const supervisor = fakeSupervisor();
   const daemon = await createDaemon(
     {

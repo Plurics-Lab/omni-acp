@@ -1,11 +1,16 @@
-import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HEADER, type AgentListResponse } from "@omni-acp/protocol";
 import { fakeSupervisor, nullLogger, seqIds } from "@omni-acp/testkit";
 import { createDaemon } from "../../src/create-daemon.js";
 import type { Daemon } from "../../src/types.js";
+import { removeTempRoots, tempRoot } from "../support/temp-dirs.js";
+
+/** ~800 leaked `/tmp` directories per full run without this; see `support/temp-dirs.ts`. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 vi.mock("@omni-acp/core", async (importOriginal) => {
   const { fakeCoreModule } = await import("./../fake-core.js");
@@ -21,7 +26,7 @@ const SECRET = "the-only-valid-secret-0123456789";
  * `ProcessInfo.argsRedacted` already refuses to serve on `GET /v1/workers/{id}`.
  */
 async function daemonWithSecretArgs(): Promise<Daemon> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "omni-http-agents-")));
+  const root = await tempRoot("omni-http-agents-");
   return await createDaemon(
     {
       dataDir: join(root, "data"),

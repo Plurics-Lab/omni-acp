@@ -1,12 +1,18 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { ID_PATTERN, createIdGen } from "@omni-acp/protocol";
 import { seqIds } from "@omni-acp/testkit";
 import { DAEMON_ID_FILE, expandHome, loadOrCreateDaemonId, resolvePath } from "../src/ids-file.js";
+import { removeTempRoots, tempRoot } from "./support/temp-dirs.js";
 
-const tempDir = () => mkdtemp(join(tmpdir(), "omni-ids-"));
+const tempDir = () => tempRoot("omni-ids-");
+
+/** See `support/temp-dirs.ts`: these suites leaked ~800 `/tmp` directories per full run. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 describe("loadOrCreateDaemonId (WP-5 acceptance 13)", () => {
   it("mints a d_-prefixed ULID and persists it under dataDir", async () => {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { OmniError, isDaemonId, type DaemonId, type IdGen } from "@omni-acp/protocol";
@@ -42,7 +42,11 @@ export async function loadOrCreateDaemonId(dataDir: string, ids: IdGen): Promise
   const dir = resolvePath(dataDir);
   const file = join(dir, DAEMON_ID_FILE);
 
-  await mkdir(dir, { recursive: true });
+  // 0700, matching the `daemon-id` file's own 0600 below and `persist/open.ts`'s data dir: the
+  // directory is created here on the memory-driver path too, where `openPersistence` never runs.
+  // The `chmod` is what covers a directory that already exists, where `mkdir` sets no mode.
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await chmod(dir, 0o700).catch(() => {});
 
   const existing = await readDaemonId(file);
   if (existing.id !== null) return existing.id;

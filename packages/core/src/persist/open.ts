@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
   OmniError,
@@ -20,6 +20,26 @@ export const EVENTS_DB_FILE = "events.db";
 
 /** SQLite's own spelling for "no file at all". Skips the lock — there is nothing to contend for. */
 const IN_MEMORY = ":memory:";
+
+/**
+ * Owner-only, on the database AND on the directory that holds it.
+ *
+ * `events.db` is the most sensitive file this daemon writes: it holds every worker's whole event
+ * log — prompt text, agent output, tool-call payloads, `cwd` paths, `sessionId`, `ownerTokenId`.
+ * `node:sqlite` creates it (and its `-wal` / `-shm` siblings) with default permissions, so on a
+ * shared host every other local account could read every transcript. `probe-cache.ts` already
+ * takes exactly this posture for a *ProbeSummary*, and `ids-file.ts` and `lock.ts` write 0600;
+ * the one file that actually holds the data must not be the open one.
+ *
+ * `mkdir`'s mode is masked by the umask and is a no-op on a PRE-EXISTING directory, so both are
+ * asserted with a following `chmod`. On win32 `chmod` is advisory and a near-no-op — a platform
+ * fact, which is why every call below tolerates a failure rather than refusing to start.
+ */
+const DB_FILE_MODE = 0o600;
+const DATA_DIR_MODE = 0o700;
+
+/** The files `node:sqlite` creates for one database in WAL mode. */
+const dbFiles = (file: string): readonly string[] => [file, `${file}-wal`, `${file}-shm`];
 
 export interface OpenPersistenceOptions {
   readonly dataDir: string;
@@ -63,7 +83,10 @@ export async function openPersistence(o: OpenPersistenceOptions): Promise<Persis
   const bootId =
     o.bootId ?? `boot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 
-  if (!inMemory) await mkdir(dir, { recursive: true });
+  if (!inMemory) {
+    await mkdir(dir, { recursive: true, mode: DATA_DIR_MODE });
+    await chmod(dir, DATA_DIR_MODE).catch(() => {});
+  }
 
   // 1. LOCK first. Opening the database before taking the lock would create the WAL and shm
   //    files of a daemon we are about to refuse to be (§14.10).
@@ -109,6 +132,15 @@ export async function openPersistence(o: OpenPersistenceOptions): Promise<Persis
 
     // 4. MIGRATE.
     const schemaVersion = migrate(db, { warn: (m) => o.logger.warn(m) });
+
+    // 5. TIGHTEN, before the first ENVELOPE is written and after the migration, which is the
+    //    first thing to write through the journal and therefore the point by which the `-wal`
+    //    and `-shm` siblings exist. Doing it before `journal_mode = wal` would leave the two
+    //    files that mirror the database's content at the driver's default 0644. `.catch`
+    //    because a sibling may still be absent and because chmod is advisory on win32.
+    if (!inMemory) {
+      for (const p of dbFiles(file)) await chmod(p, DB_FILE_MODE).catch(() => {});
+    }
 
     const events = createSqliteEventStore(db, {
       clock: o.clock,

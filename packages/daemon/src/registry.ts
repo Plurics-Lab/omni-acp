@@ -71,7 +71,12 @@ export interface WorkerRegistryOptions {
    * function stays assignable to this type, so an injected `DaemonDeps.leaseFactory` written
    * against the frozen shape keeps working and simply ignores the argument.
    */
-  readonly leaseFactory?: (owner: ClientRef | null, workerId: WorkerId, log: EventLog) => Lease;
+  readonly leaseFactory?: (
+    owner: ClientRef | null,
+    workerId: WorkerId,
+    log: EventLog,
+    initialEpoch?: number,
+  ) => Lease;
   /**
    * The durable half (§14). Absent or `null` ⇒ memory only, which is `createDaemon()`'s default
    * (ruling M1-R17) and M0's behaviour exactly: no store to read, so `list()` is the live map,
@@ -395,8 +400,9 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         // worker uses the same inline handshake `worker.ts` falls back to, and M1-WP-C's
         // `createRehydratedWorker` is the one that knows how to say that.
         session: o.session as SessionStrategy,
-        // Unheld, per ruling M1-R8 — see `leaseFor`.
-        lease: leaseFor(null, workerId, log),
+        // Unheld, per ruling M1-R8 — but resuming the row's EPOCH, so rule L7's counter stays
+        // monotonic across the restart. See `leaseFor`.
+        lease: leaseFor(null, workerId, log, row.snapshot.lease.epoch),
         clock: o.clock,
         ids: o.ids,
         logger: o.logger.child({ workerId, agent: row.agentId, rehydrated: true }),
@@ -628,6 +634,28 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     return rehydrate(row);
   };
 
+  /**
+   * H14's second sentence: "A wake also re-runs the full ACL check against the current config —
+   * a restart must not resurrect a worker the present ACL forbids (§15.7)."
+   *
+   * `create()` is not the only door a process comes through. A hibernated worker (or one adopted
+   * by boot recovery) is resurrected by `wake` — and by `prompt`, which auto-wakes inside
+   * `Worker.prompt` — with the descriptor taken from the CURRENT config but the agent id and cwd
+   * taken from the ROW. `lookup()` only answers D13's visibility question ("is this the token's
+   * own worker"), which a narrowed allowlist does not change: the operator who removes
+   * `claude-acp` from token `t`'s `agents`, or drops `/srv/a` from its `cwdRoots`, and reloads,
+   * would otherwise still see `t` spawn that exact agent in that exact directory.
+   *
+   * `assertCwd` re-`realpath`s, so a cwd that has since been deleted or symlinked out of the
+   * roots fails closed too — §15.7's intended answer, and the reason this is not a cached check.
+   *
+   * It runs BEFORE `reserveForWake`, so a 403 costs neither a slot nor an `npx` cold start.
+   */
+  const assertMayResume = async (entry: Entry, auth: AuthContext): Promise<void> => {
+    auth.assertAgent(entry.agentId);
+    await auth.assertCwd(entry.handle.snapshot().cwd);
+  };
+
   const closeEntry = (entry: Entry, reason: WorkerCloseReason): Promise<CloseResult> => {
     entry.closing ??= entry.handle.close(reason);
     return entry.closing;
@@ -683,9 +711,22 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
    * every SDK client mints a ULID per `connect()` (§16.1 rule L4), so no client could ever match
    * it: a restarted worker would answer `423` to its own owner forever. Starting unheld lets
    * rule L5's implicit acquire do exactly what it is for.
+   *
+   * The EPOCH is the half that DOES survive, and it is a fourth argument rather than a revived
+   * holder: rule L7 makes the epoch monotonic per worker, and boot adoption has already written
+   * `snapshot.lease.epoch + 1` both into the row and into the in-band
+   * `omni.lease{op:"expired", how:"daemon_restart"}` envelope a reconnecting client reads at its
+   * next `?since=` seq. Restarting the count at 0 would re-issue numbers this worker's own log
+   * has already spent — a replay reading 1 → 2 → 1, and an `isStaleEpoch` (exact equality) that
+   * accepts a fence minted before the crash.
    */
-  const leaseFor = (owner: ClientRef | null, workerId: WorkerId, log: EventLog): Lease =>
-    o.leaseFactory?.(owner, workerId, log) ??
+  const leaseFor = (
+    owner: ClientRef | null,
+    workerId: WorkerId,
+    log: EventLog,
+    initialEpoch?: number,
+  ): Lease =>
+    o.leaseFactory?.(owner, workerId, log, initialEpoch) ??
     alwaysGrantedLease(owner ?? { tokenId: "", clientId: null }, workerId);
 
   return {
@@ -965,8 +1006,12 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       } catch (e) {
         throw badRequest(e, "invalid prompt");
       }
-      const handle = get(id, auth);
-      return await handle.prompt(parsed.content, auth.asClientRef());
+      const entry = lookup(id, auth);
+      if (entry === null) return notFound(id);
+      // `Worker.prompt` auto-wakes a hibernated worker internally, so the ACL that `wake()`
+      // re-runs has to be re-run here too — otherwise the check is one HTTP route wide (H14).
+      if (entry.handle.snapshot().state === "hibernated") await assertMayResume(entry, auth);
+      return await entry.handle.prompt(parsed.content, auth.asClientRef());
     },
 
     async cancel(id, auth): Promise<void> {
@@ -1063,6 +1108,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     async wake(id, auth): Promise<WorkerSnapshot> {
       const entry = lookup(id, auth);
       if (entry === null) return notFound(id);
+      await assertMayResume(entry, auth);
       const before = entry.handle.snapshot();
       if (before.state === "hibernated") {
         reserveForWake(entry, auth);

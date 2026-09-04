@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,41 @@ export interface SourceFile {
   readonly text: string;
   /** `text` with comments, string/template and regex literals blanked (lengths preserved). */
   readonly code: string;
+  /**
+   * The identity of the BYTES this scan actually ran over — sha256 of `text`, and its length.
+   *
+   * They exist because an architecture guard's failure message has to be attributable. A red
+   * `no-direct-spawn` once named a line whose only occurrence of the forbidden specifier is
+   * backtick-quoted inside a doc comment, i.e. a match the scanner cannot produce from the file
+   * as it is on disk. With these on every violation string, the next such red either names a
+   * real import — reproducible by hashing the file — or proves that the text this process read
+   * was not the text the file holds, which is a toolchain report rather than a code change.
+   */
+  readonly sha256: string;
+  readonly bytes: number;
+}
+
+/** The one place a `SourceFile` is built, so `text`, `code`, `sha256` and `bytes` cannot drift. */
+export function sourceFile(o: { path: string; absolute: string; text: string }): SourceFile {
+  return {
+    path: o.path,
+    absolute: o.absolute,
+    text: o.text,
+    code: blankOutNonCode(o.text),
+    sha256: createHash("sha256").update(o.text, "utf8").digest("hex"),
+    bytes: Buffer.byteLength(o.text, "utf8"),
+  };
+}
+
+/**
+ * `path:line`, plus the evidence that makes a surprising hit attributable: the scanned file's
+ * hash and byte length, and the 80 characters of `text` around the match.
+ */
+export function locate(file: SourceFile, at: number, line: number): string {
+  const window = JSON.stringify(file.text.slice(Math.max(0, at - 40), at + 40));
+  return `${file.path}:${String(line)} [sha256=${file.sha256.slice(0, 16)} bytes=${String(
+    file.bytes,
+  )} near=${window}]`;
 }
 
 const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "vitest-report", "coverage"]);
@@ -43,15 +79,13 @@ export function packageSources(): SourceFile[] {
     }
     walk(src, files);
   }
-  return files.sort().map((absolute) => {
-    const text = readFileSync(absolute, "utf8");
-    return {
+  return files.sort().map((absolute) =>
+    sourceFile({
       absolute,
       path: relative(REPO_ROOT, absolute).split(sep).join("/"),
-      text,
-      code: blankOutNonCode(text),
-    };
-  });
+      text: readFileSync(absolute, "utf8"),
+    }),
+  );
 }
 
 /**

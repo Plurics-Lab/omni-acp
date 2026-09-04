@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import {
   DaemonConfig,
@@ -71,7 +71,14 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   const ids = deps?.ids ?? createIdGen();
   const logger = deps?.logger ?? createLogger(resolved.logLevel);
 
-  await mkdir(resolved.dataDir, { recursive: true });
+  // Owner-only, the same posture `persist/open.ts`, `probe-cache.ts`, `ids-file.ts` and
+  // `persist/lock.ts` take: the data dir holds the event database, the daemon id and the probe
+  // cache, none of which another local account has any business reading. `mkdir`'s mode is
+  // umask-masked and is a no-op on a PRE-EXISTING directory, so the `chmod` is the half that
+  // actually bites; it is tolerated when it fails, because it is advisory on win32 and because a
+  // daemon must not refuse to start over a directory somebody else owns.
+  await mkdir(resolved.dataDir, { recursive: true, mode: 0o700 });
+  await chmod(resolved.dataDir, 0o700).catch(() => {});
   const daemonId = await resolveDaemonId(resolved, ids);
 
   /**
@@ -180,7 +187,7 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
      * An injected factory still wins, which is what lets a test drive `alwaysGrantedLease` or a
      * spy without the daemon composing one behind its back.
      */
-    leaseFactory: (owner, workerId, log) => {
+    leaseFactory: (owner, workerId, log, initialEpoch) => {
       // An INJECTED factory still wins — that is what lets a test drive `alwaysGrantedLease` or a
       // spy without the daemon composing one behind its back. It cannot be consulted for an
       // UNHELD lease, though: `DaemonDeps.leaseFactory` is frozen at `(owner: ClientRef, …)` and
@@ -193,6 +200,11 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
         clock,
         config: resolved.lease,
         initialHolder: owner,
+        // Rule L7's monotonic counter across a restart: the registry hands the row's persisted
+        // epoch back for a REHYDRATED worker (and `undefined` for every other one), so the
+        // number boot adoption already published in the worker's own
+        // `omni.lease{how:"daemon_restart"}` envelope is the number the live lease reports.
+        initialEpoch,
         onEvent: (payload) => {
           try {
             log.append({ kind: "omni.lease", payloadVersion: 2, turnId: null, payload });

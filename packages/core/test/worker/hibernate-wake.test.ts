@@ -691,13 +691,13 @@ const STATE_TABLE: readonly {
     owner: "asserted as an absence",
   },
   {
-    // The frozen `worker.ts` closes on every process death (`#onExit` -> `#closeWith`); there is
-    // no arm that hibernates a crashed-but-resumable worker. Recorded in this work package's
-    // notes with the exact change it would take.
+    // §15.1's "process death, resume method present" row, and DESIGN §3.2's 进程崩溃：agent 支持
+    // resume → 转 hibernated 并标记 crashed. `#classifyAndClose` branches on exactly the
+    // predicate `boot-recovery.ts` applies to an abandoned row, so a crash and a daemon restart
+    // converge on the same state instead of a crash losing a session the restart would keep.
     edge: "running->hibernated",
     reason: "agent_crashed",
-    drivenHere: false,
-    owner: "unreachable in the frozen worker.ts — see WP-C notes",
+    drivenHere: true,
   },
   {
     edge: "live->hibernated",
@@ -727,7 +727,7 @@ describe("§15.1's state table (acceptance 1)", () => {
     }
     // A cheap regression on the transcription itself: the table has one row per §15.1 line.
     expect(STATE_TABLE).toHaveLength(21);
-    expect(STATE_TABLE.filter((r) => r.drivenHere)).toHaveLength(16);
+    expect(STATE_TABLE.filter((r) => r.drivenHere)).toHaveLength(17);
   });
 
   it("every `drivenHere` row is actually produced, by driving it", async () => {
@@ -792,12 +792,20 @@ describe("§15.1's state table (acceptance 1)", () => {
     await deleted.worker.close("client_request");
     observe(deleted.h);
 
-    // agent_crashed
-    const crashed = await rig();
+    // agent_crashed -> CLOSED: the agent advertises no resume spelling, so there is nothing to
+    // come back to and the session pointer is worth nothing.
+    const crashed = await rig({ agent: { capabilities: NOT_RESUMABLE } });
     await crashed.worker.prompt([TEXT("hi")], OWNER);
     crashed.h.process().simulateExit(9, "SIGKILL");
     await flush();
     observe(crashed.h);
+
+    // agent_crashed -> HIBERNATED: the same death, on an agent that CAN resume (§15.1).
+    const crashedResumable = await rig();
+    await crashedResumable.worker.prompt([TEXT("hi")], OWNER);
+    crashedResumable.h.process().simulateExit(9, "SIGKILL");
+    await flush();
+    observe(crashedResumable.h);
 
     const missing = STATE_TABLE.filter((r) => r.drivenHere).filter(
       (r) => !seen.has(`${r.edge}:${r.reason}`),
@@ -862,16 +870,35 @@ describe("§15.1's state table (acceptance 1)", () => {
   });
 
   it("`crashed` is monotone across hibernate and wake (invariant 2)", async () => {
+    // A crash on an agent that CANNOT resume closes the worker, and `crashed` is observed on the
+    // row it writes.
+    const gone = await rig({ agent: { capabilities: NOT_RESUMABLE } });
+    gone.h.process().simulateExit(9, "SIGKILL");
+    await flush();
+    const closed = gone.worker.snapshot();
+    expect(closed.crashed).toBe(true);
+    expect(closed.state).toBe("closed");
+    expect(closed.hibernatedAt).toBeNull();
+
+    // The same death on a RESUMABLE agent hibernates instead (§15.1's `running -> hibernated`
+    // row), and the flag survives the wake that follows — which is invariant 2 itself, driven
+    // here rather than only through `rehydrated.test.ts`'s restore path.
     const r = await rig();
-    // A crash closes the worker in M1's frozen `worker.ts`, so `crashed` is observed on the row
-    // it writes; the monotonicity across a wake is asserted through the RESTORE path in
-    // `rehydrated.test.ts`, which is the only way a crashed worker comes back.
+    await r.worker.prompt([TEXT("hi")], OWNER);
     r.h.process().simulateExit(9, "SIGKILL");
     await flush();
-    const snap = r.worker.snapshot();
-    expect(snap.crashed).toBe(true);
-    expect(snap.state).toBe("closed");
-    expect(snap.hibernatedAt).toBeNull();
+    const asleep = r.worker.snapshot();
+    expect(asleep.state).toBe("hibernated");
+    expect(asleep.crashed).toBe(true);
+    expect(asleep.hibernatedAt).not.toBeNull();
+    expect(asleep.sessionId).not.toBeNull();
+
+    r.next({ onResume: { kind: "ok" } });
+    await r.worker.wake(OWNER);
+    const awake = r.worker.snapshot();
+    expect(awake.state).toBe("ready");
+    // Sticky: it NEVER goes back to false (D2).
+    expect(awake.crashed).toBe(true);
   });
 
   it("`closed` is terminal: hibernate, wake and prompt all refuse afterwards", async () => {

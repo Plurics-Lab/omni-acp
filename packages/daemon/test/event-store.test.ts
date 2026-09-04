@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readdir, realpath } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DaemonConfig,
   OmniError,
@@ -12,6 +12,12 @@ import { fakeClock, fakeSupervisor, nullLogger, seqIds } from "@omni-acp/testkit
 import { createDaemon } from "../src/create-daemon.js";
 import { armRetention, openDaemonPersistence } from "../src/event-store.js";
 import { fakePersistence } from "./fake-persistence.js";
+import { removeTempRoots, tempRoot } from "./support/temp-dirs.js";
+
+/** See `support/temp-dirs.ts`: these suites leaked ~800 `/tmp` directories per full run. */
+afterEach(async () => {
+  await removeTempRoots();
+});
 
 const config = (o?: Record<string, unknown>): ResolvedDaemonConfig =>
   DaemonConfig.parse({
@@ -22,7 +28,7 @@ const config = (o?: Record<string, unknown>): ResolvedDaemonConfig =>
 
 describe("openDaemonPersistence — the driver decides (ruling M1-R17)", () => {
   it('returns null for "memory", so createDaemon() leaves no file behind', async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "omni-event-store-"));
+    const dataDir = await tempRoot("omni-event-store-");
     const handle = await openDaemonPersistence({
       config: config({ dataDir, eventLog: { driver: "memory" } }),
       clock: fakeClock(),
@@ -37,7 +43,7 @@ describe("openDaemonPersistence — the driver decides (ruling M1-R17)", () => {
     // The driver-gating decision is this module's; the store is M1-WP-A's. With both landed the
     // assertion is that the two met: a real handle, over a file this dataDir owns, reporting the
     // driver the operator asked for.
-    const dataDir = await mkdtemp(join(tmpdir(), "omni-event-store-"));
+    const dataDir = await tempRoot("omni-event-store-");
     const handle = await openDaemonPersistence({
       config: config({ dataDir, eventLog: { driver: "sqlite" } }),
       clock: fakeClock(),
@@ -154,7 +160,7 @@ describe("createDaemon — retention is armed, and stopped with the daemon", () 
     persistence?: PersistenceHandle;
     clock?: ReturnType<typeof fakeClock>;
   }) => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "omni-retention-")));
+    const root = await tempRoot("omni-retention-");
     return await createDaemon(
       {
         dataDir: join(root, "data"),
@@ -202,7 +208,7 @@ describe("createDaemon — a store that refuses to open fails the START, naming 
     // Acceptance 10's WIRING half: a `schema_version` from the future is `openPersistence`'s own
     // startup failure (M1-WP-A), and what this owns is that such a failure REACHES the caller
     // instead of being swallowed into a daemon that quietly runs on memory.
-    const root = await realpath(await mkdtemp(join(tmpdir(), "omni-retention-")));
+    const root = await tempRoot("omni-retention-");
     const dataDir = join(root, "data");
     await mkdir(dataDir, { recursive: true });
     await plantFutureSchema(join(dataDir, "events.db"));
@@ -224,7 +230,7 @@ describe("createDaemon — a store that refuses to open fails the START, naming 
   });
 
   it("starts on a GOOD sqlite file, so the refusal above is not vacuous", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "omni-retention-")));
+    const root = await tempRoot("omni-retention-");
     const daemon = await createDaemon(
       {
         dataDir: join(root, "data"),
