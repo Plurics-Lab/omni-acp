@@ -777,11 +777,147 @@ review round 1, item 5); no temp dir and no orphan process left on any OS.
    diff from M0 is the `tests/compat` workspace importer row, and CI's `git diff --exit-code
    pnpm-lock.yaml` after `pnpm install --frozen-lockfile` proves no work package rewrote it (review R20).
 
-### Real-agent record (to be filled at the WP‑F merge)
+### Real-agent record
 
 A one-off observation in the shape of M0-PLAN §5's smoke, recorded because M1's claim is that the daemon
-**resumes** a real agent and not just a fixture. Run once on Linux against the logged-in Claude Code:
-the §4 script end to end, with the resulting `ProbeSummary`, the observed `ResumeReport` (`outcome`,
-`rule`, `durationMs`, `replayedEvents`), the wake latency, the `-32002` cwd-mismatch classification, and
-the on-disk size of `events.db` after the run. Anything that contradicts the corpus README's findings is
-recorded here and the descriptor is corrected — the README is an observation, not a spec.
+**resumes** a real agent and not just a fixture.
+
+Run on Linux (node 22.23.2) on **2026-09-04**, against the logged-in Claude Code, agent command
+`npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, launched with the daemon's own environment (the
+catalog's `toSpawnSpec`, §5.4) so the adapter finds the existing login. Driver `sqlite`, two SDK clients on
+one token, workspace and `dataDir` both `mkdtemp`.
+
+```
+OMNI_COMPAT_REAL=1 OMNI_COMPAT_CONFIG=agents.local.yaml OMNI_COMPAT_REQUIRE=1 \
+  pnpm --filter @omni-acp/compat-tests test
+```
+
+#### Result: green, twice
+
+| run | at | passed | failed | skipped | wall |
+| --- | -- | ------ | ------ | ------- | ---- |
+| 1 | 07:16:40Z | 13 | 0 | 4 | 62.4 s |
+| 2 | 07:18:43Z | 13 | 0 | 4 | 57.5 s |
+
+Per case, run 1 / run 2, in milliseconds:
+
+| case | 1 | 2 | | case | 1 | 2 |
+| ---- | - | - |-| ---- | - | - |
+| `handshake` | 3608 | 3839 | | `hibernate-wake` | 10232 | 9752 |
+| `plain-turn` | 2701 | 2659 | | `resume-cwd-mismatch` | 3857 | 3980 |
+| `tool-turn` | 5591 | 5666 | | `lease` | 7153 | 7166 |
+| `stream-resume` | 2443 | 2278 | | `restart-survives` | 595 | 554 |
+| `cancel-late-update` | 4729 | 4694 | | `unknown-method` | 5 | 5 |
+| `tool-merge` | 5623 | 5590 | | `idempotent-map` | 154 | 156 |
+| `permission-deny` | 13866 | 8941 | | | | |
+
+**Every skip, with its source** — there are four, all `config`, and they are §18.2's own rows for this
+agent's corpus gaps. The runner reports a declared skip whose case this suite does not implement under its
+own name anyway, so M1-PLAN's "the four corpus gaps stay visible in every run" is literally true of
+`compat-report.json` rather than a claim about a file nobody prints:
+
+| case | source | reason |
+| ---- | ------ | ------ |
+| `plan-update` | config | no todo/plan tool in this build; two deliberate attempts produced no `plan` (corpus 05/05b) |
+| `agent-thought` | config | not emitted at default effort (corpus) |
+| `current-mode-update` | config | `session/set_mode` answers with the v2 `config_option_update` (corpus 08) |
+| `git-patch` | config | diff blocks are widened fragments; `structuredPatch` is a vendor extension (F19) |
+
+No `capability` and no `precondition` skips: the probe reports a resume spelling, so both resume cases RAN,
+and `provides: [tools, permission, cancel]` is satisfied by the corpus rows 02 / 04 / 14. Zero agents were
+skipped at selection.
+
+#### Step 0 — the `ProbeSummary`
+
+2.24 s, one process, `cached: true` on the second call. `runtimeId` = `claude-acp@7c8f2ec1ff53`.
+
+```json
+{
+  "agentInfo": { "name": "@agentclientprotocol/claude-agent-acp", "title": "Claude Agent", "version": "0.73.0" },
+  "protocolVersion": 1,
+  "resumeMethod": "session/resume",
+  "supportedMethods": ["session/set_mode", "session/set_config_option", "session/list",
+                       "session/resume", "session/load", "session/close"],
+  "unsupportedMethods": ["session/set_model", "session/set_options"],
+  "learnedParams": { "session/set_mode": "modeId", "session/set_config_option": "configId",
+                     "session/resume": "cwd", "session/load": "cwd" },
+  "timings": { "initialize": 976, "session/new": 1063, "session/set_model": 28,
+               "session/set_options": 2, "session/set_mode": 6, "session/set_config_option": 5,
+               "session/list": 88, "session/resume": 3, "session/load": 1,
+               "omni/definitely_unknown_method": 1, "session/close": 8, "total": 2191 }
+}
+```
+
+Three things in there are worth naming, because each one is a §17 claim the probe was built to settle:
+
+1. **F17 reproduced.** `session/set_config_option` answered `-32602` with `data.configId._errors`, and the
+   probe learned the field is `configId` and not `optionId` — the row §17.4 exists for.
+2. **The corpus's `-32601` pair holds** (`session/set_model`, `session/set_options`), and `session/set_mode`
+   is live and answers `-32602` naming `modeId`. §17.3's preference order
+   (`set_config_option` → `set_mode` → `set_model`) is the right way round for this build.
+3. **`session/load` AND `session/resume` are both implemented on one process** — F18, confirmed live —
+   which is why the descriptor carries a preference ORDER rather than one name per capability.
+
+#### Steps 1-3 — create, turn, hibernate, wake
+
+| step | observed |
+| ---- | -------- |
+| create (spawn + `initialize` + `session/new`) | **1.82 s** warm |
+| turn 1, `"Remember the token OMNI-M1 and reply OK."` | **4.54 s**, `verdict: "ok"`, `stopReason: "end_turn"`, text `"OK"` |
+| `idleTimeoutMs: 400` fires → `hibernated` | **0.96 s** after the turn; `process: null`, `waitGone(pid)` true, `lease.holder: null` |
+| turn 2 on a hibernated worker (auto-wake + turn) | **6.63 s** total, of which the resume itself was **1.82 s** |
+
+The `ResumeReport` the wake recorded:
+
+```json
+{ "outcome": "landed", "hint": "ok", "rule": "rule7:landed", "method": "session/resume",
+  "requested": "59921f25-cd02-43f9-8f5c-1fa403fb8433",
+  "landedOn":  "59921f25-cd02-43f9-8f5c-1fa403fb8433",
+  "historyLost": false, "acp": null,
+  "replayedEvents": 0, "replayDropped": 0, "durationMs": 1819 }
+```
+
+`generation` went 1 → 2, `seq` continued (no restart at 1), `persistence: "durable"`, and the agent
+answered turn 2 with **`OMNI-M1`** — which is the point of the whole exercise: the AGENT's model context
+survived, not merely our log.
+
+**Two observations that CONTRADICT the corpus README, recorded here rather than smoothed over.**
+
+1. **`replayedEvents: 0`.** F16 measured `session/load` replaying the conversation as `session/update`
+   notifications between the request and its response. `session/resume` — the spelling the descriptor
+   PREFERS, and the one the probe selects — replays **nothing** on 0.73.0: the context is restored inside
+   the agent and the client is told nothing about it. The daemon is correct either way (the replay window is
+   opened around the call and closes empty), and D6's marking is still exercised hermetically by
+   `fixture-hybrid`, whose `session/resume` does replay. **The descriptor is not changed**: `replayFrom` is
+   already `false` for this runtime and the map's behaviour does not depend on the count. What changes is
+   the expectation — a `landed` resume with `replayedEvents: 0` is normal for claude-acp, and a future
+   reader should not treat a zero as a broken window.
+2. **`events.db` is 4 KB on disk and 96 KB by `GET /v1/info`.** Both numbers are true: WAL mode keeps the
+   recent pages in `events.db-wal` until a checkpoint, so a `statSync` immediately after a run sees only the
+   header page while the daemon's own accounting sees the whole database. `DaemonInfo.persistence.sizeBytes`
+   is the one to read; a bare `ls -l events.db` under-reports by an order of magnitude and is not evidence
+   that nothing was written. (`writeFailures: 0`, `schemaVersion: 1`, `retentionDays: 7`.)
+
+#### The `-32002` cwd mismatch — F15, reproduced live for the first time
+
+F15 recorded this shape in the corpus README and in **no committed transcript**. Driven at the probe layer
+(§4 step 3's second half: a throwaway process opens a session in one directory and a second one asks to
+resume it from another), 0.73.0 answers:
+
+```json
+{ "code": -32002,
+  "message": "Resource not found: f47bbc46-e452-4371-baf6-b3c64473a5f4",
+  "data": { "uri": "f47bbc46-e452-4371-baf6-b3c64473a5f4" } }
+```
+
+`classifyResume` puts that at **rule 4 → `unknown` / `hint: "cwd_mismatch"`, pointer KEPT** — the
+`isResourceNotFoundShape` arm matches on both halves (the message text and `data.uri` with `-32002`), and
+`PERMANENT_TEXT` deliberately does not match it. Ruling M1-R6 chose `unknown` over `rejected_transient` for
+exactly this: the pointer survives, the session is still alive, and only the request was wrong.
+
+#### What this run does NOT establish
+
+DESIGN §11's criterion is "同一份 SDK 代码对五个 v1 目标 agent 行为一致", and **one** real agent cannot
+falsify it. §11.6 already records that. What this run does establish is that the identical script — the same
+thirteen cases, the same assertions, no branches — is green against `claude-acp` and against nine hermetic
+agents, and that adding the tenth is a YAML edit (`tests/compat/README.md`).

@@ -25,6 +25,12 @@ agents:
       }
     # Unmet ⇒ "skipped: precondition", never a pass and never a hard failure (§18.3).
     requires: { login: "claude-code" }
+    # What this runtime is expected to EXERCISE. `resume` is deliberately absent: the probe
+    # measures it (`ProbeSummary.resumeMethod`) and a YAML that claimed otherwise would be a
+    # second opinion about a fact we measure. The three below cannot be probed for — no method
+    # battery can tell you whether an agent will reach for a tool when you ask it something —
+    # and all three are recorded in the corpus (02 reads, 04 permission, 14 cancel).
+    provides: [tools, permission, cancel]
     # Observed on this machine, 2026-09-04: initialize ~7 s cold / ~1.5 s warm, `loadSession: true`,
     # sessionCapabilities list/resume/close/delete/fork.
     budgets:
@@ -39,6 +45,11 @@ agents:
       quirks: { resumeRequiresSameCwd: true }
     # The `config` skip source (§18.3). Every reason is at least 10 characters and names the
     # evidence, because a skip nobody can argue with is the only kind worth having.
+    #
+    # These four name CORPUS GAPS rather than cases this suite implements — they are §18.2's own
+    # rows, kept verbatim. The runner reports each one under its own name with its own reason, so
+    # M1-PLAN §5's "the four corpus gaps stay visible in every run" is literally true of
+    # `compat-report.json` rather than being a claim about a file nobody prints.
     skip:
       - {
           case: plan-update,

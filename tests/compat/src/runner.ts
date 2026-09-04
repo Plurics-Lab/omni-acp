@@ -209,6 +209,29 @@ export function runCompatSuite(selection: CompatSelection, o: { reportPath: stri
         };
       };
 
+      /**
+       * §18.2's four `claude-acp` rows — `plan-update`, `agent-thought`, `current-mode-update`,
+       * `git-patch` — name CORPUS GAPS rather than cases in this suite, and M1-PLAN §5's
+       * definition of done asks that they "stay visible in every run rather than decaying into
+       * silence". A declared skip whose case this suite does not implement is therefore REPORTED
+       * under its own name with its own reason, instead of being silently dead config.
+       */
+      const implemented = new Set(compatCases().map((c) => c.id));
+      for (const declared of agent.skip ?? []) {
+        if (implemented.has(declared.case)) continue;
+        it(`${declared.case} (declared gap)`, (t) => {
+          results.push({
+            agent: agent.id,
+            case: declared.case,
+            status: "skipped",
+            source: "config",
+            reason: declared.reason,
+            durationMs: 0,
+          });
+          t.skip(`config: ${declared.reason}`);
+        });
+      }
+
       for (const test of compatCases()) {
         it(test.id, async (t) => {
           const started = Date.now();
