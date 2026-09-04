@@ -8,6 +8,7 @@ import {
   type EventListener,
   type EventLog,
   type Normalizer,
+  type PersistedEventLogOptions,
   type PromptAccepted,
   type SessionId,
   type Seq,
@@ -18,6 +19,7 @@ import {
   type WorkerCloseReason,
   type WorkerHandle,
   type WorkerId,
+  type WorkerRow,
   type WorkerSnapshot,
   type WorkerState,
 } from "@omni-acp/protocol";
@@ -50,10 +52,12 @@ interface Sub {
   readonly onOverflow: ((lastDelivered: Seq) => void) | undefined;
 }
 
-export function testEventLog(o: MemoryEventLogOptions): EventLog {
+export function testEventLog(o: MemoryEventLogOptions & { startSeq?: Seq }): EventLog {
   const ring: EventEnvelope[] = [];
   const subs = new Set<Sub>();
-  let head: Seq = 0;
+  // §14.4 / ruling M1-R2: a rehydrated log continues the worker's seq space rather than
+  // restarting it at 1 — the bug that quietly forks one worker's history into two.
+  let head: Seq = o.startSeq ?? 0;
   let sessionId: SessionId | null = null;
   let logClosed = false;
 
@@ -179,6 +183,166 @@ export function testEventLog(o: MemoryEventLogOptions): EventLog {
       sessionId = id;
     },
   };
+}
+
+/**
+ * The write-through log M1-WP-A's `createPersistedEventLog` will be: the SAME ring, plus a sink
+ * (ruling M1-R1 — write-through behind the existing ring, never a deserializing `read()`).
+ *
+ * `startSeq` is what makes `seq` continue after a restart rather than restarting at 1 (§14.4,
+ * ruling M1-R2), and it is modelled here because the daemon-wiring tests assert exactly that:
+ * adoption's envelopes must land at the next seq a reconnecting client expects.
+ *
+ * A `put` that throws does NOT fail the append (§14.3): the log stays correct in RAM, the
+ * subscriber still receives the envelope, and `seq` stays gap-free.
+ */
+export function testPersistedEventLog(
+  o: PersistedEventLogOptions & { maxEvents?: number; subscriberQueueSize?: number },
+): EventLog {
+  const inner = testEventLog({
+    workerId: o.workerId,
+    daemonId: o.daemonId,
+    clock: o.clock,
+    maxEvents: o.maxEvents ?? o.config.maxEventsPerWorker,
+    subscriberQueueSize: o.subscriberQueueSize ?? o.queueSize ?? o.config.subscriberQueueSize,
+    ...(o.startSeq === undefined ? {} : { startSeq: o.startSeq }),
+  });
+
+  const sink = (envelope: EventEnvelope): EventEnvelope => {
+    try {
+      o.store.put(envelope);
+    } catch {
+      // Degraded, not broken (§14.3). `EventStoreDiagnostics.writeFailures` is the report.
+    }
+    return envelope;
+  };
+
+  return {
+    ...inner,
+    get head(): Seq {
+      return inner.head;
+    },
+    get tail(): Seq {
+      return inner.tail;
+    },
+    get subscriberCount(): number {
+      return inner.subscriberCount;
+    },
+    append: (input) => sink(inner.append(input)),
+    appendAll: (inputs) => inner.appendAll(inputs).map(sink),
+  };
+}
+
+/**
+ * The permissive lease, restated rather than imported.
+ *
+ * This module IS the `@omni-acp/core` mock, so an `import { alwaysGrantedLease }` here would
+ * resolve to the mocked binding it is itself defining — a cycle that reads fine and returns the
+ * partial double, not the real one.
+ */
+function permissiveLease(snapshot: WorkerSnapshot): WorkerHandle["lease"] {
+  const value = {
+    workerId: snapshot.workerId,
+    holder: { tokenId: snapshot.ownerTokenId, clientId: null },
+    epoch: 0,
+    expiresAt: null,
+    acquiredAt: null,
+    pinned: false,
+  };
+  const no = (what: string): never => {
+    throw new OmniError("bad_request", `lease.${what}() is M1-WP-D's`);
+  };
+  return {
+    holder: value.holder,
+    epoch: 0,
+    snapshot: () => value,
+    assertHolder: () => value,
+    acquire: () => no("acquire"),
+    release: () => no("release"),
+    steal: () => no("steal"),
+    pinExpiry: () => () => {},
+    releaseForHibernate: () => value,
+    onChange: () => () => {},
+    close: () => {},
+  } as WorkerHandle["lease"];
+}
+
+/**
+ * A handle over a PERSISTED row with no process — M1-WP-C's `createRehydratedWorker` as the
+ * daemon can observe it (§14.8).
+ *
+ * The one behaviour the wiring tests actually depend on is §15.6 level 3: a `closed` row
+ * pre-resolves its close with the PERSISTED `CloseResult`, byte for byte, so a `DELETE` after a
+ * restart returns the same body as the one before it.
+ */
+export function testRehydratedWorker(row: WorkerRow, log: EventLog): WorkerHandle {
+  let snapshot = row.snapshot;
+  const stateListeners = new Set<(s: WorkerState, prev: WorkerState | null) => void>();
+  const closeResult: CloseResult = row.closeResult ?? {
+    workerId: snapshot.workerId,
+    state: "closed",
+    reason: snapshot.closeReason ?? "daemon_shutdown",
+    leaderExited: false,
+    treeGone: false,
+    sessionClosed: false,
+  };
+  /**
+   * `closed` is created ONCE, up front, exactly as the real `Worker`'s constructor creates it.
+   *
+   * A getter that manufactured a fresh never-settling promise while the worker was still open
+   * would silently drop every `handle.closed.then(...)` a caller attached before the close —
+   * which is where the registry's slot accounting and subscription teardown live. The bug is
+   * invisible until something closes, so the double has to have the same shape as the thing.
+   */
+  let settleClosed!: (r: CloseResult) => void;
+  const closedPromise = new Promise<CloseResult>((resolve) => {
+    settleClosed = resolve;
+  });
+  let closing: Promise<CloseResult> | null = null;
+  if (snapshot.state === "closed") {
+    closing = Promise.resolve(closeResult);
+    settleClosed(closeResult);
+  }
+
+  const setState = (next: WorkerState): void => {
+    const previous = snapshot.state;
+    snapshot = { ...snapshot, state: next };
+    for (const cb of stateListeners) cb(next, previous);
+  };
+
+  const handle: WorkerHandle = {
+    id: snapshot.workerId,
+    log,
+    lease: permissiveLease(snapshot),
+    snapshot: () => snapshot,
+    prompt: () => Promise.reject(new OmniError("worker_closed", "rehydrated: no process")),
+    cancel: () => Promise.resolve(),
+    close(reason): Promise<CloseResult> {
+      closing ??= (async () => {
+        setState("closed");
+        const result = { ...closeResult, reason };
+        settleClosed(result);
+        return result;
+      })();
+      return closing;
+    },
+    turn: (turnId) => turnStatus(turnId, log.read(0)),
+    onStateChange(cb): () => void {
+      stateListeners.add(cb);
+      return () => stateListeners.delete(cb);
+    },
+    closed: closedPromise,
+    hibernate(): Promise<WorkerSnapshot> {
+      setState("hibernated");
+      return Promise.resolve(snapshot);
+    },
+    wake(): Promise<WorkerSnapshot> {
+      setState("ready");
+      return Promise.resolve(snapshot);
+    },
+    generation: snapshot.generation,
+  };
+  return handle;
 }
 
 // ── worker ───────────────────────────────────────────────────────────────────
@@ -409,6 +573,36 @@ export async function testCreateWorker(
       return () => stateListeners.delete(cb);
     },
 
+    /**
+     * M1's two lifecycle verbs, as the REGISTRY can observe them (§15.2, §15.3).
+     *
+     * The ordering argument, the resume classifier and the wake-failure counter are
+     * `worker.ts`'s and M1-WP-C's; what the daemon-wiring suite needs is a handle whose state
+     * actually MOVES, so that the slot accounting, `hibernatedSize` and the 429 on a wake are
+     * assertions rather than tautologies. Both are idempotent, like the real ones.
+     */
+    hibernate(): Promise<WorkerSnapshot> {
+      if (state === "hibernated") return Promise.resolve(snapshot());
+      if (currentTurnId !== null) {
+        return Promise.reject(new OmniError("worker_busy", "a turn is already running"));
+      }
+      setState("hibernated");
+      return Promise.resolve(snapshot());
+    },
+
+    wake(): Promise<WorkerSnapshot> {
+      if (state === "closed") {
+        return Promise.reject(new OmniError("worker_closed", `worker ${deps.workerId} is closed`));
+      }
+      if (state !== "hibernated") return Promise.resolve(snapshot());
+      setState("ready");
+      return Promise.resolve(snapshot());
+    },
+
+    get generation(): number {
+      return state === "starting" ? 0 : 1;
+    },
+
     closed,
   };
 
@@ -494,6 +688,10 @@ export async function fakeCoreModule(
     createMemoryEventLog: testEventLog,
     createNormalizer: testNormalizer,
     createWorker: testCreateWorker,
+    // M1's two: the write-through log (M1-WP-A) and the handle over a persisted row (M1-WP-C).
+    // Both are stubs in this tree, and both are on the daemon-wiring path this suite drives.
+    createPersistedEventLog: testPersistedEventLog,
+    createRehydratedWorker: (row, log) => testRehydratedWorker(row, log),
     alwaysGrantedLease: (holder) => ({
       holder,
       assertHolder: () => {},

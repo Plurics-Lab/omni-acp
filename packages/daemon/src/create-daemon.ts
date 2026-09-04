@@ -21,10 +21,14 @@ import type { Hono } from "hono";
 import { createTokenStore } from "./auth.js";
 import { createCatalog } from "./catalog.js";
 import { systemClock } from "./clock.js";
+import { armRetention, openDaemonPersistence } from "./event-store.js";
 import { createHttpApp } from "./http/app.js";
 import { loadOrCreateDaemonId, resolvePath } from "./ids-file.js";
 import { createLogger } from "./logger.js";
+import { createProbeCache } from "./probe-cache.js";
+import { createProbeService } from "./probe-service.js";
 import { createWorkerRegistry } from "./registry.js";
+import type { BootRecoveryResult } from "./boot-recovery.js";
 import type { AuthContext, Daemon, DaemonDeps, DaemonEvent } from "./types.js";
 
 /**
@@ -63,19 +67,59 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
 
   await mkdir(resolved.dataDir, { recursive: true });
   const daemonId = await resolveDaemonId(resolved, ids);
+
+  /**
+   * The boot sequence §14 and §15.7 prescribe, in order: OPEN persistence (which takes the
+   * data-dir lock and migrates, §14.10 / §14.7), then boot adoption, then the retention timer.
+   *
+   * An injected handle wins, so a test drives the whole wiring without a database file and an
+   * embedder can supply its own store. `null` is the memory driver, still the default (ruling
+   * M1-R17) — `omni-acp start` is what writes `"sqlite"` into the config it builds.
+   */
+  const persistence =
+    deps?.persistence ?? (await openDaemonPersistence({ config: resolved, clock, logger }));
+
   /**
    * This BOOT's id, distinct from the persistent `daemonId` (§15.7). It is what lets boot
-   * adoption recognise a worker row a PREVIOUS boot owned; `deps.persistence` carries the
-   * authoritative one once M1-WP-A opens the store, and until then a per-process value is the
-   * honest answer for a daemon whose rows never leave memory.
+   * adoption recognise a worker row a PREVIOUS boot owned; the store carries the authoritative
+   * one, and a per-process value is the honest answer for a daemon whose rows never leave memory.
    */
-  const bootId = deps?.persistence?.bootId ?? `boot_${ids.request()}`;
+  const bootId = persistence?.bootId ?? `boot_${ids.request()}`;
 
   const tokens = createTokenStore(resolved);
-  const catalog = createCatalog(resolved);
   const supervisor =
     deps?.supervisor ??
     createSupervisor({ config: resolved.supervisor, clock, logger: logger.child({ mod: "sup" }) });
+
+  /**
+   * The probe layer, wired into the catalog by a late-bound hook.
+   *
+   * The cycle is real — the probe service asks the catalog for a `SpawnSpec` and a descriptor,
+   * and the catalog's `probe()` façade row hands H16 back to the probe service — so `catalog`
+   * is built first with a hook that reads `probes` out of the closure. There is no window in
+   * which the hook can fire early: nothing calls `catalog.probe` during construction.
+   */
+  const probeCache = createProbeCache({ dataDir: resolved.dataDir, logger });
+  let probes: ReturnType<typeof createProbeService> | null = null;
+  const catalog = createCatalog(resolved, {
+    hooks: {
+      cached: (agentId) => probes?.cached(agentId) ?? null,
+      run: (id, body, auth) => {
+        if (probes === null) {
+          return Promise.reject(new OmniError("internal", "the probe service is not ready"));
+        }
+        return probes.probe(id, body, auth);
+      },
+    },
+  });
+  probes = createProbeService({
+    config: resolved,
+    catalog,
+    supervisor,
+    cache: probeCache,
+    clock,
+    logger,
+  });
   // M0 wires the fixed auto-DENY responder and nothing else: the first remote-execution surface
   // ships fail-closed (D4/L7, CONTRACTS.md §7.4).
   const responder = deps?.responder ?? createBaselineResponder("deny", clock);
@@ -99,6 +143,16 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     }
   };
 
+  /** Boot adoption's full result, captured from the ONE pass `workers.adopt()` runs below. */
+  let adoption: BootRecoveryResult = {
+    found: 0,
+    reaped: 0,
+    skipped: 0,
+    hibernated: 0,
+    closed: 0,
+    orphans: [],
+  };
+
   const workers = createWorkerRegistry({
     daemonId,
     config: resolved,
@@ -112,10 +166,56 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     // `createLease` once M1-WP-D lands it; until then an injected factory is the only way a test
     // gets an enforcing lease, and it is one line rather than a shared hunk.
     ...(deps?.leaseFactory === undefined ? {} : { leaseFactory: deps.leaseFactory }),
+    // Seam 2: absent ⇒ `worker.ts`'s inline M0 handshake, so the M0 suite runs untouched.
+    ...(deps?.session === undefined ? {} : { session: deps.session }),
+    persistence,
+    onBootAdoption: (r) => {
+      adoption = r;
+    },
     onEnvelope: (workerId, envelope) => {
       emit(workerId as WorkerId, envelope as EventEnvelope);
     },
   });
+
+  // Boot adoption runs ONCE, here, before `start()` can bind a port (§15.7, H21): every row a
+  // previous boot abandoned converges on `hibernated` or `closed`, with the orphan recorded
+  // whether or not it could be reaped. It is a no-op on a second run and for the memory driver.
+  await workers.adopt();
+
+  // The retention sweep, armed last so it cannot race adoption for the same rows (§14.5).
+  const retention = armRetention({ persistence, config: resolved, clock, logger });
+
+  /**
+   * `probe.onStart` (§17.4). The DEFAULT is `"cached"`, which LOADS `<dataDir>/probes/*.json`
+   * and spawns nothing: an operator with eight agents configured must not pay eight `npx` cold
+   * starts to bind a port. `"always"` is the explicit lever for the operator who wants exactly
+   * that, and a broken agent there is a log line rather than a daemon that will not start.
+   */
+  await probes.warmup().catch((e: unknown) => {
+    logger.warn("probe warmup failed", { error: String(e) });
+  });
+
+  /**
+   * §14.9's honesty contract, extended: an operator reads these BEFORE anything goes wrong.
+   *
+   * A GETTER rather than a frozen literal, because `writeFailures`, `sizeBytes` and `lastSweep`
+   * all change while the daemon runs — a snapshot taken at construction would report a healthy
+   * store forever, which is the opposite of what `writeFailures` exists to say.
+   */
+  const persistenceInfo = (): DaemonInfo["persistence"] => {
+    const diagnostics = persistence?.events.diagnostics;
+    return {
+      // What is in FORCE, not what was configured: an operator must never have to guess whether
+      // this daemon's logs survive a restart (§14.9).
+      driver: diagnostics?.driver ?? "memory",
+      file: diagnostics?.file ?? null,
+      schemaVersion: diagnostics?.schemaVersion ?? 0,
+      sizeBytes: diagnostics?.sizeBytes ?? 0,
+      writeFailures: diagnostics?.writeFailures ?? 0,
+      retentionDays: resolved.eventLog.retentionDays,
+      lastSweep: retention.lastSweep,
+    };
+  };
 
   const info: DaemonInfo = Object.freeze({
     daemonId,
@@ -140,22 +240,21 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
      * wrong: whether this daemon's logs survive a restart, whether they still do, and what a
      * previous boot left behind — including `skipped: n` on Windows, where nothing can be reaped.
      *
-     * They report the state of a daemon with no persistence opened, which is exactly what
-     * `eventLog.driver: "memory"` (still the default, ruling M1-R17) means. M1-WP-E wires them
-     * to the real `PersistenceHandle` and to `recoverFromPreviousBoot`.
+     * `persistence` is a live view (the getter above); `orphansAtStart` is deliberately frozen at
+     * what the ONE adoption pass found, because "at start" is exactly what it claims to be.
      */
-    persistence: {
-      driver: resolved.eventLog.driver === "sqlite" ? ("sqlite" as const) : ("memory" as const),
-      file: null,
-      schemaVersion: 0,
-      sizeBytes: 0,
-      writeFailures: 0,
-      retentionDays: resolved.eventLog.retentionDays,
-      lastSweep: null,
+    get persistence(): DaemonInfo["persistence"] {
+      return persistenceInfo();
     },
     /** This daemon INSTANCE's id — not `daemonId`, which is stable across boots (§15.7). */
     bootId,
-    orphansAtStart: { found: 0, reaped: 0, skipped: 0 },
+    orphansAtStart: Object.freeze({
+      found: adoption.found,
+      reaped: adoption.reaped,
+      // On win32 `PlatformOps.fingerprint` is null by design, so nothing is ever reaped and this
+      // is `found` — `{found: 3, reaped: 0, skipped: 3}` rather than a quiet lie (§15.7, M1-R9).
+      skipped: adoption.skipped,
+    }),
   });
 
   // Bound lazily so that `createHttpApp(daemon)` can close over the finished object. The import
@@ -254,6 +353,28 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
             return [];
           });
         await closeServer();
+        /**
+         * The store closes LAST, after `closeAll` (M1-PLAN WP-E acceptance 5).
+         *
+         * `closeAll` is what appends every worker's `omni.worker_state{closed}`, and closing the
+         * store first would drop exactly the envelopes that tell the next boot each worker shut
+         * down cleanly — which is the difference between a clean stop and a fleet of orphans on
+         * the next start. There is no separate `flush()` to call: `EventStore.put` is
+         * SYNCHRONOUS (§5.1 — `DatabaseSync` is, and an async `put` would reintroduce the
+         * interleave a non-monotonic `seq` is), so a returned `append` is already durable and
+         * `close()` is the barrier.
+         *
+         * An injected handle is NOT closed here: it belongs to whoever injected it, and closing
+         * somebody else's store is how a test that reuses one file across two daemons breaks.
+         */
+        retention.stop();
+        if (deps?.persistence === undefined) {
+          try {
+            persistence?.close();
+          } catch (e) {
+            logger.warn("closing persistence failed", { error: String(e) });
+          }
+        }
         url = null;
         starting = null;
         logger.info("daemon stopped", { daemonId });
@@ -332,14 +453,10 @@ function parseConfig(config: DaemonConfig): ResolvedDaemonConfig {
     );
   }
 
-  if (parsed.eventLog.driver !== "memory") {
-    // Parses, and is rejected here: the config SHAPE does not change in M1, only this line
-    // does (CONTRACTS.md §8.1).
-    throw new OmniError(
-      "bad_request",
-      `eventLog.driver "${parsed.eventLog.driver}" is M1; M0 supports "memory" only`,
-    );
-  }
+  // M0 refused every driver but `"memory"` here; M1 is the milestone that removes that line
+  // (§8.1). `"memory"` remains the DEFAULT (ruling M1-R17) — `createDaemon()` keeps a zero-file,
+  // zero-experimental-module footprint so `OmniACP.local()` in a user's script does not leave a
+  // database behind, and `omni-acp start` is what writes `"sqlite"` into the config it builds.
 
   // Every path the daemon stores is absolute and `~`-expanded, so `daemon.config` reads the same
   // as what is on disk.

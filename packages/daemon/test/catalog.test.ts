@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { DaemonConfig, OmniError } from "@omni-acp/protocol";
-import { createCatalog } from "../src/catalog.js";
+import { createCatalog, runtimeIdFor } from "../src/catalog.js";
 
 const AGENT = {
   id: "example",
@@ -27,9 +27,11 @@ describe("Catalog (H4, D22)", () => {
         args: ["--version"],
         source: "config",
         probed: null,
-        // Which quirk table WILL govern a worker created now (§5.1 AgentCatalogEntry).
-        // `unresolved` is the fingerprint sentinel until M1-WP-E computes the real sha256.
-        runtimeId: "example@unresolved",
+        // Which quirk table WILL govern a worker created now (§5.1 AgentCatalogEntry): the
+        // agent id, then 12 hex characters of the real sha256 over command ⊕ args ⊕ version.
+        // Asserted through `runtimeIdFor` rather than as a literal, because a hard-coded digest
+        // would encode `process.execPath` — different on every machine and in CI.
+        runtimeId: runtimeIdFor(config().agents[0]!, null),
       },
     ]);
   });
