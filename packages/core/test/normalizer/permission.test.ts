@@ -1,11 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createBaselineResponder } from "@omni-acp/core";
-import {
-  fakeClock,
-  fakeRuntime,
-  transcriptRequests,
-  transcriptUpdates,
-} from "@omni-acp/testkit";
+import { fakeClock, fakeRuntime, transcriptUpdates } from "@omni-acp/testkit";
+import { transcriptRequests } from "./support/corpus-facts.js";
 import type { MappedPermissionRequest, PermissionOption } from "@omni-acp/protocol";
 import { mapPermissionRequest } from "../../src/normalizer/map/permission.js";
 import { claudeAcpDescriptor } from "./support/claude-acp.js";
@@ -132,9 +128,9 @@ describe("§12.6 — `title` precedence is evidence-ordered and never empty", ()
   });
 
   it("3. then a constructed `<kind>: <name|toolCallId>` — still TRUE, not a placeholder", () => {
-    expect(map({ ...base, toolCall: { toolCallId: "c1", kind: "edit", name: "Write" } }).title).toBe(
-      "edit: Write",
-    );
+    expect(
+      map({ ...base, toolCall: { toolCallId: "c1", kind: "edit", name: "Write" } }).title,
+    ).toBe("edit: Write");
     expect(map({ ...base, toolCall: { toolCallId: "c1", kind: "edit" } }).title).toBe("edit: c1");
     expect(map({ ...base, toolCall: { toolCallId: "c1" } }).title).toBe("tool_call: c1");
   });
@@ -158,9 +154,9 @@ describe("§12.6 — the responder REFUSES an optionId the agent did not offer (
         const optionId = decision.record.optionId;
         expect(optionId).not.toBeNull();
         expect(offered.has(optionId as string)).toBe(true);
-        expect(
-          (decision.response as { outcome: { optionId: string } }).outcome.optionId,
-        ).toBe(optionId);
+        expect((decision.response as { outcome: { optionId: string } }).outcome.optionId).toBe(
+          optionId,
+        );
       }
     }
   });

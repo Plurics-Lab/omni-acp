@@ -23,8 +23,15 @@ export interface TranscriptLine {
   raw?: string;
 }
 
-/** `<repo>/docs/research/transcripts/claude-acp-0.73.0`, from `dist/corpus.js` or `src`. */
-export function transcriptDir(): string {
+/**
+ * `<repo>/docs/research/transcripts/claude-acp-0.73.0`, from `dist/corpus.js` or `src`.
+ *
+ * NOT exported: `packages/testkit/src/index.ts` is a frozen `export *` barrel and
+ * `exports-are-stable` pins its surface to §5.7's list exactly. Everything a test needs beyond
+ * the three functions §5.7 names is DERIVED from `loadTranscript` in the test tree that needs it
+ * (`core/test/normalizer/support/corpus-facts.ts`), which keeps the published surface honest.
+ */
+function transcriptDir(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   // dist/corpus.js  ->  packages/testkit  ->  packages  ->  <repo root>
   return join(here, "..", "..", "..", "docs", "research", "transcripts", "claude-acp-0.73.0");
@@ -91,55 +98,6 @@ export function transcriptUpdates(name: string): readonly Record<string, unknown
     const msg = line.msg as SessionUpdateMessage | undefined;
     if (msg?.method !== "session/update") return [];
     const update = msg.params?.update;
-    return typeof update === "object" && update !== null
-      ? [update as Record<string, unknown>]
-      : [];
+    return typeof update === "object" && update !== null ? [update as Record<string, unknown>] : [];
   });
-}
-
-/** Every recorded update across every transcript, tagged with the scenario it came from. */
-export function allTranscriptUpdates(): readonly {
-  readonly name: string;
-  readonly index: number;
-  readonly update: Record<string, unknown>;
-}[] {
-  return transcriptNames().flatMap((name) =>
-    transcriptUpdates(name).map((update, index) => ({ name, index, update })),
-  );
-}
-
-/** Every `agent->client` REQUEST (never a notification) whose method is `method`. */
-export function transcriptRequests(
-  name: string,
-  method: string,
-): readonly Record<string, unknown>[] {
-  return loadTranscript(name).flatMap((line) => {
-    if (line.dir !== "agent->client") return [];
-    const msg = line.msg as { method?: unknown; id?: unknown; params?: unknown } | undefined;
-    if (msg?.method !== method || msg.id === undefined) return [];
-    const params = msg.params;
-    return typeof params === "object" && params !== null
-      ? [params as Record<string, unknown>]
-      : [];
-  });
-}
-
-/** The agent's answer to the client request with this id — the `initialize` / `session/new` body. */
-export function transcriptResult(name: string, id: number): unknown {
-  for (const line of loadTranscript(name)) {
-    if (line.dir !== "agent->client") continue;
-    const msg = line.msg as { id?: unknown; result?: unknown } | undefined;
-    if (msg?.id === id && msg.result !== undefined) return msg.result;
-  }
-  return undefined;
-}
-
-/** The agent's JSON-RPC error for the client request with this id, or `undefined`. */
-export function transcriptError(name: string, id: number): unknown {
-  for (const line of loadTranscript(name)) {
-    if (line.dir !== "agent->client") continue;
-    const msg = line.msg as { id?: unknown; error?: unknown } | undefined;
-    if (msg?.id === id && msg.error !== undefined) return msg.error;
-  }
-  return undefined;
 }

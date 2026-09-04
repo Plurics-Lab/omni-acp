@@ -27,16 +27,3 @@ export function wireAgentPath(): string {
   // dist/wire-agent.js -> <package root>/fixtures/agents/wire.mjs
   return join(here, "..", "fixtures", "agents", "wire.mjs");
 }
-
-/** The environment `wireAgentPath()` needs, so a caller cannot spell a knob wrong. */
-export function wireAgentEnv(o: {
-  transcript: string;
-  speed?: number;
-  stopReason?: string;
-}): Record<string, string> {
-  return {
-    WIRE_TRANSCRIPT: o.transcript,
-    ...(o.speed === undefined ? {} : { WIRE_SPEED: String(o.speed) }),
-    ...(o.stopReason === undefined ? {} : { WIRE_STOP_REASON: o.stopReason }),
-  };
-}

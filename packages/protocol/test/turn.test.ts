@@ -1,3 +1,6 @@
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   reduceTurn,
@@ -323,5 +326,377 @@ describe("reduceTurn edge cases", () => {
     const view = reduceTurn(T, second).toolCalls[0];
     expect("rawInput" in (view ?? {})).toBe(true);
     expect(view?.rawInput).toBeNull();
+  });
+});
+
+// ── M1: the projection (CONTRACTS.md §12.5, §13.4, ruling M1-R5) ────────────
+
+const policyDecision = (
+  o: { decision: "allow" | "deny" | "error"; toolCallId: string | null; title?: string },
+  turnId: TurnId = T,
+) =>
+  env(
+    {
+      kind: "omni.policy_decision",
+      payloadVersion: 2,
+      payload: {
+        requestId: `req_${o.toolCallId ?? "none"}`,
+        title: o.title ?? "a tool call",
+        decision: o.decision,
+        rule: "m0:auto-deny",
+        optionId: o.decision === "deny" ? "reject" : "allow-once",
+        offered: [],
+        toolCallId: o.toolCallId,
+      },
+    },
+    turnId,
+  );
+
+const toolCall = (o: { id: string; status?: string; content?: unknown[] }, turnId: TurnId = T) =>
+  env(
+    {
+      kind: "acp.session_update",
+      payloadVersion: 2,
+      payload: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: o.id,
+        ...(o.status === undefined ? {} : { status: o.status }),
+        ...(o.content === undefined ? {} : { content: o.content }),
+      } as never,
+    },
+    turnId,
+  );
+
+/** A v2 diff block carrying §12.5's `omni/v1Diff`, which is where the text lives. */
+const v2Diff = (o: {
+  path: string;
+  operation: string;
+  oldText: string | null;
+  newText: string;
+  fragment: boolean;
+}) => ({
+  type: "diff",
+  changes: [{ operation: o.operation, path: o.path }],
+  _meta: { "omni/v1Diff": { oldText: o.oldText, newText: o.newText, fragment: o.fragment } },
+});
+
+const idleWithMeta = (meta: Record<string, unknown>, turnId: TurnId = T) =>
+  env(
+    {
+      kind: "acp.session_update",
+      payloadVersion: 2,
+      payload: {
+        sessionUpdate: "state_update",
+        state: "idle",
+        stopReason: "end_turn",
+        _meta: meta,
+      } as never,
+    },
+    turnId,
+  );
+
+describe("reduceTurn skips `replay: true` envelopes (ruling M1-R5)", () => {
+  it("does not fold a replayed chunk into `text`", () => {
+    const replayed = { ...chunk("REPLAYED "), replay: true as const };
+    const result = reduceTurn(T, [running(), replayed, chunk("live"), idle("end_turn")]);
+    expect(result.text).toBe("live");
+  });
+
+  it("does not count a replayed tool call or policy decision", () => {
+    const events = [
+      running(),
+      { ...toolCall({ id: "ghost", status: "failed" }), replay: true as const },
+      { ...policyDecision({ decision: "deny", toolCallId: "ghost" }), replay: true as const },
+      idle("end_turn"),
+    ];
+    const result = reduceTurn(T, events);
+    expect(result.toolCalls).toEqual([]);
+    expect(result.failedToolCalls).toEqual([]);
+    expect(result.deniedToolCalls).toEqual([]);
+    expect(result.verdict).toBe("ok");
+  });
+
+  it("a replayed `worker_state{closed}` does not end the turn", () => {
+    // The one that matters most: a replayed history that happened to contain a close would end
+    // every turn folded beside it, and the daemon's own log is the authority (README finding 8).
+    const closed = {
+      ...env(
+        {
+          kind: "omni.worker_state",
+          payloadVersion: 2,
+          payload: { state: "closed", previous: "running", reason: "client_request" },
+        },
+        null,
+      ),
+      replay: true as const,
+    };
+    const events = [running(), closed, chunk("still here"), idle("end_turn")];
+    const result = reduceTurn(T, events);
+    expect(result.error).toBeNull();
+    expect(result.text).toBe("still here");
+    expect(turnStatus(T, events).state).toBe("completed");
+  });
+
+  it("is still de-duplicated by `(workerId, seq)`, still order-independent, still pure", () => {
+    const events = [running(), chunk("a"), chunk("b"), idle("end_turn")];
+    const once = reduceTurn(T, events);
+    expect(reduceTurn(T, [...events, ...events.map((e) => ({ ...e }))])).toStrictEqual(once);
+    expect(reduceTurn(T, [...events].reverse())).toStrictEqual(once);
+    expect(reduceTurn(T, events)).toStrictEqual(once);
+  });
+});
+
+describe("reduceTurn reads the v2 diff shape first and the v1 shape second (§12.5)", () => {
+  it('builds a FileChange from `changes` + `_meta["omni/v1Diff"]`', () => {
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({
+        id: "c1",
+        status: "completed",
+        content: [
+          v2Diff({
+            path: "/repo/a.ts",
+            operation: "modify",
+            oldText: "old",
+            newText: "new",
+            fragment: true,
+          }),
+        ],
+      }),
+      idle("end_turn"),
+    ]);
+    expect(result.changes).toEqual([
+      {
+        path: "/repo/a.ts",
+        operation: "modify",
+        oldText: "old",
+        newText: "new",
+        // From the DESCRIPTOR, stamped by the normalizer — never derived here (F19).
+        fragment: true,
+      },
+    ]);
+  });
+
+  it("still reads a v1 block, because a persisted log can hold both", () => {
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({
+        id: "c1",
+        content: [{ type: "diff", path: "/repo/b.ts", oldText: null, newText: "created" }],
+      }),
+      idle("end_turn"),
+    ]);
+    expect(result.changes).toEqual([
+      { path: "/repo/b.ts", operation: "add", oldText: null, newText: "created", fragment: false },
+    ]);
+  });
+
+  it("contributes NO FileChange for a v2 diff with no recoverable text", () => {
+    // v2's `Diff` has no `oldText`/`newText` at all, and `FileChange.newText` is a string.
+    // Inventing `""` would tell a consumer the file is now empty; skipping is what M0 already
+    // did for a v1 block with no `newText`.
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({
+        id: "c1",
+        content: [{ type: "diff", changes: [{ operation: "add", path: "/repo/c.ts" }] }],
+      }),
+      idle("end_turn"),
+    ]);
+    expect(result.changes).toEqual([]);
+  });
+});
+
+describe("reduceTurn computes §13.4's verdict with NO agent prose", () => {
+  it("`ok` when nothing failed and nothing was denied", () => {
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({ id: "c1", status: "completed" }),
+      idle("end_turn"),
+    ]);
+    expect(result.verdict).toBe("ok");
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("`partial` from the STATUS ENUM alone", () => {
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({ id: "c1", status: "in_progress" }),
+      toolCall({ id: "c1", status: "failed" }),
+      idle("end_turn"),
+    ]);
+    expect(result.verdict).toBe("partial");
+    expect(result.failedToolCalls).toEqual(["c1"]);
+    expect(result.deniedToolCalls).toEqual([]);
+    expect(result.warnings).toEqual([
+      {
+        code: "tool_failed",
+        message: "tool call c1 ended with status failed",
+        source: "tool_status",
+        detail: { toolCallId: "c1" },
+      },
+    ]);
+  });
+
+  it("`partial` from OUR OWN denial, joined by toolCallId", () => {
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({ id: "c1", status: "pending" }),
+      policyDecision({ decision: "deny", toolCallId: "c1", title: "Write hello.txt" }),
+      idle("end_turn"),
+    ]);
+    expect(result.verdict).toBe("partial");
+    expect(result.deniedToolCalls).toEqual(["c1"]);
+    // Deny is invisible in `stopReason` (corpus finding 7), which is the whole point.
+    expect(result.stopReason).toBe("end_turn");
+  });
+
+  it("a denial with a NULL toolCallId is recorded but joins to nothing", () => {
+    const result = reduceTurn(T, [
+      running(),
+      policyDecision({ decision: "deny", toolCallId: null }),
+      idle("end_turn"),
+    ]);
+    expect(result.deniedToolCalls).toEqual([]);
+    expect(result.interactions).toHaveLength(1);
+    expect(result.verdict).toBe("ok");
+  });
+
+  it("D4 rule 4's `decision: error` is an ADVISORY, not a failure", () => {
+    const result = reduceTurn(T, [
+      running(),
+      policyDecision({ decision: "error", toolCallId: "c1" }),
+      idle("end_turn"),
+    ]);
+    expect(result.verdict).toBe("ok");
+    expect(result.warnings.map((w) => w.code)).toEqual(["permission_not_offered"]);
+  });
+
+  it("`failed` outranks `partial` when the turn also carries an error", () => {
+    const result = reduceTurn(T, [
+      running(),
+      toolCall({ id: "c1", status: "failed" }),
+      env({
+        kind: "omni.error",
+        payloadVersion: 2,
+        payload: { code: "agent_error", message: "the agent's stderr matched fatalStderr:oom" },
+      }),
+      idle("end_turn"),
+    ]);
+    expect(result.verdict).toBe("failed");
+    expect(result.failedToolCalls).toEqual(["c1"]);
+  });
+
+  it("de-duplicates a denial reported twice for one tool call", () => {
+    const result = reduceTurn(T, [
+      running(),
+      policyDecision({ decision: "deny", toolCallId: "c1" }),
+      policyDecision({ decision: "deny", toolCallId: "c1" }),
+      idle("end_turn"),
+    ]);
+    expect(result.deniedToolCalls).toEqual(["c1"]);
+  });
+});
+
+describe("reduceTurn reads §13.2's `idle` additions", () => {
+  it("`tokens` comes from `idle.usage` and `usage` from `usage_update` — two shapes, two fields", () => {
+    const result = reduceTurn(T, [
+      running(),
+      env({
+        kind: "acp.session_update",
+        payloadVersion: 2,
+        payload: { sessionUpdate: "usage_update", used: 42, size: 200 } as never,
+      }),
+      env({
+        kind: "acp.session_update",
+        payloadVersion: 2,
+        payload: {
+          sessionUpdate: "state_update",
+          state: "idle",
+          stopReason: "end_turn",
+          usage: { totalTokens: 999, inputTokens: 900, outputTokens: 99, cachedReadTokens: 5 },
+        } as never,
+      }),
+    ]);
+    expect(result.usage).toEqual({ used: 42, size: 200 });
+    expect(result.tokens).toEqual({
+      totalTokens: 999,
+      inputTokens: 900,
+      outputTokens: 99,
+      cachedReadTokens: 5,
+    });
+  });
+
+  it("omits `tokens` when `idle.usage` is not the v2 `Usage` shape", () => {
+    expect(reduceTurn(T, [running(), idleWithMeta({})]).tokens).toBeUndefined();
+  });
+
+  it("reads `warnings` and `vendorPatch` off `idle._meta`, and validates both", () => {
+    const result = reduceTurn(T, [
+      running(),
+      idleWithMeta({
+        "omni/warnings": [
+          {
+            code: "rate_limit",
+            message: "rate-limit status allowed_warning",
+            source: "usage_meta",
+          },
+          { code: "bogus", message: "no source" },
+          { code: "bogus2", message: "bad source", source: "telepathy" },
+          7,
+        ],
+        "omni/vendorPatch": {
+          format: "git_patch",
+          text: "diff --git a/x b/x\\n",
+          source: "vendor",
+        },
+      }),
+    ]);
+    expect(result.warnings).toEqual([
+      { code: "rate_limit", message: "rate-limit status allowed_warning", source: "usage_meta" },
+    ]);
+    expect(result.vendorPatch).toEqual({
+      format: "git_patch",
+      text: "diff --git a/x b/x\\n",
+      source: "vendor",
+    });
+    // D8 / M1-R11: `patch` is null even when a vendor patch is present and valid.
+    expect(result.patch).toBeNull();
+  });
+
+  it("rejects a vendorPatch in a shape it cannot vouch for", () => {
+    for (const bad of [
+      { format: "unified", text: "x", source: "v" },
+      { format: "git_patch", source: "v" },
+      { format: "git_patch", text: "x" },
+      "a patch",
+      null,
+    ]) {
+      const result = reduceTurn(T, [running(), idleWithMeta({ "omni/vendorPatch": bad })]);
+      expect(result.vendorPatch, JSON.stringify(bad)).toBeNull();
+    }
+  });
+});
+
+describe("the v1/v2 `=` rows are structurally equal AT COMPILE TIME (§12.7)", () => {
+  it("type-checks the identity fixture with zero diagnostics", () => {
+    const fixture = join(dirname(fileURLToPath(import.meta.url)), "types", "v1-v2-identity.ts");
+    const program = ts.createProgram([fixture], {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      types: [],
+    });
+    const diagnostics = ts.getPreEmitDiagnostics(program).map((d) => {
+      const where =
+        d.file && d.start !== undefined
+          ? `${d.file.fileName}:${d.file.getLineAndCharacterOfPosition(d.start).line + 1}`
+          : "<no file>";
+      return `${where} TS${String(d.code)}: ${ts.flattenDiagnosticMessageText(d.messageText, " ")}`;
+    });
+    expect(diagnostics).toEqual([]);
   });
 });

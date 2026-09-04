@@ -1,0 +1,28 @@
+{
+  "scenario": "04-tool-write-denied",
+  "note": "Write + permission DENY. end_turn, workspace empty, tool status failed (README finding 7).",
+  "stopReason": "end_turn",
+  "verdict": "partial",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 7,
+    "agent_message_chunk": 5,
+    "tool_call_update": 4
+  },
+  "toolCalls": [
+    {
+      "id": "toolu_01LGdKmGmcWVh9Mvy7x2rvpa",
+      "kind": "edit",
+      "status": "failed"
+    }
+  ],
+  "changes": [],
+  "failedToolCalls": ["toolu_01LGdKmGmcWVh9Mvy7x2rvpa"],
+  "deniedToolCalls": ["toolu_01LGdKmGmcWVh9Mvy7x2rvpa"],
+  "textIncludes": ["The file was not created."],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": []
+}

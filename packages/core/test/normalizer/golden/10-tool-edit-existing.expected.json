@@ -1,0 +1,41 @@
+{
+  "scenario": "10-tool-edit-existing",
+  "note": "The only transcript with a non-null oldText, and the one that shows structuredPatch.",
+  "stopReason": "end_turn",
+  "verdict": "ok",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 8,
+    "agent_message_chunk": 10,
+    "tool_call_update": 10
+  },
+  "toolCalls": [
+    {
+      "id": "toolu_01KgYpKyf3WXpPE5zXsuRtEp",
+      "kind": "read",
+      "status": "completed"
+    },
+    {
+      "id": "toolu_01HbWvZ8DahZP6xX5Zzj555e",
+      "kind": "edit",
+      "status": "completed"
+    }
+  ],
+  "changes": [
+    {
+      "path": "/tmp/acp-ws-edit-96xAuv/config.txt",
+      "operation": "modify",
+      "oldText": "mode = slow\nretries = 3",
+      "newText": "mode = fast\nretries = 3",
+      "fragment": true
+    }
+  ],
+  "failedToolCalls": [],
+  "deniedToolCalls": [],
+  "textIncludes": ["Done. In `config.txt`"],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": ["@@ -1,2 +1,2 @@", "-mode = slow", "+mode = fast"]
+}

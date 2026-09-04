@@ -80,8 +80,7 @@ const hasToolResponse = (u: Record<string, unknown>): boolean =>
   typeof u["_meta"] === "object" &&
   u["_meta"] !== null &&
   "claudeCode" in (u["_meta"] as object) &&
-  "toolResponse" in
-    ((u["_meta"] as { claudeCode: Record<string, unknown> }).claudeCode as object);
+  "toolResponse" in ((u["_meta"] as { claudeCode: Record<string, unknown> }).claudeCode as object);
 
 describe("§12.5 — the vendor patch, against a real git", () => {
   it("reconstructs the recorded EDIT (transcript 10) from `structuredPatch` + `originalFile`", () => {
@@ -170,7 +169,9 @@ describe("§12.5 — the vendor patch, against a real git", () => {
       {
         filePath: "/tmp/ws/a",
         originalFile: null,
-        structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] }],
+        structuredPatch: [
+          { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] },
+        ],
       },
       // An unrecognized line marker.
       {
@@ -201,7 +202,10 @@ describe("§12.5 — where the patch ends up, and where it must not", () => {
       quietMs: 250,
       hardMs: 5_000,
       descriptor: D,
-      cwd: transcript === "03-tool-write-allowed" ? "/tmp/acp-ws-wa-VxS6ru" : "/tmp/acp-ws-edit-96xAuv",
+      cwd:
+        transcript === "03-tool-write-allowed"
+          ? "/tmp/acp-ws-wa-VxS6ru"
+          : "/tmp/acp-ws-edit-96xAuv",
     });
     const out: EventEnvelope[] = [];
     let seq = 0;

@@ -20,11 +20,8 @@ const D = claudeAcpDescriptor();
 const GENERIC = fakeRuntime();
 const CONTEXT = { planId: "plan_t_00000000000000000000000001", modes: claudeAcpModes() };
 
-const map = (
-  update: unknown,
-  descriptor = D,
-  context = CONTEXT,
-): MappedUpdate => mapUpdate(update, descriptor, countingIds(), context);
+const map = (update: unknown, descriptor = D, context = CONTEXT): MappedUpdate =>
+  mapUpdate(update, descriptor, countingIds(), context);
 
 describe("§12.3 rows 1-3 — the three chunk kinds are `=` except `messageId`", () => {
   for (const sessionUpdate of [
@@ -161,9 +158,7 @@ describe("§12.3 row 6 — the diff block (§12.5)", () => {
     const out = map({
       toolCallId: "toolu_01Uq",
       sessionUpdate: "tool_call_update",
-      content: [
-        { type: "diff", path: "/tmp/ws/hello.txt", oldText: null, newText: "hello" },
-      ],
+      content: [{ type: "diff", path: "/tmp/ws/hello.txt", oldText: null, newText: "hello" }],
     });
     expect(out.payload).toEqual({
       toolCallId: "toolu_01Uq",
@@ -350,7 +345,10 @@ describe("§12.3 row 10 — `available_commands_update` is `=` ON THE WIRE", () 
         available_commands_update: { map: null, stream: false, store: false, digest: false },
       },
     });
-    const out = map({ sessionUpdate: "available_commands_update", availableCommands: [] }, dropping);
+    const out = map(
+      { sessionUpdate: "available_commands_update", availableCommands: [] },
+      dropping,
+    );
     expect(out.keep).toBe(false);
   });
 });
@@ -397,8 +395,9 @@ describe("§12.3 row 11 — `current_mode_update` -> `config_option_update`", ()
       planId: "plan_x",
       modes: null,
     });
-    expect((out.payload as { configOptions: { options: unknown }[] }).configOptions[0]?.options)
-      .toEqual([]);
+    expect(
+      (out.payload as { configOptions: { options: unknown }[] }).configOptions[0]?.options,
+    ).toEqual([]);
   });
 
   it("preserves the update's own `_meta` beside `omni/derivedFrom`", () => {
@@ -475,7 +474,11 @@ describe("§12.3 rows 16 and 17 — what is NOT synthesized", () => {
       "terminal_output_chunk",
     ]);
     const inputs: unknown[] = [
-      { sessionUpdate: "agent_message_chunk", messageId: "m", content: { type: "text", text: "x" } },
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "m",
+        content: { type: "text", text: "x" },
+      },
       { sessionUpdate: "user_message_chunk", messageId: "m", content: { type: "text", text: "x" } },
       { sessionUpdate: "tool_call", toolCallId: "c", title: "t" },
       { sessionUpdate: "tool_call_update", toolCallId: "c" },

@@ -1,6 +1,7 @@
 import { SessionUpdate } from "@agentclientprotocol/sdk/experimental/v2";
 import { describe, expect, it } from "vitest";
-import { allTranscriptUpdates, transcriptNames, transcriptUpdates } from "@omni-acp/testkit";
+import { transcriptNames, transcriptUpdates } from "@omni-acp/testkit";
+import { allTranscriptUpdates } from "./support/corpus-facts.js";
 import type { MappedUpdate } from "@omni-acp/protocol";
 import { mapUpdate } from "../../src/normalizer/map/update.js";
 import { claudeAcpDescriptor, claudeAcpModes, countingIds } from "./support/claude-acp.js";
@@ -23,7 +24,9 @@ const CONTEXT = { planId: "plan_t_corpus", modes: claudeAcpModes() };
 const map = (u: unknown): MappedUpdate => mapUpdate(u, D, countingIds(), CONTEXT);
 
 const ALL = allTranscriptUpdates();
-const GUARD_NAMES = Object.keys(SessionUpdate).filter((n) => n !== "isCustom") as (keyof typeof SessionUpdate)[];
+const GUARD_NAMES = Object.keys(SessionUpdate).filter(
+  (n) => n !== "isCustom",
+) as (keyof typeof SessionUpdate)[];
 
 /** Which v2 arm the SDK says this payload is, or null. Never more than one can match. */
 function sdkArm(payload: unknown): string | null {
@@ -97,7 +100,9 @@ describe("§12.7(b) — the eight properties, over all 216 recorded updates", ()
       // The escape hatch is a FAILURE, not a pass: v2's union ends in an open arm, so a guard is
       // necessary and not sufficient, and landing on `isCustom` means we produced a vendor kind.
       if (arm === null || custom) {
-        offenders.push(`${name}#${String(index)} ${String(update["sessionUpdate"])} arm=${String(arm)} custom=${String(custom)}`);
+        offenders.push(
+          `${name}#${String(index)} ${String(update["sessionUpdate"])} arm=${String(arm)} custom=${String(custom)}`,
+        );
       }
     }
     expect(offenders).toEqual([]);
@@ -179,11 +184,7 @@ describe("§12.7(b) — the eight properties, over all 216 recorded updates", ()
   });
 
   it("6. `messageId` is synthesized ZERO times for this agent: 86 of 86 chunks pass through", () => {
-    const CHUNKS = new Set([
-      "user_message_chunk",
-      "agent_message_chunk",
-      "agent_thought_chunk",
-    ]);
+    const CHUNKS = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk"]);
     let chunks = 0;
     const synthesized: string[] = [];
     for (const { name, index, update } of ALL) {

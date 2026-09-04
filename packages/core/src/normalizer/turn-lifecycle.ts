@@ -372,7 +372,12 @@ function agentUpdate(
   input: Extract<TurnInput, { type: "agent_update" }>,
   cfg: TurnLifecycleConfig,
 ): { state: TurnLifecycleState; output: TurnOutput } {
-  const mapped: MappedUpdate = mapUpdate(input.update, cfg.descriptor, cfg.ids, mapContext(state, cfg));
+  const mapped: MappedUpdate = mapUpdate(
+    input.update,
+    cfg.descriptor,
+    cfg.ids,
+    mapContext(state, cfg),
+  );
 
   // §13.4's third signal and §12.5's vendor patch: both are read through the DESCRIPTOR's
   // extension pointers, so no agent's `_meta` spelling appears in this file.
@@ -645,7 +650,14 @@ function advance(
       let next: TurnLifecycleState = state;
       if (state.stopReason !== null && state.turnId !== null) {
         emit.push(idle(state, state.turnId));
-        next = { ...state, turnId: null, stopReason: null, usage: null, warnings: [], vendorPatch: null };
+        next = {
+          ...state,
+          turnId: null,
+          stopReason: null,
+          usage: null,
+          warnings: [],
+          vendorPatch: null,
+        };
       }
       // Rung 2: EOF on stdin — no more requests are coming. NEVER at turn end (§6.5, M1-R4);
       // this is the forced ladder and nothing else.

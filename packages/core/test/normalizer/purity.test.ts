@@ -32,8 +32,6 @@ const FORBIDDEN_NAMES = new Set([
   "runAllTimers",
 ]);
 
-
-
 interface Hit {
   readonly line: number;
   readonly what: string;
@@ -110,7 +108,13 @@ function tsFilesIn(dir: string, recursive = false): Scanned[] {
  * `src` only: a TEST may legally name a fixed epoch, and every one of them does.
  */
 function nonDeterminism(fileName: string, text: string): Hit[] {
-  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const source = ts.createSourceFile(
+    fileName,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
   const found: Hit[] = [];
   const at = (node: ts.Node): number =>
     source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;

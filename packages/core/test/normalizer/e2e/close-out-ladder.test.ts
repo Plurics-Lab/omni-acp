@@ -68,7 +68,11 @@ function markerFile(): string {
 }
 
 const rungs = (file: string): string[] =>
-  existsSync(file) ? readFileSync(file, "utf8").split("\n").filter((l) => l !== "") : [];
+  existsSync(file)
+    ? readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+    : [];
 
 async function start(env: Record<string, string>): Promise<E2eWorker> {
   const w = await startE2eWorker({
@@ -90,7 +94,9 @@ describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
 
     // A live turn the agent will never answer: the ladder only runs when there is output to
     // protect, and this is that case.
-    await w.worker.prompt([{ type: "text", text: "go" }], { tokenId: w.worker.snapshot().ref.tokenId });
+    await w.worker.prompt([{ type: "text", text: "go" }], {
+      tokenId: w.worker.snapshot().ref.tokenId,
+    });
     await until("the agent to start talking", () => w.events().length >= 3);
     expect(rungs(marker)).toEqual([]);
 
@@ -107,7 +113,9 @@ describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
     // `session/cancel` is never sent, and the fixture never records a `cancel`.
     const marker = markerFile();
     const w = await start({ HYBRID_EOF_MARKER: marker, HYBRID_NEVER_ANSWER: "1" });
-    await w.worker.prompt([{ type: "text", text: "go" }], { tokenId: w.worker.snapshot().ref.tokenId });
+    await w.worker.prompt([{ type: "text", text: "go" }], {
+      tokenId: w.worker.snapshot().ref.tokenId,
+    });
     await until("the agent to start talking", () => w.events().length >= 3);
 
     await w.worker.close("client_request");
@@ -135,7 +143,9 @@ describe("§13.2 CLOSE_OUT, end to end through a real Worker", () => {
       HYBRID_NEVER_ANSWER: "1",
       HYBRID_IGNORE_EOF: "1",
     });
-    await w.worker.prompt([{ type: "text", text: "go" }], { tokenId: w.worker.snapshot().ref.tokenId });
+    await w.worker.prompt([{ type: "text", text: "go" }], {
+      tokenId: w.worker.snapshot().ref.tokenId,
+    });
     await until("the agent to start talking", () => w.events().length >= 3);
 
     await w.worker.close("client_request");
@@ -189,9 +199,7 @@ describe("§13.4 end to end — a fatal stderr line promotes to `omni.error` bef
     const who = { tokenId: w.worker.snapshot().ref.tokenId };
     const accepted = await w.worker.prompt([{ type: "text", text: "go" }], who);
 
-    await until("the turn to settle", () =>
-      tags(w.events()).some((t) => t.startsWith("idle")),
-    );
+    await until("the turn to settle", () => tags(w.events()).some((t) => t.startsWith("idle")));
 
     const order = tags(w.events());
     const errorAt = order.findIndex((t) => t === "error(agent_error)");
@@ -294,8 +302,9 @@ describe("the hybrid fixture, end to end — F24 and the last corpus gap", () =>
       expect(e.seq).toBeGreaterThan(start_);
       expect(e.seq).toBeLessThan(end);
       // Ruling M1-R10's flip, over a real pipe: every kind this agent emits is a known v2 arm.
-      expect(`${String((e.payload as { sessionUpdate: string }).sessionUpdate)}=${String(e.payloadVersion)}`)
-        .toBe(`${String((e.payload as { sessionUpdate: string }).sessionUpdate)}=2`);
+      expect(
+        `${String((e.payload as { sessionUpdate: string }).sessionUpdate)}=${String(e.payloadVersion)}`,
+      ).toBe(`${String((e.payload as { sessionUpdate: string }).sessionUpdate)}=2`);
     }
   }, 30_000);
 });

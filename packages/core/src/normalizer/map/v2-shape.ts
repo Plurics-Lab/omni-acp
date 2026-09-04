@@ -204,12 +204,12 @@ const ARMS: Readonly<Record<string, (p: Json) => boolean>> = {
     (arr(p["availableCommands"]) ?? []).every(isAvailableCommand) &&
     arr(p["availableCommands"]) !== null,
   config_option_update: (p) =>
-    arr(p["configOptions"]) !== null && (arr(p["configOptions"]) ?? []).every(isSessionConfigOption),
+    arr(p["configOptions"]) !== null &&
+    (arr(p["configOptions"]) ?? []).every(isSessionConfigOption),
   session_info_update: (p) => optionalString(p, "title") && optionalString(p, "updatedAt"),
   usage_update: (p) => num(p["used"]) !== null && num(p["size"]) !== null,
   compaction_update: (p) => str(p["compactionId"]) !== null && str(p["status"]) !== null,
-  compaction_summary_chunk: (p) =>
-    str(p["compactionId"]) !== null && isContentBlock(p["content"]),
+  compaction_summary_chunk: (p) => str(p["compactionId"]) !== null && isContentBlock(p["content"]),
 };
 
 /** The known v2 kinds, so the map can say "this tag names an arm" without knowing the arm. */

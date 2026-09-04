@@ -166,7 +166,9 @@ describe("§13.2 CLOSE_OUT — the forced ladder, rungs 1 to 5 in order", () => 
     const record = (out: TurnOutput | null): void => {
       for (const e of out?.emit ?? []) {
         const p = e.payload as { sessionUpdate?: string; state?: string };
-        emitted.push(p.sessionUpdate === "state_update" ? String(p.state) : String(p.sessionUpdate));
+        emitted.push(
+          p.sessionUpdate === "state_update" ? String(p.state) : String(p.sessionUpdate),
+        );
       }
     };
 
@@ -339,9 +341,7 @@ describe("§13.3 — what the ladder must NOT do", () => {
 describe("§13.4 — the fourth signal: a COMPLETE stderr line", () => {
   const fatal = () =>
     fakeRuntime({
-      errorRules: [
-        { id: "fatalStderr:oom", messageMatches: "^FATAL: ", classify: "agent_error" },
-      ],
+      errorRules: [{ id: "fatalStderr:oom", messageMatches: "^FATAL: ", classify: "agent_error" }],
     });
 
   it("promotes a matching line to `omni.error` and carries a warning onto `idle`", () => {
@@ -386,9 +386,9 @@ describe("§13.4 — the fourth signal: a COMPLETE stderr line", () => {
   it("does nothing at all for a descriptor with no `fatalStderr` rule — stderr is the weakest signal", () => {
     const d = driver({ descriptor: fakeRuntime() });
     liveTurn(d);
-    expect(
-      d.step({ type: "stderr_line", line: "FATAL: out of memory", at: T0 + 10 }).emit,
-    ).toEqual([]);
+    expect(d.step({ type: "stderr_line", line: "FATAL: out of memory", at: T0 + 10 }).emit).toEqual(
+      [],
+    );
   });
 
   it("de-duplicates: an agent that writes the same fatal line in a loop still warns ONCE", () => {
@@ -449,7 +449,10 @@ describe("§13.4 — the third signal: the descriptor's rate-limit pointer", () 
       const d = driver();
       liveTurn(d);
       const out = d.step(usage({ status }));
-      expect(out.emit.map((e) => e.kind), status).toEqual(["omni.error", "acp.session_update"]);
+      expect(
+        out.emit.map((e) => e.kind),
+        status,
+      ).toEqual(["omni.error", "acp.session_update"]);
       expect((out.emit[0]?.payload as { code: string }).code).toBe("agent_error");
     }
   });

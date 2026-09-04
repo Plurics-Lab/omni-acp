@@ -41,6 +41,12 @@ const FATAL_STDERR = process.env.HYBRID_FATAL_STDERR === "1";
 const NEVER_ANSWER = process.env.HYBRID_NEVER_ANSWER === "1";
 const RATE_LIMIT = process.env.HYBRID_RATE_LIMIT ?? "";
 
+let keepAlive = null;
+process.on("SIGTERM", () => {
+  if (keepAlive !== null) clearInterval(keepAlive);
+  process.exit(0);
+});
+
 // stdin is piped through a PassThrough rather than handed straight to `Readable.toWeb`, so the
 // `end` event still reaches us: observing stdin EOF is the whole point of EOF_MARKER, and a
 // stream the web adapter has taken ownership of no longer reports it here.
@@ -56,6 +62,10 @@ process.stdin.on("end", () => {
   // is what makes the drain rung's `stdoutEnded` arrive. IGNORE_EOF is the uncooperative agent,
   // which is the only way a test reaches rung 4.
   if (!IGNORE_EOF) process.exit(0);
+  // …and staying alive takes WORK: with stdin at EOF the SDK connection closes and node's event
+  // loop empties, so the process would exit 0 on its own and look cooperative. A live (not
+  // unref'd) timer is what keeps stdout open, which is what the drain rung is waiting for.
+  keepAlive = setInterval(() => {}, 1_000);
 });
 
 const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(stdin));
@@ -148,7 +158,10 @@ acp
     });
 
     if (NEVER_ANSWER) return never();
-    return { stopReason: "end_turn", usage: { totalTokens: 30, inputTokens: 10, outputTokens: 20 } };
+    return {
+      stopReason: "end_turn",
+      usage: { totalTokens: 30, inputTokens: 10, outputTokens: 20 },
+    };
   })
   .onNotification("session/cancel", () => {
     // RECORDED, then ignored on purpose: a close-out ladder that reaches rung 4 must not be

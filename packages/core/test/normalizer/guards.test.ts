@@ -175,7 +175,7 @@ describe("guard: no-agent-prose (§10.2, §13.4)", () => {
       text: "",
       code: blankComments(
         [
-          "// the agent says \"User refused permission to run tool\", and we ignore it",
+          '// the agent says "User refused permission to run tool", and we ignore it',
           "/* Method not found */",
           'if (e.message.includes("User refused permission")) return "denied";',
         ].join("\n"),

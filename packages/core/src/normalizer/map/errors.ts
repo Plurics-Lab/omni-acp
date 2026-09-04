@@ -62,10 +62,7 @@ function methodOf(e: AcpErrorDetail): string | null {
   return str(resolvePointer(e.data, "/method"));
 }
 
-function matches(
-  rule: RuntimeDescriptor["errorRules"][number],
-  e: AcpErrorDetail,
-): boolean {
+function matches(rule: RuntimeDescriptor["errorRules"][number], e: AcpErrorDetail): boolean {
   if (rule.code !== undefined && rule.code !== e.code) return false;
 
   if (rule.dataPointer !== undefined) {

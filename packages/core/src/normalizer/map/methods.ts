@@ -43,20 +43,21 @@ const CAPABILITY_OF: Readonly<Record<string, string>> = {
  * method can be the answer to two different canonical calls on different runtimes. A pair with
  * no entry passes its params through, which is what row 26b's vendor extension needs.
  */
-const PARAM_RULES: Readonly<Record<string, (p: Record<string, unknown>) => Record<string, unknown>>> =
-  {
-    // Row 24: v1's `session/load` has no `replayFrom`. Sending it is harmless on claude-acp
-    // (it "accepts and ignores" it, F18) but it is not in v1's schema, and an agent that
-    // validates its params would reject the whole call over a field we invented for it.
-    "session/resume session/load": ({ replayFrom: _replayFrom, ...rest }) => rest,
-    // Row 25: `{configId, value}` → `{modeId}`. `session/set_mode` is still live on the same
-    // process that answers `session/set_config_option` (F18), so this is a real fallback and
-    // not a legacy branch.
-    "session/set_config_option session/set_mode": (p) => ({ modeId: p["value"] }),
-    // Row 26: the vendor spelling multica saw on 8 runtimes. `-32601` on claude-acp, which is
-    // exactly why it is a SPELLING behind a preference order rather than a method we call.
-    "session/set_config_option session/set_model": (p) => ({ modelId: p["value"] }),
-  };
+const PARAM_RULES: Readonly<
+  Record<string, (p: Record<string, unknown>) => Record<string, unknown>>
+> = {
+  // Row 24: v1's `session/load` has no `replayFrom`. Sending it is harmless on claude-acp
+  // (it "accepts and ignores" it, F18) but it is not in v1's schema, and an agent that
+  // validates its params would reject the whole call over a field we invented for it.
+  "session/resume session/load": ({ replayFrom: _replayFrom, ...rest }) => rest,
+  // Row 25: `{configId, value}` → `{modeId}`. `session/set_mode` is still live on the same
+  // process that answers `session/set_config_option` (F18), so this is a real fallback and
+  // not a legacy branch.
+  "session/set_config_option session/set_mode": (p) => ({ modeId: p["value"] }),
+  // Row 26: the vendor spelling multica saw on 8 runtimes. `-32601` on claude-acp, which is
+  // exactly why it is a SPELLING behind a preference order rather than a method we call.
+  "session/set_config_option session/set_model": (p) => ({ modelId: p["value"] }),
+};
 
 export function mapRequest(
   method: string,

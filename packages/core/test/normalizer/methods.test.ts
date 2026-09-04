@@ -1,14 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createNormalizer } from "@omni-acp/core";
-import { fakeRuntime, transcriptError, transcriptResult } from "@omni-acp/testkit";
+import { fakeRuntime } from "@omni-acp/testkit";
+import { transcriptError, transcriptResult } from "./support/corpus-facts.js";
 import type { OutboundCall } from "@omni-acp/protocol";
 import { mapCapabilities } from "../../src/normalizer/map/capabilities.js";
 import { classifyError } from "../../src/normalizer/map/errors.js";
-import {
-  mapRequest,
-  resolveInboundMethod,
-  untagIds,
-} from "../../src/normalizer/map/methods.js";
+import { mapRequest, resolveInboundMethod, untagIds } from "../../src/normalizer/map/methods.js";
 import { claudeAcpDescriptor } from "./support/claude-acp.js";
 
 /**
@@ -183,18 +180,31 @@ describe("§12.3 row 22 — an `McpServer` without a `type` gets one", () => {
   it("is UNREACHABLE from the wire in M1 — `mcpServers` is always `[]`", () => {
     // Implemented and unit-tested, gated behind M2's presets (§2.3). DESIGN §8 calls
     // `mcpServers` the highest-risk attack surface, and shipping it half-tested would be worse.
-    expect(call("session/new", { cwd: "/tmp/ws", mcpServers: [] }).params["mcpServers"]).toEqual([]);
+    expect(call("session/new", { cwd: "/tmp/ws", mcpServers: [] }).params["mcpServers"]).toEqual(
+      [],
+    );
   });
 });
 
 describe("§12.3 row 27 — v2's `{type:'id', value}` tag is DROPPED outbound", () => {
   it("drops the tag and keeps `{value}`, recursively, and only on that exact shape", () => {
     expect(untagIds({ type: "id", value: "s1" })).toEqual({ value: "s1" });
-    expect(untagIds({ a: [{ type: "id", value: 1 }, { type: "id", value: 2 }] })).toEqual({
+    expect(
+      untagIds({
+        a: [
+          { type: "id", value: 1 },
+          { type: "id", value: 2 },
+        ],
+      }),
+    ).toEqual({
       a: [{ value: 1 }, { value: 2 }],
     });
     // A vendor object that merely HAS a `type` is untouched: the rule is the two-key shape.
-    expect(untagIds({ type: "id", value: 1, extra: 2 })).toEqual({ type: "id", value: 1, extra: 2 });
+    expect(untagIds({ type: "id", value: 1, extra: 2 })).toEqual({
+      type: "id",
+      value: 1,
+      extra: 2,
+    });
     expect(untagIds({ type: "text", value: "x" })).toEqual({ type: "text", value: "x" });
   });
 
@@ -281,16 +291,22 @@ describe("§17.3 — `classifyError` keys on a CODE and a JSON POINTER, never on
 
   it("NEVER throws: a bad regex in an operator's overlay classifies rather than crashing", () => {
     const broken = fakeRuntime({
-      errorRules: [{ id: "bad", code: -32000, dataPointer: "/x", dataMatches: "([", classify: "agent_error" }],
+      errorRules: [
+        { id: "bad", code: -32000, dataPointer: "/x", dataMatches: "([", classify: "agent_error" },
+      ],
     });
-    expect(() => classifyError({ code: -32000, message: "x", data: { x: "y" } }, broken)).not.toThrow();
+    expect(() =>
+      classifyError({ code: -32000, message: "x", data: { x: "y" } }, broken),
+    ).not.toThrow();
     expect(classifyError({ code: -32000, message: "x", data: { x: "y" } }, broken)).toEqual({
       kind: "unclassified",
     });
   });
 
   it("`unknownMethodErrorCode` is a DESCRIPTOR field, so a runtime that answers differently says so", () => {
-    const odd = fakeRuntime({ quirks: { ...fakeRuntime().quirks, unknownMethodErrorCode: -32000 } });
+    const odd = fakeRuntime({
+      quirks: { ...fakeRuntime().quirks, unknownMethodErrorCode: -32000 },
+    });
     expect(classifyError({ code: -32000, message: "nope" }, odd)).toEqual({
       kind: "unsupported_method",
       method: null,

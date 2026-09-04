@@ -74,12 +74,14 @@ const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(p
 
 acp
   .agent({ name: "wire" })
-  .onRequest("initialize", () =>
-    // The RECORDED body when the transcript has one, so `mapCapabilities` sees the real shape.
-    initializeResult ?? {
-      protocolVersion: acp.PROTOCOL_VERSION,
-      agentCapabilities: { loadSession: false },
-    },
+  .onRequest(
+    "initialize",
+    () =>
+      // The RECORDED body when the transcript has one, so `mapCapabilities` sees the real shape.
+      initializeResult ?? {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: { loadSession: false },
+      },
   )
   .onRequest("session/new", () => newSessionResult ?? { sessionId: `wire-${NAME}` })
   .onRequest("session/prompt", async (ctx) => {

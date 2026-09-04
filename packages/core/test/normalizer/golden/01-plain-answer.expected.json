@@ -1,0 +1,21 @@
+{
+  "scenario": "01-plain-answer",
+  "note": "Text turn, no tools. The baseline handshake; its sessionId and cwd feed 07.",
+  "stopReason": "end_turn",
+  "verdict": "ok",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 4,
+    "agent_message_chunk": 2
+  },
+  "toolCalls": [],
+  "changes": [],
+  "failedToolCalls": [],
+  "deniedToolCalls": [],
+  "textIncludes": ["PONG"],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": []
+}

@@ -77,7 +77,12 @@ export function claudeAcpDescriptor(): RuntimeDescriptor {
         dataMatches: "^Invalid value for config option ",
         classify: "bad_request",
       },
-      { id: "unknown-method", code: -32601, dataPointer: "/method", classify: "unsupported_method" },
+      {
+        id: "unknown-method",
+        code: -32601,
+        dataPointer: "/method",
+        classify: "unsupported_method",
+      },
     ],
     unverified: [
       "plan",
@@ -102,7 +107,11 @@ export function claudeAcpModes(): Record<string, unknown> {
     currentModeId: "default",
     availableModes: [
       { id: "default", name: "Manual", description: "Always ask before making changes" },
-      { id: "acceptEdits", name: "Accept edits", description: "Automatically accept all file edits" },
+      {
+        id: "acceptEdits",
+        name: "Accept edits",
+        description: "Automatically accept all file edits",
+      },
       { id: "plan", name: "Plan", description: "Create a plan before making changes" },
     ],
   };

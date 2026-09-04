@@ -1,0 +1,28 @@
+{
+  "scenario": "02-tool-read",
+  "note": "One tool_call (kind read) + 3 tool_call_update. No permission asked: reads are auto-allowed.",
+  "stopReason": "end_turn",
+  "verdict": "ok",
+  "state": "completed",
+  "kinds": {
+    "state_update:running": 1,
+    "state_update:idle": 1,
+    "available_commands_update": 2,
+    "usage_update": 6,
+    "agent_message_chunk": 4,
+    "tool_call_update": 4
+  },
+  "toolCalls": [
+    {
+      "id": "toolu_01QAxu6j2Q52J8pYPMBXHRUm",
+      "kind": "read",
+      "status": "completed"
+    }
+  ],
+  "changes": [],
+  "failedToolCalls": [],
+  "deniedToolCalls": [],
+  "textIncludes": ["Reading note.txt now.", "alpha beta gamma"],
+  "replayEnvelopes": 0,
+  "vendorPatchIncludes": []
+}

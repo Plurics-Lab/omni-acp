@@ -9,12 +9,7 @@ import {
   createWorker,
   type CreateWorkerDeps,
 } from "@omni-acp/core";
-import {
-  fixtureAgentPath,
-  nullLogger,
-  seqIds,
-  type FixtureAgentName,
-} from "@omni-acp/testkit";
+import { fixtureAgentPath, nullLogger, seqIds, type FixtureAgentName } from "@omni-acp/testkit";
 import { mapCapabilities } from "../../../src/normalizer/map/capabilities.js";
 import type {
   AcpLinkLike,
@@ -227,12 +222,19 @@ export async function startE2eWorker(o: E2eOptions): Promise<E2eWorker> {
     cwd,
     events: () => log.read(0),
     async dispose(): Promise<void> {
-      try {
-        await worker.close("client_request");
-      } catch {
-        /* already closed */
+      // `close()` is idempotent, but calling it on an already-closed worker and then shutting the
+      // supervisor down races the SDK's web-stream adapter, which rejects the writer it is still
+      // holding on the agent's stdin. That rejection has nowhere to go and lands as vitest's
+      // "unhandled error" — the same one `tree-kill.itest.ts` has always produced. Skipping the
+      // redundant close is what keeps this suite's output clean.
+      if (worker.snapshot().state !== "closed") {
+        try {
+          await worker.close("client_request");
+        } catch {
+          /* raced another close */
+        }
       }
-      await supervisor.shutdown();
+      if (supervisor.live.size > 0) await supervisor.shutdown();
       rmSync(cwd, { recursive: true, force: true });
     },
   };
