@@ -3,7 +3,16 @@ import { readFile } from "node:fs/promises";
 import { createDaemon } from "@omni-acp/daemon";
 import { OmniError, type DaemonConfig } from "@omni-acp/protocol";
 import { USAGE, parseArgs, type ParsedArgs } from "./args.js";
-import { yamlToDaemonConfig } from "./yaml-config.js";
+import {
+  listAgents,
+  listWorkers,
+  probeAgentAt,
+  renderAgents,
+  renderProbe,
+  renderWorkers,
+  targetOf,
+} from "./remote.js";
+import { declaresEventLogDriver, yamlToDaemonConfig } from "./yaml-config.js";
 
 export interface CliIo {
   stdout: NodeJS.WritableStream;
@@ -53,6 +62,17 @@ async function version(): Promise<string> {
   }
 }
 
+/**
+ * Ruling M1-R17: `omni-acp start` writes `sqlite` where `createDaemon()` keeps `memory`.
+ *
+ * A daemon you started from a shell is a LONG-RUNNING one, and D2's whole claim is that a
+ * restart loses nothing; an embedded `OmniACP.local()` inside somebody's script is the opposite
+ * case and must not leave a database file behind or load an experimental module. One default per
+ * entry point, and `GET /v1/info.persistence.driver` reports which is in force so it is never a
+ * guess.
+ */
+const SQLITE_DEFAULT = { eventLog: { driver: "sqlite" } } as const;
+
 /** CLI flags -> a `Partial<DaemonConfig>`. Absent flags stay absent (see `yamlToDaemonConfig`). */
 function overridesFor(args: Extract<ParsedArgs, { cmd: "start" }>): Partial<DaemonConfig> {
   const listen =
@@ -66,6 +86,61 @@ function overridesFor(args: Extract<ParsedArgs, { cmd: "start" }>): Partial<Daem
     ...(listen === undefined ? {} : { listen }),
     ...(args.dataDir === undefined ? {} : { dataDir: args.dataDir }),
   };
+}
+
+/**
+ * The three read-only commands, which share one shape: resolve the target, make ONE call, print.
+ *
+ * `--json` prints the daemon's answer verbatim, because a command whose output is piped into `jq`
+ * should not be reformatting the contract; without it the same answer is rendered as columns for
+ * a person. Failures come back as the daemon's own sentence and exit 1 — never as a stack, and
+ * never as "HTTP 403" when the daemon already wrote a better message (§9).
+ */
+async function remote(
+  args: Extract<ParsedArgs, { cmd: "agents" | "workers" | "probe" }>,
+  env: NodeJS.ProcessEnv,
+  out: CliIo,
+): Promise<number> {
+  try {
+    const target = targetOf(args, env, `omni-acp ${args.cmd}`);
+
+    if (args.cmd === "agents") {
+      const body = await listAgents(target);
+      write(
+        out.stdout,
+        `${args.json === true ? JSON.stringify(body, null, 2) : renderAgents(body)}\n`,
+      );
+      return EXIT_OK;
+    }
+
+    if (args.cmd === "workers") {
+      const body = await listWorkers(target);
+      write(
+        out.stdout,
+        `${
+          args.json === true
+            ? JSON.stringify(body, null, 2)
+            : renderWorkers(body.workers, {
+                ...(args.includeClosed === true ? { includeClosed: true } : {}),
+              })
+        }\n`,
+      );
+      return EXIT_OK;
+    }
+
+    const body = await probeAgentAt(target, args.agent, {
+      ...(args.deep === true ? { deep: true } : {}),
+      ...(args.force === true ? { force: true } : {}),
+    });
+    write(
+      out.stdout,
+      `${args.json === true ? JSON.stringify(body, null, 2) : renderProbe(body)}\n`,
+    );
+    return EXIT_OK;
+  } catch (e) {
+    write(out.stderr, `omni-acp: ${messageOf(e)}\n`);
+    return EXIT_FAILURE;
+  }
 }
 
 /**
@@ -99,6 +174,9 @@ export async function main(
     write(out.stderr, `omni-acp: ${args.message}\n\n${USAGE}`);
     return EXIT_USAGE;
   }
+  if (args.cmd === "agents" || args.cmd === "workers" || args.cmd === "probe") {
+    return remote(args, env, out);
+  }
 
   let config: DaemonConfig;
   let generatedSecret: string | null = null;
@@ -111,6 +189,7 @@ export async function main(
       generatedSecret = env["OMNI_ACP_TOKEN"] ?? randomBytes(32).toString("hex");
       config = yamlToDaemonConfig("", {
         ...overrides,
+        ...SQLITE_DEFAULT,
         tokens: [{ id: "local", secret: generatedSecret, role: "admin" }],
         listen: { host: args.host ?? "127.0.0.1", port: args.port ?? 0 },
       });
@@ -118,7 +197,12 @@ export async function main(
       // A config file that forgets `tokens` is the operator's mistake, not something to paper
       // over with a token they never see: `yamlToDaemonConfig` says so by name.
       const text = await readFile(args.configPath, "utf8");
-      config = yamlToDaemonConfig(text, overrides);
+      config = yamlToDaemonConfig(text, {
+        ...overrides,
+        // Ruling M1-R17, and only when the file did not choose: `eventLog` merges field by field,
+        // so this adds a driver without touching the operator's `retentionDays`.
+        ...(declaresEventLogDriver(text) ? {} : SQLITE_DEFAULT),
+      });
     }
   } catch (e) {
     write(out.stderr, `omni-acp: ${messageOf(e)}\n`);

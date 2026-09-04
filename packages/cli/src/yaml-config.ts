@@ -16,8 +16,9 @@ function isMapping(v: unknown): v is Record<string, unknown> {
  *
  *  - An `undefined` value in `overrides` is an ABSENT flag, not an instruction to unset. `{...yaml,
  *    ...overrides}` would let `--host` alone erase the YAML's `dataDir`.
- *  - `listen` merges field by field. `--port 8080` must not delete the YAML's `listen.host`, and
- *    `listen` is the only nested object the CLI can address, so this is the only deep case.
+ *  - `listen` and `eventLog` merge field by field. `--port 8080` must not delete the YAML's
+ *    `listen.host`, and `start`'s `eventLog.driver: "sqlite"` (ruling M1-R17) must not delete the
+ *    YAML's `retentionDays`. They are the only two nested objects the CLI addresses.
  *
  * The result is validated here rather than at `createDaemon()`, so a typo in a config file is a
  * message about that file instead of a stack from inside the daemon.
@@ -50,6 +51,14 @@ export function yamlToDaemonConfig(text: string, overrides: Partial<DaemonConfig
       : { ...listenOverride };
   }
 
+  const eventLogOverride = overrides.eventLog;
+  if (eventLogOverride !== undefined && eventLogOverride !== null) {
+    const fromYaml = document["eventLog"];
+    merged["eventLog"] = isMapping(fromYaml)
+      ? { ...fromYaml, ...eventLogOverride }
+      : { ...eventLogOverride };
+  }
+
   const parsed = DaemonConfig.safeParse(merged);
   if (!parsed.success) {
     const issues = parsed.error.issues
@@ -63,6 +72,33 @@ export function yamlToDaemonConfig(text: string, overrides: Partial<DaemonConfig
   // The fully-defaulted config. It is still a valid `DaemonConfig` INPUT — every field it
   // carries is one the schema accepts — so `createDaemon()` re-parsing it is a no-op.
   return parsed.data;
+}
+
+/**
+ * True when the document ALREADY chose an `eventLog.driver` (ruling M1-R17).
+ *
+ * `omni-acp start` writes `"sqlite"` — a long-running daemon must survive a restart — while
+ * `createDaemon()` keeps `"memory"`, so an `OmniACP.local()` inside somebody's script leaves no
+ * database file and loads no experimental module. One default per entry point, and no magic in
+ * the schema.
+ *
+ * The CLI's default is a DEFAULT and not an override: an operator who wrote `driver: memory` in a
+ * config file meant it, and a `start` that silently reversed that choice would be the "magic in
+ * the schema" the ruling rejected, moved one layer up. Hence a predicate rather than a merge.
+ */
+export function declaresEventLogDriver(text: string): boolean {
+  let document: unknown;
+  try {
+    document = parse(text);
+  } catch {
+    // Not parseable: `yamlToDaemonConfig` is about to say so, with a better message than this
+    // function could. Reporting "no driver" here just means the override is offered and the
+    // parse failure still wins.
+    return false;
+  }
+  if (!isMapping(document)) return false;
+  const eventLog = document["eventLog"];
+  return isMapping(eventLog) && eventLog["driver"] !== undefined;
 }
 
 function describe(e: unknown): string {
