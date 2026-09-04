@@ -9,6 +9,19 @@
 import type { ResumeMethod } from "./resume.js";
 
 /**
+ * One capability's spellings, in preference order, plus what a failure MEANS.
+ *
+ * `onFailure` is per capability and it is DESIGN §6.2's rule made a field: `set_model` failing is
+ * `fail` (the caller asked for a model and did not get one), `set_options` failing is `warn` (a
+ * vendor extension we offered to pass through). Without it the descriptor cannot express the one
+ * distinction §6.2 draws, and every extension would have to be all-or-nothing (review R2).
+ */
+export interface MethodPreference {
+  readonly spellings: readonly string[];
+  readonly onFailure: "fail" | "warn";
+}
+
+/**
  * PREFERENCE ORDER OVER SPELLINGS, not one name per capability. F18 is decisive: on ONE
  * claude-acp process `session/set_mode` and `session/set_config_option` are both live while
  * `session/set_model` is `-32601`. A registry that maps one capability to one method name cannot
@@ -16,13 +29,17 @@ import type { ResumeMethod } from "./resume.js";
  *
  * The first entry not already known-unsupported is used; a `-32601` marks it unsupported for the
  * life of the process (never persisted — a version bump may add it) and the next one is tried.
+ *
+ * A RECORD, not four fixed arrays (review R2): `session/set_options` is a vendor extension DESIGN
+ * §6.2 requires the descriptor to carry, and a fixed shape would have made adding it an edit to a
+ * type frozen for the whole of M1. The well-known keys are `resume` / `setConfig` / `setOptions` /
+ * `list` / `close`; a runtime may carry more, and a consumer that does not know a key ignores it.
+ *
+ * `prefer.resume.spellings` holds `ResumeMethod` values — the type stays `string[]` because the
+ * record is uniform, and the one place that consumes it (`handshake.ts`, M1-WP-C) narrows against
+ * `ResumeMethod` and drops a spelling it does not recognise rather than sending it blind.
  */
-export interface MethodPreferences {
-  readonly resume: readonly ResumeMethod[];
-  readonly setConfig: readonly string[];
-  readonly list: readonly string[];
-  readonly close: readonly string[];
-}
+export type MethodPreferences = Readonly<Record<string, MethodPreference>>;
 
 export interface UpdateRule {
   /** The v2 `sessionUpdate` kind, or `null` = no row in the map (vendor passthrough). */
@@ -102,6 +119,14 @@ export interface RuntimeDescriptor {
   readonly extensions: Readonly<Record<string, ExtensionPath>>;
   readonly errorRules: readonly ErrorRule[];
   readonly quirks: Quirks;
+  /**
+   * INBOUND method aliases: an agent→client notification whose method matches a key is
+   * normalized to the value before the update map runs. `{"session/notification":
+   * "session/update"}` is DESIGN §1.3's non-standard spelling, and this is where §6.2 requires a
+   * vendor extension to be registered (review R4). Empty by default, and empty for claude-acp —
+   * an unregistered method keeps §7.6's `-32601`, so a typo cannot silently swallow updates.
+   */
+  readonly inboundAliases: Readonly<Record<string, string>>;
   /** D3: both false for every agent M1 knows about. */
   readonly clientHost: { readonly fs: boolean; readonly terminal: boolean };
   readonly budgets: RuntimeBudgets;

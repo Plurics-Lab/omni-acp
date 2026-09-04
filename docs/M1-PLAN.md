@@ -34,9 +34,17 @@ packages/protocol/src/{lease,resume,runtime}.ts  ← NEW, types only
 packages/core/src/worker/worker.ts               ← ONE edit, then frozen (§1.2 seam 1 + 2)
 packages/daemon/src/http/routes/{index,workers}.ts   ← the split of routes.ts; per-feature route
                                                         modules are owned by their work package
-packages/daemon/src/types.ts
-tests/compat/{package.json,tsconfig.json,vitest.config.ts,agents.ci.yaml,agents.local.yaml}
+packages/daemon/src/types.ts                     ← re-export-only, like the barrels above
+tests/compat/{package.json,tsconfig.json,vitest.config.ts}
 ```
+
+`packages/daemon/src/types.ts` is re-export-only and stays Land-frozen, so §2's and §3's WP‑E rows
+exclude it explicitly alongside `index.ts` (review R1): a daemon-internal type WP‑E needs lives in the
+module that needs it, exactly as M0 already does.
+
+`tests/compat/agents.{ci,local}.yaml` are **NOT** frozen — they are WP‑F's (review R3). WP‑F is the only
+package that reads them, so freezing them buys no disjointness and costs the milestone the ability to fix
+its own data. The Land step wrote both to the §18.2 schema; WP‑F edits them as the suite learns.
 
 **Created by the Land step, then handed over permanently:** every other new `packages/**/src/**/*.ts`,
 `tests/compat/src/**`, and each new `*.itest.ts`, with the exact signature from `CONTRACTS.md` §5 and a body
@@ -72,15 +80,40 @@ process, which is the whole point.
 **Seam 2 — `SessionStrategy` is injected.** After M1, `worker.ts` never names `initialize`, `session/new`,
 `session/load` or `session/resume` again: it holds a `SessionStrategy` and calls `open()` on create and
 `reopen()` on wake, and its `hibernate()`/`wake()` are ~60 lines of state transition that delegate. WP‑C
-owns the strategy (`worker/{session-open,wake,resume-classify,hibernate,rehydrated}.ts`). The Land step
-writes the delegation and the state widening (`M0State` → `WorkerState`, `#generation`, `#replayWindow`),
-then freezes `worker.ts`.
+owns the strategy (`worker/{session-open,wake,resume-classify,hibernate,rehydrated}.ts`).
 
-**Seam 3 — the lease needs no seam at all.** `Worker.prompt()` and `Worker.cancel()` **already** call
-`lease.assertHolder(who)` as their first statement (CONTRACTS F22, `worker.ts:274` and `:369`). D5
-enforcement is therefore a change to the *factory* `registry.ts` passes in, plus the epoch on `ClientRef`.
-WP‑D touches **zero** core worker files. This is M0's DI paying off, and it is worth saying out loud so
-nobody "helpfully" adds an interface.
+**Landed, and this is what "frozen" now means** (review R13). The Land step wrote, in `worker.ts`:
+
+- `hibernate()` — §15.2's ordered transition: the synchronous `#hibernating` flag, stdin EOF then the
+  graceful ladder, **no `session/close`**, `lease.releaseForHibernate()`, then the envelope. It REFUSES
+  (`not_resumable`) when no resume spelling was resolved, which is ruling M1-R15's default;
+- `wake()` — §15.3's ladder over private state: single-flight admission, `#openProcess()`, then ONE call
+  to `this.#deps.session.reopen(link, {…, controls})` **inside** the replay window, then §15.5's mapping
+  of the outcome onto `ready` / `hibernated` / `closed`, and of `maxWakeFailures` onto `wake_failed`;
+- `prompt()` on a `hibernated` worker AUTO-WAKES (§15.3's first box), and the `#hibernating` window
+  answers `worker_busy`;
+- `start()` — the same delegation for create: `strategy.open(link, …)` when one is injected, M0's inline
+  `runHandshake` when it is not, so the M0 suite runs untouched;
+- the state widening (`M1State`, `#generation`, `#crashed`, `#hibernatedAt`, `#wakeFailures`,
+  `#replayWindow` as a refcount) and the `AcpLinkLike` adapter a strategy is handed.
+
+WP‑C therefore writes `SessionStrategy`, `createHibernateTimer`, `attemptResume`, `classifyResume`,
+`createRehydratedWorker` and every test — and edits **no** frozen file. `performWake`'s first parameter is
+the `AcpLinkLike`, so its signature can reach `SessionStrategy.reopen`.
+
+**Seam 3 — the lease needs no interface, but it does need an injection point.** `Worker.prompt()` and
+`Worker.cancel()` **already** call `lease.assertHolder(who)` as their first statement (CONTRACTS F22), and
+the Land step added the same first line to `Worker.wake()`. D5 enforcement is therefore a change to the
+*factory* `registry.ts` passes in, plus the epoch on `ClientRef`.
+
+**Landed** (review R14): `WorkerRegistryOptions.leaseFactory` and `DaemonDeps.leaseFactory`, with
+`registry.ts` calling `o.leaseFactory?.(owner, workerId) ?? alwaysGrantedLease(owner, workerId)` at the one
+construction site; `registry.delete()` calling `assertHolder` (the `423` on `DELETE` has no other home,
+because `WorkerHandle.close()` takes no `ClientRef`); and the registry's `lease()` façade row written and
+dispatching acquire / release / steal onto that lease. Under the default `alwaysGrantedLease` every one of
+those is M0's behaviour unchanged. WP‑D implements `createLease` in its own files; WP‑E flips the default
+in `create-daemon.ts`. Neither edits the other's hunk, and WP‑D still touches **zero** core worker files —
+so nobody should "helpfully" add an interface.
 
 ### 1.3 Land step exit criteria
 
@@ -93,10 +126,71 @@ nobody "helpfully" adds an interface.
    the six new `eventLog` fields) and an **unmodified M0 config file still parses**.
 5. `@omni-acp/protocol` still imports no other `@omni-acp/*` package; the §3.1 DAG holds; the new
    `tests/compat` package is `PRIVATE` and depends on `{client, daemon, protocol, testkit}`.
-6. **No new runtime dependency.** `node:sqlite` is a Node built-in; `pnpm-lock.yaml` is unchanged, and the
-   `static` CI job's `git diff --exit-code pnpm-lock.yaml` proves it.
+6. **No new external dependency.** `node:sqlite` is a Node built-in. The only `pnpm-lock.yaml` delta from
+   M0 is the new `tests/compat` workspace importer — a new workspace member always adds one, and criterion
+   5 requires that member — whose entries are all `workspace:*` links plus `yaml@2.9.0`, already resolved
+   for `@omni-acp/cli`. `pnpm install --frozen-lockfile` followed by the `static` CI job's
+   `git diff --exit-code pnpm-lock.yaml` is clean, which is the property actually intended and actually
+   checked (review R7, R20, Land note S1).
 7. `packages/daemon/src/http/sse.ts` is byte-identical to its M0 content, and the `sse-is-unchanged`
    checksum guard is in place and passing.
+
+### 1.4 What the Land step actually landed — the deviations, recorded
+
+The Land commit is `chore: land M1 contract surface (stubs and types)` plus the review-driven amendment
+`chore: apply M1 contract review findings; land seams 2 and 3`. Everything below is a place where the
+landed code says something this plan or `CONTRACTS.md` did not, and it is recorded here so a work package
+reads one story rather than two.
+
+1. **Optional where the document said required, at the Land step only** (S2, S3). `createNormalizer`'s four
+   M1 options (`drainGraceMs`, `cancelGraceMs`, `descriptor`, `ids`) and `CreateWorkerDeps.session` are
+   OPTIONAL, because a required dependency whose only implementation throws would have taken all 978 M0
+   tests with it. A caller written against CONTRACTS §5.7 compiles unchanged; WP‑B and WP‑C tighten the
+   defaults away. Same pattern as M0's `CreateWorkerDeps.toSpawnSpec?`.
+2. **Three bodies are REAL, not stubs, and each for a reason that would otherwise break a fixture** (S4,
+   S5). `mapPermissionRequest` (ruling M1-R14 routes every permission through the v2 map before the
+   responder sees it, and a throwing stub would HANG the SDK example agent mid-turn rather than fail it);
+   `DEFAULT_V1_PROFILE` and `fakeRuntime()` (`Catalog.descriptor()` is documented as NEVER throwing, so a
+   throwing constant would make the fallback path the one that cannot run). `BUILTIN_RUNTIMES` is still
+   `[]` — WP‑E lands the claude-acp entry from §17.2.
+3. **Honest placeholders, each commented in place** (S6). `WorkerSnapshot.runtimeId` is
+   `"<agentId>@unresolved"` because `DEFAULT_V1_PROFILE.fingerprint` is the literal sentinel `"unresolved"`
+   rather than twelve invented hex digits; `ProcessInfo.fingerprint` is `null` at spawn, which is exactly
+   the value that FORBIDS signalling the pid after a restart; `AgentCapabilitiesSnapshot.resume.method` is
+   `null`, so under the default `whenNotResumable:"keep"` an M0-shaped worker refuses to hibernate — the
+   safe reading; `DaemonInfo.persistence` reports the memory driver's real state and `bootId` is
+   per-process.
+4. **`PlatformOps.fingerprint` on win32 returns `null` as FINAL behaviour** (S7), not a stub: §15.7 fixes
+   it and WP‑C acceptance 7 asserts it. The POSIX one throws `unimplemented: M1-WP-C`.
+5. **Two registrars register NOTHING rather than throwing** (S8): `registerLeaseRoutes` and the probe half
+   of `registerAgentRoutes` are called by `createHttpApp()` on every daemon this repo builds, and a
+   throwing route would answer `500` where the honest answer for an unimplemented route is today's
+   `400 unknown route` (§9, D29). `GET /v1/agents` moved into `routes/agents.ts` unchanged so WP‑E can add
+   H16 beside it without touching a frozen file.
+6. **`routes/workers.ts` imports its helpers from `routes/index.ts`** (S9) — a module cycle in the graph
+   sense only (every binding is a hoisted function declaration; registration happens inside a call). A
+   fifth `params.ts` would have fallen under WP‑E's ownership per §3, so the helpers stayed in the
+   Land-owned index.
+7. **`ProbeOverrides` is spelled out instead of `ProbeConfig.partial().prefault({})`** (S12): `.partial()`
+   only makes keys optional, so the inner `.default()`s still fire and `{}` would parse into the full
+   block — an agent overlay would then silently beat the daemon-wide `probe` setting on every field the
+   operator never wrote. CONTRACTS §5.1's diff now says so.
+8. **`turn.ts` was Land-written and transferred to WP‑B** (S14), and `CLOSE_REASON_CODE` gained arms for
+   M1's new close reasons (S13, and now CONTRACTS §5.1's `src/turn.ts` block). `TurnResult.verdict` is the
+   only field the M0 fold can honestly derive today (`error === null ? "ok" : "failed"`); `warnings` /
+   `failedToolCalls` / `deniedToolCalls` are `[]` and `vendorPatch` is `null` until WP‑B lands §13.4's
+   promotion rules.
+9. **M0 tests adapted, minimally, each with a comment saying why** (S10): the lease double (`steal` is its
+   own method now), the permission-responder helper (it builds a `MappedPermissionRequest`, per M1-R14 —
+   every asserted RULE is unchanged), the handshake/close tests (new snapshot fields), the protocol config
+   and golden tests (new defaults, `toolCallId`, `TurnResult`'s and `FileChange`'s new fields), and the
+   testkit/daemon/client doubles. **No test was weakened**; each change is a shape change the contract
+   requires.
+10. **Guard changes** (S11): `no-message-id` is retired and replaced by `message-id-optional`, because
+    §10.2 mandates the swap — M1's map passes `messageId` through, so the old guard would forbid the
+    feature; `http-has-no-logic` now scans `src/http/**` RECURSIVELY (a non-recursive scan would have gone
+    silently vacuous after the routes split); and the new `sse-is-unchanged` pins `sse.ts`'s sha256.
+11. **The lockfile** (S1): see §1.3 criterion 6 — one importer row, no new external package.
 
 ---
 
@@ -221,7 +315,8 @@ close-out ladders, and `reduceTurn`'s `verdict` / `warnings` / `deniedToolCalls`
 **Owns exclusively**
 
 ```
-packages/core/src/worker/**   MINUS worker.ts (Land-frozen)
+packages/core/src/worker/**   MINUS worker.ts (Land-frozen; its hibernate/wake/start delegations
+                              are WRITTEN — §1.2 seam 2 — so nothing here needs to touch it)
                               session-open.ts wake.ts resume-classify.ts hibernate.ts
                               rehydrated.ts handshake.ts permission-responder.ts
 packages/core/src/process/**  fingerprint.ts platform.ts platform-posix.ts
@@ -280,7 +375,9 @@ packages/client/test/lease.test.ts
 ```
 
 **dependsOn**: none (Land only). **Seam 3: it touches no core worker file and no registry file** — the
-registry's `lease()` façade row is Land-written and calls the injected factory.
+registry's `lease()` façade row is Land-written and dispatches onto the lease that
+`WorkerRegistryOptions.leaseFactory` produced, and `registry.delete()` already calls `assertHolder`. WP‑D
+implements `createLease` and hands it to `DaemonDeps.leaseFactory`; nothing else changes.
 
 **Description.** CONTRACTS §16: `createLease` with the fencing epoch, TTL that cannot fire mid-turn,
 implicit acquire, steal with audit, `releaseForHibernate`, the `omni.lease` envelopes, the `423` body
@@ -315,7 +412,7 @@ carrying the holder, and the three-route module.
 packages/core/src/runtime/**              descriptor.ts known.ts merge.ts probe.ts
                                           classify.ts extensions.ts
 packages/core/test/runtime/**
-packages/daemon/src/**   MINUS index.ts and http/routes/{index,workers,lease}.ts
+packages/daemon/src/**   MINUS index.ts, types.ts and http/routes/{index,workers,lease}.ts
                          create-daemon.ts registry.ts catalog.ts boot-recovery.ts
                          probe-service.ts probe-cache.ts event-store.ts
                          http/routes/agents.ts  http/{app,auth-middleware,sse,errors}.ts
@@ -383,18 +480,27 @@ files.
 
 **Acceptance**
 
-1. `runCompatSuite` is green over `agents.ci.yaml` (hermetic: the SDK example agent + ten fixtures) on
+1. `runCompatSuite` is green over `agents.ci.yaml` (hermetic: the SDK example agent + the **eight
+   turn-completing fixtures**; `crash` and `orphan` are excluded, because neither completes a turn) on
    three OSes, and **never silently empty** — `OMNI_COMPAT_REQUIRE=1` fails an empty selection.
 2. **Adding an agent is a YAML edit only** — proven two ways: a test appends a fixture-agent entry to a temp
-   config and runs the suite unchanged, and a second test asserts **no `.ts` file in the repository contains
-   a real agent's command string**.
+   config and runs the suite unchanged, and a second test asserts that **no `.ts` file in the repository
+   contains the launch argv from `agents.local.yaml`** — the joined `npx -y
+   @agentclientprotocol/claude-agent-acp@0.73.0` command line. The guard is scoped to the LAUNCH SPELLING,
+   not to the agent's name: CONTRACTS §17.2 requires `BUILTIN_RUNTIMES` to ship a claude-acp profile whose
+   matcher is `agentInfo.name /^claude-(code|agent)-acp$/`, so `packages/core/src/runtime/known.ts` will
+   legitimately contain that substring and is exempted by name (review R19).
 3. Every skip carries a **source** (`config` / `capability` / `precondition`) and a reason; a skip with no
    source **fails**; `compat-report.json` is written unconditionally and uploaded.
 4. §4's acceptance script is green against `claude-acp` under `OMNI_COMPAT_REAL=1`, and the run is recorded
    in §5 in the M0 smoke's format.
 5. **Reconnect loses no events**: drop the SSE at a random seq during a live turn, reconnect with `?since=`,
-   and the concatenated stream is **byte-identical** to an uninterrupted observer's — run 50× with
-   randomized cut points.
+   and the concatenated stream's **envelope frames** — the `id:`/`event:`/`data:` triples — are identical to
+   an uninterrupted observer's, with `: hb` comments and the `retry:` / `omni.stream_truncated` /
+   `_overflow` / `_end` control frames excluded and asserted SEPARATELY (segment 2 starts with `retry:` and
+   may carry one `stream_truncated`). Run 50× with randomized cut points. A raw byte comparison is
+   unachievable against the checksum-frozen `sse.ts`, which writes a `retry:` preamble on every stream and
+   heartbeats on a phase two connections do not share (review R12).
 6. **Hibernated workers wake**: `hibernate-wake.itest.ts` with `idleTimeoutMs: 200` against the SDK example
    agent (`loadSession: true`).
 7. `restart-survives.itest.ts`: prompt, `stop()`, `createDaemon()` on the same `dataDir`, `?since=<mid>`
@@ -416,13 +522,13 @@ files.
 
 | Path | Owner |
 | ---- | ----- |
-| root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `tests/compat/{package.json,tsconfig.json,vitest.config.ts,agents.ci.yaml,agents.local.yaml}` | **Land (frozen)** |
+| root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `tests/compat/{package.json,tsconfig.json,vitest.config.ts}` | **Land (frozen)** |
 | `packages/core/src/{event-log,persist}/**`, `packages/core/test/{event-log,persist}/**`, `packages/testkit/src/{event-log-conformance,tmp-persistence}.ts`, `packages/testkit/test/event-log-conformance.test.ts` | **WP‑A** |
 | `packages/core/src/normalizer/**`, `packages/core/test/normalizer/**`, `packages/protocol/src/turn.ts`, `packages/protocol/test/{turn,turn-golden}.test.ts`, `packages/protocol/test/{transcripts,types}/**`, `packages/testkit/src/{corpus,wire-agent}.ts`, `packages/testkit/fixtures/agents/**`, `packages/testkit/test/fixture-agents.test.ts` | **WP‑B** |
 | `packages/core/src/worker/**` (minus `worker.ts`), `packages/core/src/process/**`, `packages/core/test/{worker,process}/**` | **WP‑C** |
 | `packages/core/src/lease/**`, `packages/core/test/lease/**`, `packages/daemon/src/http/routes/lease.ts`, `packages/daemon/test/http/lease.test.ts`, `packages/testkit/src/lease-conformance.ts`, `packages/client/src/lease.ts`, `packages/client/test/lease.test.ts` | **WP‑D** |
-| `packages/core/src/runtime/**`, `packages/core/test/runtime/**`, `packages/daemon/src/**` (minus `index.ts` and `http/routes/{index,workers,lease}.ts`), `packages/daemon/test/**` (minus `http/lease.test.ts`), `packages/testkit/src/fake-runtime.ts` | **WP‑E** |
-| `packages/client/src/**` (minus `index.ts`, `lease.ts`), `packages/client/test/**` (minus `lease.test.ts`), `packages/cli/{src,test}/**`, `tests/compat/src/**`, `tests/integration/src/**`, `packages/testkit/test/arch/**` | **WP‑F** |
+| `packages/core/src/runtime/**`, `packages/core/test/runtime/**`, `packages/daemon/src/**` (minus `index.ts`, `types.ts` and `http/routes/{index,workers,lease}.ts`), `packages/daemon/test/**` (minus `http/lease.test.ts`), `packages/testkit/src/fake-runtime.ts` | **WP‑E** |
+| `packages/client/src/**` (minus `index.ts`, `lease.ts`), `packages/client/test/**` (minus `lease.test.ts`), `packages/cli/{src,test}/**`, `tests/compat/src/**`, `tests/compat/agents.{ci,local}.yaml`, `tests/integration/src/**`, `packages/testkit/test/arch/**` | **WP‑F** |
 
 Every path not listed keeps its M0 owner and its M0 content; an M1 work package that needs one edited files
 a request to the Land owner rather than editing it.
@@ -444,8 +550,9 @@ into a failure.
 > **Real-agent runs use `claude-acp` only.** It is the only ACP agent installed here
 > (`npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, logged-in Claude Code). `codex-acp`, `gemini`,
 > `opencode` and `kimi` are **not installed and must not be installed**; they are YAML entries somebody
-> else adds later, with no code change. CI runs `agents.ci.yaml` (the SDK example agent + the ten testkit
-> fixtures) on three OSes; the real-agent file is `OMNI_COMPAT_REAL=1`, `workflow_dispatch` only.
+> else adds later, with no code change. CI runs `agents.ci.yaml` (the SDK example agent + the **eight
+> turn-completing** testkit fixtures; `crash` and `orphan` are excluded) on three OSes; the real-agent file
+> is `OMNI_COMPAT_REAL=1`, `workflow_dispatch` only.
 
 **Setup.** `mkdtemp` workspace under `os.tmpdir()`, registered as the token's only `cwdRoot`.
 `createDaemon({ listen: {host:"127.0.0.1", port:0}, dataDir: <mkdtemp>, eventLog: { driver: "sqlite" },
@@ -462,35 +569,66 @@ Assert `state === "ready"`, `capabilities.raw` non-empty, `runtimeId` stable acr
 
 **Step 2 — a tool-using turn, interrupted and resumed mid-flight.**
 
+> **M1 has exactly one wired permission responder and it is auto-DENY** (`create-daemon.ts` hard-defaults
+> `createBaselineResponder("deny")`; `CreateWorkerRequest.onUnresolved` accepts only `"deny"`; the policy
+> engine is M2, CONTRACTS §2.3). So this step asserts what a denial actually looks like on the wire, which
+> is corpus `04`'s recorded outcome, rather than a write that cannot happen (review R11).
+
 - Open an SSE stream from `w.events({ since: 0 })` on client **B** (the observer) and keep it for the whole
   step.
-- `A.prompt("Create a file report.txt whose first line is exactly OMNI-M1, then read it back and tell me
-  the first line.")` — a task that forces at least one `tool_call` and at least one permission request.
-- Concurrently, **kill A's own stream at a randomly chosen seq** while the turn is live, then reconnect with
-  `?since=<lastSeq>`.
-- **Assert.** The concatenation of A's two segments is **byte-identical** to B's uninterrupted stream, and
-  the `seq` sequence is `1..n` with no gaps and no duplicates. `TurnResult.stopReason === "end_turn"`;
-  `toolCalls` non-empty with terminal final statuses; `changes` mentions `report.txt`; `verdict` is `"ok"`
-  or `"partial"` and, if `"partial"`, `deniedToolCalls ∪ failedToolCalls` is non-empty (never a bare
-  `end_turn` hiding a denial — corpus finding 7); `await w.turn(turnId)` is **deep-equal** to the
-  `prompt()` return value (DESIGN §5.5, one aggregate).
+- **Turn 2a, read-only** — `A.prompt("List the files in this directory and tell me how many there are.")`.
+  Reads are auto-allowed (corpus `02`), so this turn needs no permission answer.
+  **Assert.** `stopReason === "end_turn"`, `verdict === "ok"`, `toolCalls` non-empty with terminal final
+  statuses, and `changes` **matches the workspace** — empty, for a turn that wrote nothing.
+- **Turn 2b, a denied write** — `A.prompt("Create a file report.txt whose first line is exactly OMNI-M1.")`,
+  a task that forces at least one `tool_call` and at least one permission request.
+  **Assert the denial is VISIBLE**, exactly as CONTRACTS §18.4's `permission-deny` case specifies:
+  `verdict === "partial"`, `deniedToolCalls` **non-empty**, `changes` **empty**, the workspace still has no
+  `report.txt`, and `stopReason === "end_turn"` — the whole point being that a bare `end_turn` must never
+  hide a denial (corpus findings 6, 7). The tool call's final status is `failed` with the agent's own
+  `rawOutput` preserved.
+- Concurrently with 2b, **kill A's own stream at a randomly chosen seq** while the turn is live, then
+  reconnect with `?since=<lastSeq>`.
+- **Assert the reconnect.** The concatenation of A's two segments, **compared over envelope frames only**
+  (the `id:`/`event:`/`data:` triples; `: hb` comments and the `retry:` / `omni.stream_truncated` /
+  `_overflow` / `_end` control frames excluded), is identical to B's uninterrupted stream, and the `seq`
+  sequence is `1..n` with no gaps and no duplicates. The control frames are asserted separately: segment 2
+  begins with `retry:` and may carry one `omni.stream_truncated`. A RAW byte comparison is unachievable —
+  `sse.ts` is frozen by checksum and writes a `retry:` preamble on every stream (review R12).
+- **Assert the aggregate.** For each turn, `await w.turn(turnId)` is **deep-equal** to the `prompt()`
+  return value (DESIGN §5.5, one aggregate).
+
+> If a future milestone wants an ALLOWED write here, it is one line and it must be labelled: add
+> `@omni-acp/core` to `tests/compat/package.json` and pass
+> `deps.responder = createBaselineResponder("allow", clock)` in §4's setup — a test-only seam, never a
+> default.
 
 **Step 3 — hibernate, forced by a small idle timeout, then prompt again.**
 
 - `POST /v1/workers/{wid}` was created with `idleTimeoutMs: 60_000`; the suite re-creates a second worker
-  with **`idleTimeoutMs: 200`** and waits for `state === "hibernated"` (budget 5 s).
+  with **`idleTimeoutMs: 200`**, sends it ONE small prompt — `"Remember the token OMNI-M1 and reply OK."` —
+  and only then waits for `state === "hibernated"` (budget 5 s). The prompt is not decoration: a worker
+  whose session was opened by `session/new` and never prompted has **nothing to recall**, and corpus `07`
+  confirms replay carries only conversational content (review R16).
 - **Assert the hibernation.** `process === null`, `sessionId !== null`, `hibernatedAt !== null`,
   `supervisor.live.size` dropped by one, `lease.holder === null` (hibernate releases), and exactly one
   `omni.worker_state{state:"hibernated", reason:"hibernate"}` in the log.
-- `A.prompt("What did I just ask you to create?")` — this must **auto-wake**.
+- `A.prompt("What token did I ask you to remember?")` — this must **auto-wake**.
 - **Assert the resume outcome.** The envelope sequence is `wake` → `resumed`, the `resumed` envelope carries
   `resume.outcome === "landed"` with a `rule` and a `durationMs`, `generation === 2`, `seq` **continues**
   (no restart at 1), and every envelope inside the replay window carries `replay: true` while nothing
-  outside it does. The answer references `report.txt` — proof the agent's context, not just our log,
-  survived.
-- **Assert the negative.** A third worker resumed against a **foreign cwd** classifies `unknown` with
-  `hint: "cwd_mismatch"` and **keeps its session pointer** — never `rejected_permanent`. This case is what
-  turns CONTRACTS F15's unrecorded README claim into reproducible evidence.
+  outside it does. The answer echoes `OMNI-M1` — proof the agent's context, not just our log, survived.
+- **Assert the negative, in the two places it is actually reachable** (review R17). A worker's cwd is fixed
+  at creation and there is no API to resume an existing pointer under a different one, so this is not
+  drivable through `Worker.wake()`:
+  1. a **unit regression lock** on the pure `classifyResume`, fed the README's recorded `-32002`
+     `{message:"Resource not found: <sessionId>"}` shape: `unknown`, `hint: "cwd_mismatch"`, pointer
+     **kept**, plus the companion assertion that `PERMANENT_TEXT` does **not** match `"Resource not
+     found"` (CONTRACTS §15.4);
+  2. a compat case `resume-cwd-mismatch` driven at the **probe layer** — a second throwaway process that
+     sends the descriptor's resume spelling with a deliberately foreign cwd, which is exactly how the
+     corpus recorder produced transcripts `07`/`08`. That is what turns F15's unrecorded README claim into
+     reproducible evidence.
 
 **Step 4 — lease steal from a second client.**
 
@@ -541,11 +679,14 @@ with `leaderExited === true` and the **reported** value asserted against `waitGo
 3. The §4 script is green over `agents.ci.yaml` on three OSes, and green over `agents.local.yaml`
    (`claude-acp`) on Linux under `OMNI_COMPAT_REAL=1`, with the run recorded below in the M0 smoke's format.
 4. `compat-report.json` shows **zero unexplained skips**: every skip has a source and a reason, and
-   `claude-acp`'s four corpus gaps (`plan`, `agent_thought_chunk`, `current_mode_update`, a tool that fails
-   on its own merits) appear as `config`/`capability` skips rather than as passes.
+   **every row of `claude-acp`'s `unverified` list in CONTRACTS §17.2** — which is the single source of
+   truth for its corpus gaps (review R8) — appears as a `config`/`capability` skip rather than as a pass.
+   `agents.local.yaml` restates that same list and never a shorter one.
 5. Zero orphan processes after any suite, on any OS; no `ExperimentalWarning` on stderr from a spawned child
    that opens the SQLite driver, and none at all under the memory driver.
-6. No file in the repository has two owners; `pnpm-lock.yaml` is **unchanged from M0** (M1 adds no package).
+6. No file in the repository has two owners; `pnpm-lock.yaml` gains **no new external package** — the only
+   diff from M0 is the `tests/compat` workspace importer row, and CI's `git diff --exit-code
+   pnpm-lock.yaml` after `pnpm install --frozen-lockfile` proves no work package rewrote it (review R20).
 
 ### Real-agent record (to be filled at the WP‑F merge)
 

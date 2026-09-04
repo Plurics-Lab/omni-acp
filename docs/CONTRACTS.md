@@ -169,8 +169,11 @@ M0 rows L1–L13 stand unchanged and are not restated except where M1 alters the
 **Acceptance (DESIGN §11's M1 criterion, made mechanical).** The **config-driven compat suite** (§18) runs
 the identical SDK script against every configured agent — today `claude-acp` only, tomorrow a YAML edit —
 and for each one asserts: a tool-using turn completes with the same observable `TurnResult` shape; an SSE
-stream dropped mid-turn and reconnected with `?since=` yields a union that is **byte-identical** to an
-uninterrupted observer's and gap-free; a worker forced to `hibernated` by a small `idleTimeoutMs` wakes on
+stream dropped mid-turn and reconnected with `?since=` yields a union whose **envelope frames** — the
+`id:`/`event:`/`data:` triples, with `: hb` heartbeat comments and the `retry:` / `omni.stream_truncated` /
+`_overflow` / `_end` control frames excluded — are **identical** to an uninterrupted observer's, and
+gap-free (review R12: `sse.ts` writes a `retry:` preamble on every stream and heartbeats on a phase the two
+connections do not share, so a RAW byte comparison is unachievable against a file M1 froze by checksum); a worker forced to `hibernated` by a small `idleTimeoutMs` wakes on
 the next prompt with a recorded `ResumeReport` whose `outcome` is `landed`; a second client's `prompt`
 returns `423` with the holder named, and its `steal` transfers the lease, bumps the epoch and makes the
 first client's next call `423`. Agents not configured on this machine are **skipped with a printed
@@ -1296,6 +1299,14 @@ export interface RuntimeDescriptor {
   readonly extensions: Readonly<Record<string, ExtensionPath>>;
   readonly errorRules: readonly ErrorRule[];
   readonly quirks: Quirks;
+  /**
+   * INBOUND method aliases (review R4): an agent→client notification whose method matches a key is
+   * normalized to the value BEFORE the update map runs — DESIGN §1.3's `session/notification` as an
+   * alias for `session/update`, registered as §6.2 requires. `{}` by default and `{}` for
+   * claude-acp; an UNREGISTERED method keeps §7.6's `-32601`, so a typo cannot silently swallow
+   * updates.
+   */
+  readonly inboundAliases: Readonly<Record<string, string>>;
   /** D3: both false for every agent M1 knows about. */
   readonly clientHost: { readonly fs: boolean; readonly terminal: boolean };
   readonly budgets: {
@@ -1315,12 +1326,19 @@ export interface RuntimeDescriptor {
  * The first entry not already known-unsupported is used; a `-32601` marks it unsupported for the
  * life of the process (never persisted — a version bump may add it) and the next one is tried.
  */
-export interface MethodPreferences {
-  readonly resume: readonly ResumeMethod[];
-  readonly setConfig: readonly string[];
-  readonly list: readonly string[];
-  readonly close: readonly string[];
+export interface MethodPreference {
+  readonly spellings: readonly string[];
+  /** DESIGN §6.2, made a field: `set_model` failing is `fail`, `set_options` failing is `warn`. */
+  readonly onFailure: "fail" | "warn";
 }
+/**
+ * A RECORD, not four fixed arrays (review R2). `session/set_options` is a vendor extension §6.2
+ * requires the descriptor to carry, and a fixed shape would have made adding it an edit to a type
+ * frozen for the whole of M1. Well-known keys: `resume` / `setConfig` / `setOptions` / `list` /
+ * `close`; a runtime may carry more, and a consumer that does not know a key ignores it.
+ * `prefer.resume.spellings` holds `ResumeMethod` values, narrowed by `handshake.ts`.
+ */
+export type MethodPreferences = Readonly<Record<string, MethodPreference>>;
 
 export interface UpdateRule {
   /** The v2 `sessionUpdate` kind, or `null` = no row in the map (vendor passthrough). */
@@ -1691,6 +1709,12 @@ two bodies for the same failure stay deep-equal and there is still exactly **one
  }
 ```
 
+`CLOSE_REASON_CODE` — the private table that says which `OmniErrorCode` a mid-turn close reports —
+gains M1's four reasons, and the reading is "whose decision was it?" (Land note S13): `idle_timeout` and
+`orphaned` are OURS (`worker_closed`); `wake_failed` is a run of failed attempts against the agent
+(`agent_error`); `acl_revoked` is the current config's (`forbidden`, §15.5). The table is a mapped type
+over `WorkerCloseReason`, so a fifth reason is a compile error until somebody decides which of those it is.
+
 `reduceTurn`'s contract changes in exactly two ways and is otherwise the M0 function:
 
 ```diff
@@ -1719,8 +1743,14 @@ two bodies for the same failure stay deep-equal and there is still exactly **one
    shutdown: …,
 +  /** Operator overlay on the builtin descriptor; the probe overlays this in turn (§17.2). */
 +  runtime: RuntimeOverlay.prefault({}),
-+  /** Per-agent probe overrides. */
-+  probe: ProbeConfig.partial().prefault({}),
++  /**
++   * Per-agent probe overrides. Spelled out as its own UNDEFAULTED `ProbeOverrides` schema and
++   * NOT `ProbeConfig.partial()`: `.partial()` only makes the keys optional, so the inner
++   * `.default()`s still fire and `{}` would parse into the full default block — an agent overlay
++   * would then silently beat the daemon-wide `probe` setting on every field the operator never
++   * wrote. An override that cannot be absent is not an override (Land note S12).
++   */
++  probe: ProbeOverrides.prefault({}),
  });
 
  export const SupervisorConfig = z.object({
@@ -2155,6 +2185,13 @@ export interface DaemonDeps {
   … // M0's members unchanged
   readonly persistence?: PersistenceHandle;
   readonly session?: SessionStrategy;
+  /**
+   * SEAM 3 (M1-PLAN §1.2, review R14): the `Lease` factory the registry hands each new worker.
+   * Absent ⇒ `alwaysGrantedLease`, i.e. M0's behaviour. M1-WP-D lands `createLease` in its own
+   * files and M1-WP-E flips this default in `create-daemon.ts`, so D5 enforcement costs
+   * `worker.ts` and `registry.ts` zero further edits.
+   */
+  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId) => Lease;
 }
 
 // ── supervisor / platform ────────────────────────────────────────────────────
@@ -2723,10 +2760,13 @@ export function openPersistence(o: {
 export function acquireDataDirLock(dir: string, self: { pid: number; bootId: string }):
   Promise<{ release(): Promise<void>; brokeStaleLock: boolean }>;          // §14.10
 
-// normalizer/  — WP-B
+// normalizer/  — WP-B.  M1's four new options are OPTIONAL as landed (`drainGraceMs`,
+// `cancelGraceMs`, `descriptor` defaulting to DEFAULT_V1_PROFILE, `ids`): typing them required at
+// the Land step would have broken every M0 call site while the bodies were still stubs, and a
+// caller written against this block compiles either way. M1-WP-B tightens the defaults away.
 export function createNormalizer(o: {
-  quietMs: number; hardMs: number; drainGraceMs: number; cancelGraceMs: number;
-  descriptor: RuntimeDescriptor;
+  quietMs: number; hardMs: number; drainGraceMs?: number; cancelGraceMs?: number;
+  descriptor?: RuntimeDescriptor;
   /** For `messageId` synthesis and plan ids. Deterministic per worker; injected so the map stays pure. */
   ids: { synth(prefix: string): string };
 }): Normalizer;
@@ -2746,7 +2786,9 @@ export function fingerprintOf(pid: number, platform: NodeJS.Platform, run: RunUt
 
 // lease/       — WP-D
 export function createLease(o: LeaseOptions): Lease;
-export function alwaysGrantedLease(holder: ClientRef): Lease;   // KEPT: fixtures + in-process callers
+/** KEPT: fixtures + in-process callers. `workerId` is optional and only sharpens the snapshot —
+ *  without it `LeaseSnapshot.workerId` is the `w_unknown` sentinel rather than a fabricated id. */
+export function alwaysGrantedLease(holder: ClientRef, workerId?: WorkerId): Lease;
 
 // runtime/     — WP-E
 export const BUILTIN_RUNTIMES: readonly BuiltinRuntime[];       // exactly one entry today: claude-acp
@@ -2756,6 +2798,45 @@ export function descriptorFingerprint(d: AgentDescriptor, agentInfo?: { name?: s
 export function classifyProbe(e: unknown): MethodVerdict;
 export function probeAgent(o: ProbeOptions): Promise<ProbeSummary>;
 ```
+
+**The two seams the Land step wrote, and their types.** Neither is a new interface — that is the
+point (ruling M1-R19). `worker.ts` and `registry.ts` are edited ONCE, by the Land step, and then
+frozen, so every field a work package will need has to exist now (review R13, R14):
+
+```ts
+// core/src/worker/worker.ts — Land-written, then FROZEN for the whole of M1.
+export interface CreateWorkerDeps {
+  … // §5.3's M0 members, unchanged and still required
+  /** The catalog's SpawnSpec producer; absent ⇒ the derivation in `worker.ts` (M0 note). */
+  readonly toSpawnSpec?: (d: AgentDescriptor, o: { cwd: string }) => SpawnSpec;
+  /** SEAM 2. Absent ⇒ M0's inline `runHandshake`, so the M0 suite runs untouched (note S3). */
+  readonly session?: SessionStrategy;
+  /** The RESOLVED quirk table handed to `open` / `reopen`; absent ⇒ `DEFAULT_V1_PROFILE`. */
+  readonly runtime?: RuntimeDescriptor;
+  /** `"<agentId>@<fingerprint12>"` for `WorkerSnapshot.runtimeId`; absent ⇒ `@unresolved`. */
+  readonly runtimeId?: string;
+  readonly limits: {
+    handshakeTimeoutMs: number; cancelGraceMs: number; exitGraceMs: number; gracefulMs: number;
+    /** §15.3's wake budget; absent ⇒ `handshakeTimeoutMs`. */
+    wakeTimeoutMs?: number;
+    /** §15.5's cap on consecutive TRANSIENT wake failures; absent ⇒ 3, the config default. */
+    maxWakeFailures?: number;
+  };
+}
+
+// daemon/src/registry.ts — Land-written, then transferred to WP-E.
+export interface WorkerRegistryOptions {
+  … // M0's members, unchanged
+  /** SEAM 3. Absent ⇒ `alwaysGrantedLease(owner, workerId)`, i.e. M0 exactly. */
+  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId) => Lease;
+}
+```
+
+`Worker.hibernate()` / `Worker.wake()` are Land-written **state transitions** that delegate every
+session decision to `SessionStrategy` (§15.2, §15.3); `registry.delete()` and the `lease()` façade
+row are Land-written **enforcement points** that call the injected lease. What each work package
+then implements is its own file: WP‑C the strategy, the timer and `classifyResume`; WP‑D
+`createLease`; WP‑E the store, the rehydration and the daemon wiring.
 
 **`@omni-acp/daemon`** — new modules behind the frozen barrel (all WP‑E except the lease route):
 
@@ -3365,6 +3446,8 @@ design doc, the design doc is what gets amended (M1-R4).
 | M1-R18 | Compat config | **Two files** — `agents.ci.yaml` (hermetic, always runs) and `agents.local.yaml` (real agents, `OMNI_COMPAT_REAL=1`) — with P3's three-source skip taxonomy and mandatory reasons, P2's `expect` block, and `OMNI_COMPAT_REQUIRE=1` so an empty selection fails instead of passing. |
 | M1-R19 | How do three work packages avoid fighting over `worker.ts` and `registry.ts`? | **Named seams, and one Land edit each** (P3's shape, simplified). `worker.ts` gains an injected `SessionStrategy` and one `perform(out.action)` line for P1's `TurnOutput.action`; it is edited **once**, by the Land step, then frozen — no `CloseOutStrategy` interface is needed, because the ladder lives in the pure reducer. The lease needs **zero** `worker.ts` edits (F22). `registry.ts` and `create-daemon.ts` transfer to a single owner (the daemon work package) rather than being shared. Details in `docs/M1-PLAN.md` §1.2. |
 | M1-R20 | `exactOptionalPropertyTypes` — §1 says "revisit at M1" | **Stays off.** The SDK is still pinned at 1.4.0 with the same pervasively `?: T \| null` generated types, and M1 *adds* optional-field surface (`resume`, `orphan`, `lease`, `crashed`). Revisit at M4 with the v2 SDK. |
+| M1-R22 | DESIGN §3.2 gives the `hibernated → starting` trigger as "`prompt` / `attach`"; §15.1 lists `prompt` / `POST …/wake` | **`attach` never wakes.** Attach and SSE are ungated OBSERVER operations (§16.1 rule L2), and forcing a ~7 s npx cold start on a passive observer would contradict D5's "多观察者" and let a reader spend the holder's quota. `POST …/wake` is the explicit lever for an operator who wants the process back. **DESIGN §3.2's `attach` trigger is superseded** (review R10). |
+| M1-R23 | `wake` fails the CURRENT ACL: which close reason? | **`acl_revoked`, a new `WorkerCloseReason`** (review R6). Reusing `client_request` would make the audit log say an operator issued a `DELETE` when the config revoked a token's `cwdRoots` between boots. The HTTP answer is unchanged (`403 forbidden`); only the log stops lying. |
 | M1-R21 | `requires_action` in M1? | **No** — unanimous. M1's state set is `starting \| ready \| running \| hibernated \| closed`; the policy engine that produces the sixth state is M2, and §15.1 deliberately has no `requires_action → hibernated` row so M2 does not have to rediscover that an unanswered interaction must not be hibernated away. |
 
 ### 11.6 M1 risks accepted, with their mitigation
@@ -3441,6 +3524,7 @@ type-level tests) · `→` rewritten · `⊘` not implemented in M1, with the re
 | 16 | *(none)* | `agent_message` / `user_message` / `agent_thought` / `tool_call_content_chunk` | ⊘ **not synthesized.** These are v2 *upsert* forms with patch semantics and no v1 producer; emitting them would be inventing structure |
 | 17 | `terminal_update` / `terminal_output_chunk` | same | ⊘ D3: `clientCapabilities: {}` means no `terminal/*` traffic exists. Confirmed across all 11 corpus runs — the only agent→client methods are `session/update` and `session/request_permission` |
 | 18 | unknown `sessionUpdate` | verbatim, `payloadVersion: 1` | pass-through **by identity**; `_meta` preserved because the object is forwarded, not rebuilt |
+| 18b | an agent→client **method** in `descriptor.inboundAliases` (e.g. `session/notification`) | `session/update` | the method is renamed to the alias's value **before** this table runs, then mapped by the row its `sessionUpdate` names. Only REGISTERED spellings are aliased; an unregistered agent→client method keeps §7.6's `-32601`, so a typo can never silently swallow updates. `{}` for every agent M1 knows about (DESIGN §1.3, review R4) |
 
 Client→agent, per method:
 
@@ -3453,7 +3537,8 @@ Client→agent, per method:
 | 23 | `authenticate{methodId}` / `logout` | `auth/login{methodId}` / `auth/logout` | descriptor spellings, marked `unverified`: claude-acp advertises `auth:{logout:{}}` and `authMethods: []`, and the corpus never exercises it. The compat suite refuses to assert it |
 | 24 | `session/load{sessionId,cwd,mcpServers}` | `session/resume{…, replayFrom}` | preference order (§17.3). claude-acp answers **both** (F18) |
 | 25 | `session/set_mode{modeId}` | `session/set_config_option{configId:"mode", value}` | preference order; note **both are live on one process** (F18) |
-| 26 | *(vendor)* `session/set_model{modelId}` | `session/set_config_option{configId:"model", value}` | preference order; `-32601` here, present on 8 multica runtimes |
+| 26 | *(vendor)* `session/set_model{modelId}` | `session/set_config_option{configId:"model", value}` | preference order; `-32601` here, present on 8 multica runtimes. `prefer.setConfig.onFailure` is **`fail`** — a caller asked for a model and did not get one |
+| 26b | *(vendor)* `session/set_options{…}` | passthrough under `prefer.setOptions` | DESIGN §6.2's vendor extension. `-32601` on claude-acp (transcript `08`), and `prefer.setOptions.onFailure` is **`warn`**: an agent that does not implement an extension we offered has done nothing wrong, so the turn carries a `TurnWarning` and does not fail (review R2) |
 | 27 | v2 `{type:"id", value}` | v1 `{value}` | outbound **drop** of the `type:"id"` tag: v1's untagged arm is `{value}` and claude-acp accepts it |
 | 28 | no `session/list` / `session/close` | synthesized from the registry | only when the capability is absent; claude-acp has real ones (F18) |
 | 29 | permission request `{toolCall, options}` | `{title, subject, options}` | §12.6 |
@@ -3780,8 +3865,10 @@ The gap-free invariant, stated once so it cannot be eroded — there are exactly
 third that is forbidden:
 
 - ✅ **drop** — decided in the **Normalizer**, from `UpdateRule.stream/store` both false, **before**
-  `append()` is ever called. No seq is consumed; the log stays gap-free by construction. This is the
-  operator's escape hatch (`dropUpdateKinds` in the descriptor overlay), **empty by default**.
+  `append()` is ever called. No seq is consumed; the log stays gap-free by construction. That IS the
+  operator's escape hatch: an `updates.<kind>` overlay entry with `stream:false, store:false`. There is
+  no separate `dropUpdateKinds` field and there never was one (review R9); **no kind carries the
+  drop shape by default**.
 - ✅ **keep** — stored and streamed like everything else. When `UpdateRule.digest` is set, the payload is
   stored **once** under its sha256 in a side table and the envelope row holds a reference; `read()` and
   `subscribe()` rehydrate, so every reader sees the identical payload it would have seen with no digest at
@@ -3899,10 +3986,11 @@ wire-stable and unemitted until M2's policy engine.
 | **`ready`** | **`hibernated`** | idle timer or `POST …/hibernate`, `resume.method !== null` | **`hibernate`** | **reclaimed** | **kept** | **released** |
 | **`ready`** | **`closed`** | idle timer, no resume method, `whenNotResumable:"close"` | **`idle_timeout`** | reclaimed | dropped | released |
 | **`ready`** | **`ready`** | idle timer, no resume method, `whenNotResumable:"keep"` (default) | *(none; logged once at info)* | live | kept | kept |
-| **`hibernated`** | **`starting`** | `prompt` / `POST …/wake` | **`wake`** | spawning | kept | re-acquirable |
+| **`hibernated`** | **`starting`** | `prompt` / `POST …/wake` — **never `attach`** (ruling M1-R22) | **`wake`** | spawning | kept | re-acquirable |
 | **`starting`** | **`ready`** | wake ⇒ `landed` \| `unknown` | **`resumed`** (+`resume`) | live | kept | free |
 | **`starting`** | **`hibernated`** | wake ⇒ spawn / init / `rejected_transient` failure | **`wake_retry`** (+`resume`) | reclaimed | **kept** | free |
 | **`starting`** | **`closed`** | wake ⇒ `rejected_permanent`, or `maxWakeFailures` exhausted | **`not_resumable`** \| **`wake_failed`** (+`resume`) | reclaimed | **cleared** | — |
+| **`hibernated`** \| **`starting`** | **`closed`** | wake fails the CURRENT ACL (§15.3 step 2) | **`acl_revoked`** | reclaimed | **dropped** | — |
 | `running` | `hibernated` | process death, resume method present | `agent_crashed` (+`crashed:true`) | dead | kept | released |
 | `running` | `closed` | process death, not resumable | `agent_crashed` | dead | dropped | — |
 | **live** | **`hibernated`** | boot adoption, resumable | **`daemon_restart`** (+`orphan`, `crashed:true`) | orphaned | kept | none |
@@ -3921,6 +4009,12 @@ Five invariants a test asserts after **every** transition:
    path through this table.
 
 ### 15.2 Hibernate — the order is the correctness argument
+
+**Who writes it.** The four steps below are the Land step's, in `worker.ts`, because every one of them
+moves a PRIVATE field of the `Worker` (`#state`, `#proc`, `#link`, `#hibernatedAt`) and that file is
+frozen after the Land commit (ruling M1-R19, review R13). What M1-WP-C owns is everything the transition
+DELEGATES to: `createHibernateTimer` (which calls it), `SessionStrategy` (which reopens afterwards), and
+the tests that assert this order.
 
 The idle timer is armed on every transition **into** `ready` and disarmed on every other state, including
 `starting` during a wake. A synchronous `#hibernating` flag is set before the first `await`, exactly like
@@ -3959,6 +4053,13 @@ prompt() on `hibernated`
 
 Step 2 exists because persisting worker records makes `daemon.stop()` non-final: a `cwdRoots` or token
 change between runs must not resurrect a worker the present ACL forbids.
+
+**Who writes it.** Steps 1-2 are the registry's (`maxWorkers`, the ACL) and steps 3-7 are the Worker's,
+where 3-4 are its own spawn and 5-7 are one call to the injected `SessionStrategy.reopen` inside the replay
+window. As with hibernate, the Land step writes the state transitions and the failure mapping of §15.5;
+M1-WP-C writes the strategy, `attemptResume`, `classifyResume` and the tests (review R13). `performWake`
+takes the `AcpLinkLike` as its FIRST parameter, because a helper that cannot name a link cannot make the
+one call it exists for.
 
 **The replay window (D6, confirmed by F16).** It opens when the resume request bytes reach stdin and closes
 when its response resolves. The Worker owns it — a boolean set before the write and cleared in a
@@ -4023,6 +4124,13 @@ The classification is `unknown` and not `rejected_transient` (ruling M1-R6): bot
 **action is identical**, and `unknown` is the honest label for "we could not tell" while `transient`
 asserts a cause we have not verified. The diagnosis lives in `hint: "cwd_mismatch"`.
 
+**How rule 1 reads D2, recorded because the wording differs (review R5).** D2 says of the rate-limit /
+quota / auth / 5xx / network class "永不算 rejected"; rule 1 classifies exactly that class as
+`rejected_transient`. The reading is **"never `rejected_permanent`"**, and D2's own table is the warrant:
+it defines `rejected_transient` as "现在不行但 session 健康" **with the pointer kept**, which is precisely
+a rate limit. The action D2 asks for — keep the pointer, fail this prompt — is what rule 1 produces. The
+property test below is stated in exactly those terms, and it is the assertion that matters.
+
 A companion **property test** asserts the rule whose violation destroys a live session pointer: over
 generated errors, **no network / timeout / auth / quota / 5xx error ever yields `rejected_permanent`**.
 
@@ -4040,7 +4148,7 @@ generated errors, **no network / timeout / auth / quota / 5xx error ever yields 
 | wake spawn failure | back to `hibernated` | 502 | `agent_error` |
 | wake `initialize` timeout | back to `hibernated` | 504 | `agent_timeout` |
 | wake would exceed `maxWorkers` | stays `hibernated` | 429 | `worker_limit` |
-| wake fails the CURRENT ACL | `closed(client_request)` | 403 | `forbidden` |
+| wake fails the CURRENT ACL | `closed(acl_revoked)` | 403 | `forbidden` |
 | `prompt` on `closed` | `closed` | 410 | `worker_closed` |
 
 Every `422` carries the agent's JSON-RPC error verbatim in `acp` where there was one **and** the full
@@ -4197,11 +4305,13 @@ M1 ships **exactly one** non-default builtin, and every field of it is an observ
 ```yaml
 claude-acp:                      # matches agentInfo.name /^claude-(code|agent)-acp$/, >=0.70.0 <1.0.0
   protocolVersion: 1             # F24: answers 1, speaks v2 in places
-  prefer:
-    resume:    [session/resume, session/load]                  # F18: both work
-    setConfig: [session/set_config_option, session/set_mode]    # F18: set_model is -32601 here
-    list:      [session/list]
-    close:     [session/close]
+  prefer:                            # capability -> { spellings, onFailure }  (review R2)
+    resume:    { spellings: [session/resume, session/load],               onFailure: fail }  # F18: both work
+    setConfig: { spellings: [session/set_config_option, session/set_mode], onFailure: fail }  # F18: set_model is -32601 here
+    setOptions:{ spellings: [session/set_options],                         onFailure: warn }  # -32601 here (08); a vendor extension, so a WARNING
+    list:      { spellings: [session/list],                                onFailure: fail }
+    close:     { spellings: [session/close],                               onFailure: fail }
+  inboundAliases: {}                 # this agent spells `session/update` the standard way (review R4)
   quirks:
     resumeRequiresSameCwd: true      # README §10 — NOT in the committed transcripts (F15); compat re-observes
     loadReturnsBody: true            # F18
@@ -4229,6 +4339,12 @@ claude-acp:                      # matches agentInfo.name /^claude-(code|agent)-
 `unverified` is not decoration: §18.3 makes the compat suite **refuse to assert** those rows for this agent,
 so a corpus gap is reported as a gap rather than silently passing.
 
+**This list is the SINGLE SOURCE OF TRUTH for claude-acp's corpus gaps** (review R8). §18.3's `capability`
+skip source derives from it; `agents.local.yaml`'s `unverified:` key restates it verbatim so an operator
+reading only the YAML sees the same seven rows; and M1-PLAN §5's definition-of-done points here rather than
+re-listing a fifth, different subset. A row leaves this list when a real run exercises it — which is the
+only event that may ever shorten it.
+
 ### 17.3 The vendor-extension registry — preference order, not one name per capability
 
 F18 is the decisive fact: `session/set_mode` **and** `session/set_config_option` are both live on **one**
@@ -4245,8 +4361,10 @@ that maps one capability to one method name cannot express that.
   `data.method` carries the same information in a field.
 - `classifyError` keys on **code + a JSON pointer into `data`**, because F17 shows a wrong *value* and a
   genuine internal error share `-32603` and are separated only by `data.details`.
-- `onFailure` is per capability: `set_model` failing is `fail`, `set_options` failing is `warn`
-  (DESIGN §6.2).
+- `onFailure` is per capability, and since review R2 it is a FIELD rather than a sentence:
+  `MethodPreference.onFailure` (§5.1 `runtime.ts`). `setConfig` (which carries `set_model`) is `fail`;
+  `setOptions` is `warn` (DESIGN §6.2). A `warn` failure adds a `TurnWarning` and does not fail the turn;
+  a `fail` failure is an `OmniError` the caller sees.
 
 ### 17.4 What the probe learns, and how
 
@@ -4296,34 +4414,44 @@ changes** — proven by a test, not by intention.
 
 ### 18.2 Shape
 
+Every key below exists in `CompatAgentConfig` (`tests/compat/src/config.ts`) and in the two YAML files —
+the schema, the example and the data are one thing, not three (review R3, R15).
+
 ```yaml
 # tests/compat/agents.local.yaml   (real agents; opt-in, never CI)
 version: 1
 defaults: { handshakeTimeoutMs: 90000, turnTimeoutMs: 180000, cwdStrategy: mkdtemp }
 agents:
   - id: claude-acp
+    source: command                 # sdk-example | fixture | command
     enabled: true
     command: npx
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"]
     # §6.3: on win32 an npx .cmd shim is refused, so the direct-module form is required there.
     windows: { command: "${execPath}", args: ["${npxResolved:@agentclientprotocol/claude-agent-acp@0.73.0}"] }
     requires: { login: "claude-code" }          # unmet ⇒ "skipped: precondition", never a pass
+    budgets: { initializeMs: 30000, resumeMs: 30000, turnMs: 300000 }
     expect:
       protocolVersion: 1
       capabilities: { loadSession: true }
       resumeMethod: session/resume
       unsupportedMethods: ["session/set_model", "session/set_options", "session/notification"]
       quirks: { resumeRequiresSameCwd: true }
-    skip:
+    skip:                           # the `config` source; every reason >= 10 characters
       - { case: plan-update,         reason: "no todo/plan tool in this build; two deliberate attempts produced no `plan` (corpus 05/05b)" }
       - { case: agent-thought,       reason: "not emitted at default effort (corpus)" }
       - { case: current-mode-update, reason: "session/set_mode answers with the v2 config_option_update (corpus 08)" }
       - { case: git-patch,           reason: "diff blocks are widened fragments; structuredPatch is a vendor extension (F19)" }
+    unverified:                     # the `capability` source; MIRRORS §17.2's descriptor, all seven
+      [plan, agent_thought_chunk, current_mode_update, mcp, image_content, authenticate,
+       tool_failure_on_merits]
   # add the next runtime here. Zero code changes.
 ```
 
-`tests/compat/agents.ci.yaml` is the hermetic default: the SDK example agent plus the ten testkit
-fixtures, so the suite is green on three OSes and **never silently empty**.
+`tests/compat/agents.ci.yaml` is the hermetic default: the SDK example agent plus the **eight
+turn-completing testkit fixtures** — `crash` and `orphan` are deliberately absent, because neither
+completes a turn and a case list whose first assertion is "the turn ended" cannot be satisfied by them
+(review R20) — so the suite is green on three OSes and **never silently empty**.
 
 Selection: `OMNI_COMPAT_CONFIG=<path>` (default `agents.ci.yaml`) ⊕ `OMNI_COMPAT_AGENTS=<csv>` filter ⊕ each
 entry's `enabled`. `OMNI_COMPAT_REAL=1` enables entries that need a login or the network.
@@ -4337,7 +4465,7 @@ Three skip **sources**, and every one prints a reason:
 | source | meaning |
 | ------ | ------- |
 | `config` | an explicit `skip` entry in the YAML. `reason` is **required**, minimum 10 characters |
-| `capability` | the **probe** says this runtime lacks what the case requires, or the descriptor lists the row in `unverified` |
+| `capability` | the **probe** says this runtime lacks what the case requires, or the row appears in the resolved descriptor's `unverified` (§17.2 — the single source of truth; the YAML's `unverified:` restates it and never shortens it) |
 | `precondition` | `requires.login` / `requires.env` unsatisfied on this machine |
 
 **A skip with no source is a failure, not a skip.** `compat-report.json` (agent × case × pass/skip/fail +
@@ -4350,8 +4478,8 @@ reason + source) is written unconditionally, uploaded as a CI artifact, and rend
 | -- | -------- | ------- |
 | `handshake` | — | initialize + `session/new` within budget; `capabilities.raw` non-empty; `runtimeId` stable across two workers |
 | `plain-turn` | — | exactly one `state_update{running}` … one `{idle}`; every agent update between them; non-empty `text`; `verdict:"ok"` |
-| `tool-turn` | tools | a tool-using prompt yields ≥1 tool call whose final status is terminal, and `changes` matches the workspace |
-| `stream-resume` | — | drop the SSE mid-turn, reconnect with `?since=`, the union is **byte-identical** to an uninterrupted observer's and gap-free |
+| `tool-turn` | tools | a tool-using prompt yields ≥1 tool call whose final status is terminal, and `changes` matches the workspace. **The prompt is READ-ONLY** (corpus `02`: reads are auto-allowed): M1 wires exactly one permission responder and it is auto-DENY, so a write turn's `changes` is empty by construction and belongs to `permission-deny` instead (review R11) |
+| `stream-resume` | — | drop the SSE mid-turn, reconnect with `?since=`; the union's **envelope frames** (`id:`/`event:`/`data:` triples) are identical to an uninterrupted observer's and gap-free. `: hb` comments and the `retry:` / `omni.stream_truncated` / `_overflow` / `_end` control frames are **excluded from the comparison and asserted separately** — segment 2 begins with `retry:` and may carry one `stream_truncated`. A raw byte comparison is unachievable against the checksum-frozen `sse.ts` (review R12) |
 | `restart-survives` | — | stop the daemon, restart on the same `dataDir`, `?since=` returns the same envelopes with the same `seq`; a hibernated worker is adopted with `generation` preserved |
 | `cancel-late-update` | cancel | corpus 14: an update arriving **after** `session/cancel` is ordered **before** `idle` |
 | `tool-merge` | tools | a sparse `tool_call_update` never clears `kind` / `locations` / `title` (corpus finding 3) |

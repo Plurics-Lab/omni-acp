@@ -784,4 +784,11 @@ export interface DaemonDeps {
   readonly persistence?: PersistenceHandle;
   /** Injected so `worker.ts` never names `initialize` / `session/new` again (seam 2, M1-WP-C). */
   readonly session?: SessionStrategy;
+  /**
+   * SEAM 3 (M1-PLAN §1.2, review R14): the `Lease` factory the registry hands each new worker.
+   * Absent ⇒ `alwaysGrantedLease`, which is M0's behaviour. M1-WP-D lands `createLease` in its
+   * own files and M1-WP-E flips this default in `create-daemon.ts`, so D5 enforcement costs
+   * `worker.ts` and `registry.ts` zero further edits.
+   */
+  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId) => Lease;
 }

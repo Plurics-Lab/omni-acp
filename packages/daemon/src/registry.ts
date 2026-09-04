@@ -1,12 +1,15 @@
 import {
   CreateWorkerRequest,
+  LeaseRequestBody,
   OmniError,
   PromptRequestBody,
   type Clock,
+  type ClientRef,
   type CloseResult,
   type DaemonId,
   type EventLog,
   type IdGen,
+  type Lease,
   type LeaseSnapshot,
   type Logger,
   type OrphanRecord,
@@ -42,6 +45,17 @@ export interface WorkerRegistryOptions {
   readonly logger: Logger;
   /** Every appended envelope, for `daemon.on("worker.event" | "worker.state")`. */
   readonly onEnvelope?: (workerId: string, envelope: unknown) => void;
+  /**
+   * SEAM 3 (M1-PLAN §1.2, review R14). D5 enforcement is a change to the FACTORY this registry
+   * passes in, and to nothing else: `Worker.prompt()` / `cancel()` / `wake()` already call
+   * `lease.assertHolder(who)` as their first statement, and `delete()` below does too.
+   *
+   * Absent ⇒ `alwaysGrantedLease`, which is M0's behaviour exactly: one in-process controller by
+   * construction, every mutating verb a `bad_request` naming M1-WP-D. M1-WP-D implements
+   * `createLease` in its own files and M1-WP-E flips this default in `create-daemon.ts` — neither
+   * of them edits the hunk the other owns.
+   */
+  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId) => Lease;
 }
 
 interface Entry {
@@ -145,6 +159,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     return entry.closing;
   };
 
+  /** Seam 3's one call site. The default IS M0: `alwaysGrantedLease` grants every `assertHolder`. */
+  const leaseFor = (owner: ClientRef, workerId: WorkerId): Lease =>
+    o.leaseFactory?.(owner, workerId) ?? alwaysGrantedLease(owner, workerId);
+
   return {
     /** Live workers — the number `maxWorkers` is compared against. A closed worker holds no slot. */
     get size(): number {
@@ -213,7 +231,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               hardMs: o.config.turn.hardMs,
             }),
             responder: o.responder,
-            lease: alwaysGrantedLease(auth.asClientRef()),
+            lease: leaseFor(auth.asClientRef(), workerId),
             clock: o.clock,
             ids: o.ids,
             logger,
@@ -222,6 +240,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               cancelGraceMs: o.config.turn.cancelGraceMs,
               exitGraceMs: o.config.supervisor.exitGraceMs,
               gracefulMs: spec.gracefulMs ?? o.config.supervisor.gracefulMs,
+              // The wake half of §15.5, from the daemon-wide `hibernate` block. They live on the
+              // worker because the counter and the budget are its private state (review R13).
+              wakeTimeoutMs: o.config.hibernate.wakeTimeoutMs,
+              maxWakeFailures: o.config.hibernate.maxWakeFailures,
             },
           },
           signal,
@@ -279,6 +301,11 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const entry = entries.get(id);
       if (entry === undefined) return notFound(id);
       if (!auth.canSee(entry.handle.snapshot())) return notFound(id);
+      // D5: a DELETE is a controlling operation, so a non-holder is `423` with the holder named
+      // (M1-PLAN WP-D acceptance 2). `WorkerHandle.close()` takes no `ClientRef`, so this is the
+      // enforcement point, and it is Land-written for the same reason the rest of seam 3 is:
+      // under the default `alwaysGrantedLease` it always grants, which is M0 unchanged.
+      entry.handle.lease.assertHolder(auth.asClientRef());
       // Idempotent by construction: the second DELETE awaits the FIRST close and returns its
       // body, rather than asking a closed worker to close again (H12).
       return await closeEntry(entry, "client_request");
@@ -362,24 +389,53 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     // get-then-act orchestration in the adapter.
     //
     // Owned by M1-WP-E (daemon wiring), which lands the persisted worker store, lazy
-    // rehydration and the hibernated counter behind them. M1-WP-D swaps in the enforcing `Lease`
-    // FACTORY without touching this file — seam 3.
+    // rehydration and the hibernated counter behind them — so the two throwing bodies below are
+    // tagged M1-WP-E, the owner of this file, and not the feature's work package (review R18).
+    // M1-WP-D swaps in the enforcing `Lease` FACTORY without touching this file — seam 3.
 
     /** A hibernated worker owns no process, so it is bounded separately from `maxWorkers` (H14). */
     get hibernatedSize(): number {
       return 0;
     },
 
-    lease(_id, _auth, _op, _body): LeaseSnapshot {
-      throw new OmniError("internal", "unimplemented: M1-WP-D");
+    /**
+     * Seam 3's façade row, Land-written: parse, then ONE call on the injected lease. Under the
+     * default `alwaysGrantedLease` every mutating verb answers `bad_request` naming M1-WP-D,
+     * which is D29's honest "not implemented yet" rather than a 500.
+     */
+    lease(id, auth, op, body): LeaseSnapshot {
+      let parsed: LeaseRequestBody;
+      try {
+        parsed = LeaseRequestBody.parse(body);
+      } catch (e) {
+        throw badRequest(e, "invalid lease request");
+      }
+      const handle = get(id, auth);
+      const who = auth.asClientRef();
+      switch (op) {
+        case "acquire":
+          return handle.lease.acquire(
+            who,
+            parsed.ttlMs === undefined ? {} : { ttlMs: parsed.ttlMs },
+          );
+        case "release":
+          return handle.lease.release(who);
+        case "steal":
+          // D13: an admin never waits; a same-token peer waits `stealAfterIdleMs`. The lease owns
+          // that rule — the registry only says who is asking and with which authority.
+          return handle.lease.steal(who, {
+            reason: parsed.reason ?? null,
+            admin: auth.role === "admin",
+          });
+      }
     },
 
     hibernate(_id, _auth): Promise<WorkerSnapshot> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+      throw new OmniError("internal", "unimplemented: M1-WP-E");
     },
 
     wake(_id, _auth): Promise<WorkerSnapshot> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+      throw new OmniError("internal", "unimplemented: M1-WP-E");
     },
 
     adopt(): Promise<{ hibernated: number; closed: number; orphans: readonly OrphanRecord[] }> {

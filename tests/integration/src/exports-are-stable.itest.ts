@@ -119,6 +119,7 @@ import type {
   LeaseSnapshot,
   MappedPermissionRequest,
   MappedUpdate,
+  MethodPreference,
   MethodPreferences,
   MethodVerdict,
   OrphanRecord,
@@ -217,6 +218,7 @@ type Named =
   | LeaseSnapshot
   | MappedPermissionRequest
   | MappedUpdate
+  | MethodPreference
   | MethodPreferences
   | MethodVerdict
   | OrphanRecord

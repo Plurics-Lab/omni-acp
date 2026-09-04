@@ -83,7 +83,14 @@ export type WorkerCloseReason =
   /** `hibernate.maxWakeFailures` consecutive transient wake failures; the pointer is abandoned. */
   | "wake_failed"
   /** A previous boot owned this row and the agent cannot resume, so the session is unrecoverable. */
-  | "orphaned";
+  | "orphaned"
+  /**
+   * A wake re-ran the ACL against the CURRENT config and the worker no longer passes (§15.3
+   * step 2, §15.5's 403 row). It is NOT `client_request`: nobody issued a DELETE, and reusing
+   * that reason would make the audit log say an operator closed a worker the config closed
+   * (review R6).
+   */
+  | "acl_revoked";
 
 /** A process this daemon no longer owns, recorded so it is never silently forgotten (§15.7). */
 export interface OrphanRecord {
@@ -274,6 +281,7 @@ const WORKER_STATE_REASONS = [
   "idle_timeout",
   "wake_failed",
   "orphaned",
+  "acl_revoked",
   "created",
   "handshake_ok",
   "prompt",

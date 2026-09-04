@@ -29,10 +29,15 @@ export const DEFAULT_V1_PROFILE: RuntimeDescriptor = {
   prefer: {
     // v2's spelling first, v1's second: F18 shows one process answering both, and the order is
     // "the canonical name, then the compatible one".
-    resume: ["session/resume", "session/load"],
-    setConfig: [],
-    list: [],
-    close: ["session/close"],
+    resume: { spellings: ["session/resume", "session/load"], onFailure: "fail" },
+    // A caller that asked to set a config option and did not get one has NOT had its request
+    // honoured, so the failure is `fail` (DESIGN §6.2, review R2).
+    setConfig: { spellings: [], onFailure: "fail" },
+    // `session/set_options` is a vendor extension we offer to pass through; an agent that does
+    // not implement it has done nothing wrong, so the failure is a WARNING on the turn.
+    setOptions: { spellings: ["session/set_options"], onFailure: "warn" },
+    list: { spellings: [], onFailure: "fail" },
+    close: { spellings: ["session/close"], onFailure: "fail" },
   },
   updates: {},
   extensions: {},
@@ -53,6 +58,8 @@ export const DEFAULT_V1_PROFILE: RuntimeDescriptor = {
     /** JSON-RPC's own "Method not found". */
     unknownMethodErrorCode: -32601,
   },
+  /** No agent M1 knows about spells `session/update` differently (§12.3, review R4). */
+  inboundAliases: {},
   /** D3: the client host declares nothing, for every agent M1 knows about. */
   clientHost: { fs: false, terminal: false },
   budgets: {

@@ -2,43 +2,62 @@
 #
 # The whole point of this file is CONTRACTS.md §18's rule: adding an agent is a YAML edit with
 # ZERO code changes, and a test proves it by appending an entry to a temp copy of this file and
-# running the suite unchanged. A second test asserts that no `.ts` file in the repository
-# contains a real agent's command string, so the rule cannot rot into "config plus one branch".
+# running the suite unchanged. A second test asserts that no `.ts` file in the repository contains
+# a real agent's launch argv, so the rule cannot rot into "config plus one branch".
 #
 # `command: node` means `process.execPath` — never `npx`, which is a `.cmd` shim on Windows
-# (CONTRACTS.md §6.3). `sdk-example` resolves through `sdkExampleAgentPath()`.
+# (CONTRACTS.md §6.3). `sdk-example` resolves through `sdkExampleAgentPath()`. Nothing here needs
+# a `requires:` or a `windows:` block: a fixture is a `.mjs` file this repository ships, so it has
+# no precondition and no launch quirk to override.
 version: 1
+defaults: { handshakeTimeoutMs: 30000, turnTimeoutMs: 60000, cwdStrategy: mkdtemp }
 agents:
   - id: sdk-example
     source: sdk-example
+    enabled: true
     # The tier-3 acceptance fixture: real process, real ndJSON, `loadSession: true`.
     expect:
       resume: true
 
+  # The turn-completing fixtures. `crash` and `orphan` are deliberately absent: neither completes
+  # a turn, so neither can satisfy a case list whose first assertion is that a turn ends.
   - id: fixture-echo
     source: fixture
     fixture: echo
+    enabled: true
   - id: fixture-chatty
     source: fixture
     fixture: chatty
+    enabled: true
   - id: fixture-noisy
     source: fixture
     fixture: noisy
+    enabled: true
   - id: fixture-slow
     source: fixture
     fixture: slow
+    enabled: true
+    skip:
+      - {
+          case: plain-turn,
+          reason: "slow.mjs never answers session/prompt; it exists for the quiet window and the cancel ladder",
+        }
 
   # M1-WP-B's four gap-filling fixtures (§18.3). They are listed here now so that the fixture
   # they cover is named in config the day it lands, not the day somebody remembers.
   - id: fixture-plan
     source: fixture
     fixture: plan
+    enabled: true
   - id: fixture-thought
     source: fixture
     fixture: thought
+    enabled: true
   - id: fixture-mode
     source: fixture
     fixture: mode
+    enabled: true
   - id: fixture-hybrid
     source: fixture
     fixture: hybrid
+    enabled: true

@@ -4,23 +4,64 @@
 # only real ACP agent available on this machine, and the M1 corpus
 # (`docs/research/transcripts/claude-acp-0.73.0/`) is its ground truth.
 #
-# ADDING AN AGENT IS AN EDIT TO THIS FILE AND NOTHING ELSE. No `.ts` file may name a real agent's
-# command — the suite asserts it. An agent listed here but not installed is SKIPPED with a
-# printed source and reason; a skip with no source FAILS (§18.2).
+# ADDING AN AGENT IS AN EDIT TO THIS FILE AND NOTHING ELSE. No `.ts` file may contain a real
+# agent's launch argv — the suite asserts it. An agent listed here but not usable on this machine
+# is SKIPPED with a printed source and reason; a skip with no source FAILS (§18.2).
 version: 1
+defaults: { handshakeTimeoutMs: 90000, turnTimeoutMs: 180000, cwdStrategy: mkdtemp }
 agents:
   - id: claude-acp
     source: command
+    enabled: true
     command: npx
     args: ["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"]
+    # §6.3: on win32 an `npx` .cmd shim is REFUSED, so the direct-module form is required there.
+    # This is data, not a branch — otherwise "adding an agent is a YAML edit" would be false for
+    # every npx-launched runtime (review R15).
+    windows:
+      {
+        command: "${execPath}",
+        args: ["${npxResolved:@agentclientprotocol/claude-agent-acp@0.73.0}"],
+      }
+    # Unmet ⇒ "skipped: precondition", never a pass and never a hard failure (§18.3).
+    requires: { login: "claude-code" }
     # Observed on this machine, 2026-09-04: initialize ~7 s cold / ~1.5 s warm, `loadSession: true`,
     # sessionCapabilities list/resume/close/delete/fork.
     budgets:
       initializeMs: 30000
       resumeMs: 30000
       turnMs: 300000
-    # Corpus gaps (§18.3): rows the suite must NOT assert for this agent, because no recorded run
-    # exercises them. A gap is not a failure, and pretending otherwise is how a suite starts lying.
+    expect:
+      protocolVersion: 1
+      capabilities: { loadSession: true }
+      resumeMethod: session/resume
+      unsupportedMethods: ["session/set_model", "session/set_options", "session/notification"]
+      quirks: { resumeRequiresSameCwd: true }
+    # The `config` skip source (§18.3). Every reason is at least 10 characters and names the
+    # evidence, because a skip nobody can argue with is the only kind worth having.
+    skip:
+      - {
+          case: plan-update,
+          reason: "no todo/plan tool in this build; two deliberate attempts produced no `plan` (corpus 05/05b)",
+        }
+      - { case: agent-thought, reason: "not emitted at default effort (corpus)" }
+      - {
+          case: current-mode-update,
+          reason: "session/set_mode answers with the v2 config_option_update (corpus 08)",
+        }
+      - {
+          case: git-patch,
+          reason: "diff blocks are widened fragments; structuredPatch is a vendor extension (F19)",
+        }
+    # Corpus gaps — the `capability` skip source. This list MIRRORS the builtin descriptor's own
+    # `unverified` (CONTRACTS.md §17.2), which is the single source of truth; it is restated here
+    # so an operator reading only this file can see what will not be asserted (review R8).
     unverified:
-      - authenticate
       - plan
+      - agent_thought_chunk
+      - current_mode_update
+      - mcp
+      - image_content
+      - authenticate
+      - tool_failure_on_merits
+  # add the next runtime here. Zero code changes.

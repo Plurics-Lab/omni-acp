@@ -108,6 +108,10 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     clock,
     ids,
     logger: logger.child({ mod: "registry" }),
+    // Seam 3: absent ⇒ `alwaysGrantedLease` inside the registry. M1-WP-E defaults this to
+    // `createLease` once M1-WP-D lands it; until then an injected factory is the only way a test
+    // gets an enforcing lease, and it is one line rather than a shared hunk.
+    ...(deps?.leaseFactory === undefined ? {} : { leaseFactory: deps.leaseFactory }),
     onEnvelope: (workerId, envelope) => {
       emit(workerId as WorkerId, envelope as EventEnvelope);
     },

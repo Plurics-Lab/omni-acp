@@ -144,6 +144,9 @@ const CLOSE_REASON_CODE: { readonly [R in WorkerCloseReason]: OmniErrorCode } = 
   idle_timeout: "worker_closed",
   orphaned: "worker_closed",
   wake_failed: "agent_error",
+  // The current config forbids this worker, which is the same answer the request would have got
+  // had it arrived one boot later (§15.5's 403 row, review R6).
+  acl_revoked: "forbidden",
 };
 
 interface MutableToolCall {

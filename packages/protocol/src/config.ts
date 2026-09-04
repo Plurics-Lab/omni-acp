@@ -32,14 +32,31 @@ export type TokenConfig = z.infer<typeof TokenConfig>;
  * and rejects the forbidden `stream:false, store:true` shape.
  */
 export const RuntimeOverlay = z.object({
+  /**
+   * A RECORD of capability -> { spellings, onFailure }, mirroring `MethodPreferences`
+   * (`runtime.ts`, review R2). The well-known keys are `resume` / `setConfig` / `setOptions` /
+   * `list` / `close`; an operator may add another, because a vendor extension that DESIGN §6.2
+   * requires the descriptor to carry must not need a schema edit to express.
+   *
+   * `onFailure` defaults to `"fail"`: an operator who names a spelling is asking for it to work,
+   * and the one capability whose failure is only a warning (`setOptions`) says so out loud in the
+   * builtin descriptor.
+   */
   prefer: z
-    .object({
-      resume: z.array(z.enum(["session/load", "session/resume"])).optional(),
-      setConfig: z.array(z.string()).optional(),
-      list: z.array(z.string()).optional(),
-      close: z.array(z.string()).optional(),
-    })
+    .record(
+      z.string(),
+      z.object({
+        spellings: z.array(z.string()),
+        onFailure: z.enum(["fail", "warn"]).default("fail"),
+      }),
+    )
     .optional(),
+  /**
+   * Inbound method aliases, mirroring `RuntimeDescriptor.inboundAliases`: an agent→client
+   * notification whose method matches a key is normalized to the value (DESIGN §1.3's
+   * `session/notification`). Unregistered methods keep §7.6's `-32601` (review R4).
+   */
+  inboundAliases: z.record(z.string(), z.string()).optional(),
   updates: z
     .record(
       z.string(),

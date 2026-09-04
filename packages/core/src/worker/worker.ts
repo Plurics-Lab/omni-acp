@@ -35,8 +35,11 @@ import {
   type WorkerHandle,
   type CloseOutAction,
   type MappedPermissionRequest,
+  type AcpLinkLike,
   type OrphanRecord,
   type ResumeReport,
+  type RuntimeDescriptor,
+  type SessionOpenResult,
   type SessionStrategy,
   type WorkerId,
   type WorkerSnapshot,
@@ -44,6 +47,7 @@ import {
   type WorkerStatePayload,
 } from "@omni-acp/protocol";
 import { openAcpLink, type AcpLink } from "../acp/link.js";
+import { DEFAULT_V1_PROFILE } from "../runtime/known.js";
 import { runHandshake } from "./handshake.js";
 
 export interface CreateWorkerDeps {
@@ -67,6 +71,18 @@ export interface CreateWorkerDeps {
     cancelGraceMs: number;
     exitGraceMs: number;
     gracefulMs: number;
+    /**
+     * Budget for a WAKE's spawn + initialize + resume. Separate from `handshakeTimeoutMs`
+     * because a wake is warm (claude-acp ~0.94 s initialize + ~0.55 s load) where a create may be
+     * cold (~7 s). Absent ⇒ `handshakeTimeoutMs`, so an M0 caller keeps its one budget.
+     */
+    wakeTimeoutMs?: number;
+    /**
+     * Consecutive TRANSIENT wake failures before the pointer is abandoned (`wake_failed`, §15.5).
+     * Absent ⇒ `hibernate.maxWakeFailures`'s own default. It lives here because the counter is a
+     * private field of this class, and this file is frozen after the Land step (review R13).
+     */
+    maxWakeFailures?: number;
   };
   /**
    * Optional, and the ONLY addition to CONTRACTS.md §5.3's `CreateWorkerDeps`.
@@ -89,6 +105,13 @@ export interface CreateWorkerDeps {
    */
   readonly session?: SessionStrategy;
   /**
+   * The RESOLVED quirk table for this agent (builtin ⊕ config ⊕ probe, §17.2), handed to the
+   * `SessionStrategy` on every `open` / `reopen`. Optional for the same reason `session` is: a
+   * unit test with no catalog gets `DEFAULT_V1_PROFILE`, which is the documented fallback rather
+   * than a failure (`Catalog.descriptor()` "NEVER throws"). M1-WP-E passes the real one.
+   */
+  readonly runtime?: RuntimeDescriptor;
+  /**
    * Descriptor identity for `WorkerSnapshot.runtimeId` — "which quirk table governed this
    * worker". M1-WP-E computes it as `"<agentId>@<fingerprint12>"` from the resolved descriptor;
    * absent, the snapshot reports the agent id against the `unresolved` fingerprint sentinel
@@ -105,6 +128,13 @@ export interface CreateWorkerDeps {
  * must not typecheck as one it can.
  */
 type M1State = "starting" | "ready" | "running" | "hibernated" | "closed";
+
+/**
+ * `hibernate.maxWakeFailures`'s own default (`config.ts`), restated for a `createWorker` caller
+ * that passes no limit. Restated rather than imported because `protocol`'s zod default is a
+ * config-parse concern and this class must behave the same for a unit test that has no config.
+ */
+const DEFAULT_MAX_WAKE_FAILURES = 3;
 
 /** Close reasons whose meaning is "the agent process is gone", as opposed to "we asked". */
 const DEATH_REASONS: ReadonlySet<WorkerCloseReason> = new Set<WorkerCloseReason>([
@@ -263,6 +293,15 @@ class Worker implements WorkerHandle {
    */
   #closing = false;
   #closePromise: Promise<CloseResult> | null = null;
+  /**
+   * §15.2's flag, set SYNCHRONOUSLY before the first `await` of a hibernate, exactly like
+   * `#closing` and for the same reason: a `prompt()` arriving in the window between "we decided to
+   * reclaim the process" and "the state says hibernated" must already see busy.
+   */
+  #hibernating = false;
+  #hibernatePromise: Promise<WorkerSnapshot> | null = null;
+  /** Single-flight: five racing prompts on a hibernated worker are ONE npx cold start (§15.3). */
+  #wakePromise: Promise<WorkerSnapshot> | null = null;
   #resolveClosed!: (r: CloseResult) => void;
   readonly closed: Promise<CloseResult>;
 
@@ -341,14 +380,24 @@ class Worker implements WorkerHandle {
   async prompt(content: readonly unknown[], who: ClientRef): Promise<PromptAccepted> {
     this.#deps.lease.assertHolder(who);
 
+    // §15.3's first box: a prompt on a hibernated worker AUTO-WAKES. `wake()` performs its own
+    // synchronous admission (`#state = "starting"`), so it is entered in this same tick and a
+    // second concurrent prompt sees `starting` — a 409 — rather than starting a second npx.
+    if (this.#state === "hibernated") await this.wake(who);
+
     // Check-and-set, with NOTHING async between the two halves: `prompt()` is `async` only
     // because the contract types it that way, and 50 concurrent callers must yield exactly one
     // acceptance. An `await` anywhere above `#state = "running"` reopens that race.
     if (this.#state === "closed") {
       throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
     }
-    if (this.#state !== "ready") {
-      throw new OmniError("worker_busy", `worker ${this.#deps.workerId} is ${this.#state}`);
+    if (this.#state !== "ready" || this.#hibernating) {
+      // §15.2: `#hibernating` is the half-open window in which the state still reads `ready` but
+      // the process is already being reclaimed. "Busy" is the honest answer for it.
+      throw new OmniError(
+        "worker_busy",
+        `worker ${this.#deps.workerId} is ${this.#hibernating ? "hibernating" : this.#state}`,
+      );
     }
     assertPromptContent(content);
 
@@ -479,43 +528,281 @@ class Worker implements WorkerHandle {
   }
 
   /**
-   * ready → hibernated (§15.2). Reclaims the process tree, RELEASES the lease, keeps the record
+   * ready → hibernated (§15.2). SEAM 2, the Land-written half: this is the ordered state
+   * transition and nothing else. Reclaims the process tree, RELEASES the lease, keeps the record
    * and the session pointer, and NEVER sends `session/close` — the pointer is the entire value
-   * being preserved. Owned by M1-WP-C (`worker/hibernate.ts`).
+   * being preserved. The idle timer that CALLS it, and the strategy that reopens the session
+   * afterwards, are M1-WP-C's (`worker/hibernate.ts`, `worker/session-open.ts`).
+   *
+   * Idempotent: a second caller shares the first transition; a worker already `hibernated`
+   * answers with its snapshot rather than reclaiming a process twice.
    */
-  hibernate(_reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot> {
-    throw new OmniError("internal", "unimplemented: M1-WP-C");
+  async hibernate(reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot> {
+    const inflight = this.#hibernatePromise;
+    if (inflight !== null) return await inflight;
+    if (this.#state === "hibernated") return this.snapshot();
+    if (this.#state === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
+    if (this.#closing || this.#state !== "ready") {
+      throw new OmniError("worker_busy", `worker ${this.#deps.workerId} is ${this.#state}`);
+    }
+
+    // Ruling M1-R15, and invariant 1 of §15.1: a `hibernated` worker MUST have a session pointer
+    // and a resolved resume spelling. Hibernating a worker you can never wake is a one-way door
+    // that turns a healthy worker into a guaranteed 422 on a timer, so the default
+    // `hibernate.whenNotResumable: "keep"` refuses here and the caller keeps its process. The
+    // opt-in `"close"` is the timer owner's `close("idle_timeout")`, not a second path in here.
+    const strategy = this.#deps.session;
+    const sessionId = this.#sessionId;
+    const method = this.#capabilities?.resume.method ?? null;
+    if (strategy === undefined || sessionId === null || method === null) {
+      throw new OmniError(
+        "not_resumable",
+        `worker ${this.#deps.workerId} cannot hibernate: ${
+          strategy === undefined
+            ? "no SessionStrategy is wired, so nothing could reopen the session"
+            : method === null
+              ? "the agent advertises no resume spelling"
+              : "the session pointer has already been cleared"
+        }`,
+      );
+    }
+
+    // SYNCHRONOUS, before the first await (§15.2) — see `#hibernating`.
+    this.#hibernating = true;
+    this.#hibernatePromise = this.#doHibernate(reason);
+    try {
+      return await this.#hibernatePromise;
+    } finally {
+      this.#hibernatePromise = null;
+      this.#hibernating = false;
+    }
+  }
+
+  /** §15.2's four steps, in the order that IS the correctness argument. */
+  async #doHibernate(reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot> {
+    this.#logger.info("hibernating", { reason });
+    this.#tickTimer?.cancel();
+    this.#tickTimer = null;
+    this.#cancelTimer?.cancel();
+    this.#cancelTimer = null;
+    this.#exitGraceTimer?.cancel();
+    this.#exitGraceTimer = null;
+
+    // 1. NO `session/close` — which is why this path does not go through `#doClose`. That call is
+    //    the difference between hibernate and close: the pointer is the entire value being
+    //    preserved, and `sessionCapabilities.close` on claude-acp is real and destructive.
+    // 2. stdin EOF, then the graceful ladder: the agent gets its normal shutdown.
+    await this.#reclaimProcess({ force: false });
+
+    // 3. The lease is released (DESIGN §3.2: 进程回收、lease 释放、记录保留). A holder cannot
+    //    control a worker with no process, and holding a lease across a 30-minute sleep is how a
+    //    lease silently becomes permanent.
+    this.#deps.lease.releaseForHibernate();
+
+    // 4. The ENVELOPE, then the persist (M1-WP-E's store subscribes to this log). A crash between
+    //    them replays as §15.7's adoption path, which converges on the same `hibernated` state;
+    //    persisting first and crashing before the envelope would leave a log that never mentions
+    //    the transition.
+    this.#hibernatedAt = this.#deps.clock.iso();
+    this.#setState("hibernated", "hibernate", {
+      turnId: null,
+      generation: this.#generation,
+      ...(this.#crashed ? { crashed: true } : {}),
+    });
+    return this.snapshot();
   }
 
   /**
-   * hibernated → ready (§15.5). Idempotent and single-flight. Owned by M1-WP-C
-   * (`worker/wake.ts`), which drives it through the injected `SessionStrategy.reopen`.
+   * hibernated → ready (§15.3, §15.5). SEAM 2's other half: the Land step writes the ladder's
+   * STATE TRANSITIONS and delegates the session work to the injected `SessionStrategy.reopen`,
+   * which is M1-WP-C's (`worker/wake.ts`, `worker/resume-classify.ts`). Idempotent and
+   * single-flight: five racing callers share one attempt, because five racing prompts must not
+   * become five `npx` cold starts.
    */
-  wake(_who: ClientRef, _opts?: { timeoutMs?: number }): Promise<WorkerSnapshot> {
-    // The resume call happens INSIDE D6's replay window, which is why the wake path is the one
-    // that opens it. `#withReplayWindow` is the seam; what runs inside it is M1-WP-C's.
-    return this.#withReplayWindow(() => {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+  async wake(who: ClientRef, opts?: { timeoutMs?: number }): Promise<WorkerSnapshot> {
+    this.#deps.lease.assertHolder(who);
+    const inflight = this.#wakePromise;
+    if (inflight !== null) return await inflight;
+    if (this.#state === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
+    // Already awake: a wake is a request for a live process, and there is one.
+    if (this.#state === "ready" || this.#state === "running") return this.snapshot();
+    if (this.#state !== "hibernated") {
+      throw new OmniError("worker_busy", `worker ${this.#deps.workerId} is ${this.#state}`);
+    }
+
+    // Synchronous admission (§15.3): a second concurrent prompt now sees `starting`, i.e. 409.
+    // The ENVELOPE for it is written by `#doWake`, so `previous` still reads `hibernated`.
+    this.#state = "starting";
+    this.#wakePromise = this.#doWake(opts?.timeoutMs);
+    try {
+      return await this.#wakePromise;
+    } finally {
+      this.#wakePromise = null;
+    }
+  }
+
+  async #doWake(timeoutMs?: number): Promise<WorkerSnapshot> {
+    const strategy = this.#deps.session;
+    const sessionId = this.#sessionId;
+    if (strategy === undefined || sessionId === null) {
+      // §15.5 rows 1-2: there is nothing to resume WITH. The worker is closed and the caller gets
+      // a 422, because a worker that can never wake must not sit in `hibernated` pretending.
+      const error = new OmniError(
+        "not_resumable",
+        `worker ${this.#deps.workerId} has no session pointer to resume`,
+      );
+      await this.#closeWith("not_resumable", { error, force: true });
+      throw error;
+    }
+
+    this.#wakeCount += 1;
+    this.#setState("starting", "wake", { turnId: null, generation: this.#generation });
+
+    let opened: SessionOpenResult;
+    try {
+      const link = await this.#openProcess();
+      // D6's replay window: the resume call happens INSIDE it, which is why the wake path is the
+      // one that opens it, and `controls.replayWindow()` lets the strategy narrow it to the exact
+      // request/response pair (F16). The refcount makes that nesting free.
+      opened = await this.#withReplayWindow(() =>
+        strategy.reopen(this.#asLinkLike(link), {
+          cwd: this.#deps.cwd,
+          descriptor: this.#runtime(),
+          // Always [] in M1 (DESIGN §8 — presets are M2).
+          mcpServers: [],
+          budgetMs:
+            timeoutMs ?? this.#deps.limits.wakeTimeoutMs ?? this.#deps.limits.handshakeTimeoutMs,
+          sessionId,
+          capabilities: this.#capabilities,
+          controls: { replayWindow: () => this.#openReplayWindow() },
+        }),
+      );
+    } catch (e) {
+      return await this.#wakeFailed(OmniError.from(e, "agent_error"));
+    }
+
+    this.#capabilities = opened.capabilities;
+    this.#sessionId = opened.sessionId;
+    this.#resume = opened.resume;
+    // One more process has handshaken, so this is one more generation of this worker.
+    this.#generation += 1;
+    this.#wakeFailures = 0;
+    this.#hibernatedAt = null;
+    this.#deps.log.setSessionId(opened.sessionId);
+    this.#setState("ready", "resumed", {
+      turnId: null,
+      generation: this.#generation,
+      ...(opened.resume === null ? {} : { resume: opened.resume }),
+      ...(this.#crashed ? { crashed: true } : {}),
     });
+    return this.snapshot();
+  }
+
+  /**
+   * §15.5's failure half, and the ONE place the pointer is abandoned.
+   *
+   * `not_resumable` from the strategy is D2's `rejected_permanent`: the pointer is worthless, so
+   * it is cleared and the worker closes. Everything else is transient — the pointer is KEPT and
+   * the worker goes back to `hibernated` — until `maxWakeFailures` consecutive attempts say the
+   * agent is not coming back, which is what stops a worker whose agent binary was uninstalled
+   * from paying a 7 s spawn on every prompt forever.
+   */
+  async #wakeFailed(error: OmniError): Promise<never> {
+    await this.#reclaimProcess({ force: true });
+    const resume = error.resume ?? null;
+    if (resume !== null) this.#resume = resume;
+
+    if (error.code === "not_resumable") {
+      this.#sessionId = null;
+      await this.#closeWith("not_resumable", { error, force: true });
+      throw error;
+    }
+
+    this.#wakeFailures += 1;
+    const max = this.#deps.limits.maxWakeFailures ?? DEFAULT_MAX_WAKE_FAILURES;
+    if (this.#wakeFailures >= max) {
+      this.#sessionId = null;
+      const abandoned = new OmniError(
+        "not_resumable",
+        `worker ${this.#deps.workerId} abandoned its session pointer after ${String(max)} consecutive failed wakes`,
+        { cause: error, ...(resume === null ? {} : { resume }) },
+      );
+      await this.#closeWith("wake_failed", { error: abandoned, force: true });
+      throw abandoned;
+    }
+
+    // Back to `hibernated` with the pointer intact (§15.1's `starting -> hibernated` row).
+    this.#hibernatedAt = this.#deps.clock.iso();
+    this.#setState("hibernated", "wake_retry", {
+      turnId: null,
+      generation: this.#generation,
+      error: error.toBody(),
+      ...(resume === null ? {} : { resume }),
+      ...(this.#crashed ? { crashed: true } : {}),
+    });
+    throw error;
+  }
+
+  /** The resolved quirk table, or the documented zero-quirk fallback (§17.2). */
+  #runtime(): RuntimeDescriptor {
+    return this.#deps.runtime ?? DEFAULT_V1_PROFILE;
+  }
+
+  /**
+   * The narrow view of the link a `SessionStrategy` gets (`AcpLinkLike`, §5.1): request, notify,
+   * and whether the transport is gone. Deliberately not the `AcpLink` itself — a strategy has no
+   * business closing the link or holding the SDK connection.
+   */
+  #asLinkLike(link: AcpLink): AcpLinkLike {
+    // A closure rather than `this.#linkClosed` inside the getter: `this` in an object literal's
+    // getter is the literal, not the Worker, and a private field cannot be reached from there.
+    const isClosed = (): boolean => this.#linkClosed;
+    return {
+      request: <T>(method: string, params: unknown): Promise<T> => link.request<T>(method, params),
+      notify: (method: string, params: unknown): void => {
+        void link.notify(method, params);
+      },
+      get closed(): boolean {
+        return isClosed();
+      },
+    };
+  }
+
+  /**
+   * D6's replay window, as a refcount. Returns the closer, which is idempotent so a strategy that
+   * closes twice cannot reopen somebody else's window.
+   *
+   * The `finally` around it is load-bearing and is an acceptance bullet of its own (M1-PLAN WP-C
+   * 3): a REJECTED resume that left the window open would mark the NEXT turn's updates as replay,
+   * and a consumer filtering `replay: true` would then silently drop a live turn.
+   */
+  #openReplayWindow(): () => void {
+    this.#replayWindow += 1;
+    let closed = false;
+    return () => {
+      if (closed) return;
+      closed = true;
+      this.#replayWindow -= 1;
+    };
   }
 
   /**
    * D6's replay window, opened for the duration of `fn` and closed in a `finally`.
-   *
-   * The `finally` is load-bearing and is an acceptance bullet of its own (M1-PLAN WP-C 3): a
-   * REJECTED resume that left the window open would mark the NEXT turn's updates as replay, and
-   * a consumer filtering `replay: true` would then silently drop a live turn.
    *
    * It is a REFCOUNT rather than a boolean so a nested or re-entered open cannot close a window
    * somebody else still holds. `SessionReopenOptions.controls.replayWindow()` is the same thing
    * handed to a `SessionStrategy`.
    */
   async #withReplayWindow<T>(fn: () => Promise<T>): Promise<T> {
-    this.#replayWindow += 1;
+    const close = this.#openReplayWindow();
     try {
       return await fn();
     } finally {
-      this.#replayWindow -= 1;
+      close();
     }
   }
 
@@ -702,11 +989,16 @@ class Worker implements WorkerHandle {
   // ── the crash classifier (§6.7) ────────────────────────────────────────────
 
   #watchProcess(proc: AgentProcess): void {
+    // The identity guard is what makes a SECOND generation safe (§15.3): a hibernate or a failed
+    // wake drops `#proc` before the old process finishes dying, and its late `exited` must not be
+    // classified as a crash of the process that replaced it.
     void proc.exited.then((exit) => {
+      if (this.#proc !== proc) return;
       this.#agentGone = true;
       this.#onExit(exit);
     });
     void proc.stdoutEnded.then(() => {
+      if (this.#proc !== proc) return;
       this.#agentGone = true;
       this.#onStdoutEnded();
     });
@@ -755,6 +1047,10 @@ class Worker implements WorkerHandle {
     // non-zero code, a signal, or an exit nobody asked for — is a crash.
     const clean = exit !== null && exit.code === 0 && exit.requested;
     const reason: WorkerCloseReason = clean ? "agent_exited" : "agent_crashed";
+    // Sticky, and set HERE because `#crashed` is private to this class and this file is frozen
+    // after the Land step: once true it never goes back to false, across hibernate, wake and
+    // restart (D2, §15.1 invariant 2).
+    if (!clean) this.#crashed = true;
     const message =
       exit === null
         ? "the agent transport ended and the process did not exit within exitGraceMs"
@@ -938,6 +1234,11 @@ class Worker implements WorkerHandle {
       leaderExited?: boolean;
       treeGone?: boolean;
       error?: OmniErrorBody;
+      // ── M1 (§15.1): present on the rows that table marks, and on no others ──
+      resume?: ResumeReport;
+      orphan?: OrphanRecord;
+      crashed?: boolean;
+      generation?: number;
     },
   ): void {
     const previous = this.#emittedState;
@@ -955,6 +1256,10 @@ class Worker implements WorkerHandle {
       ...(o.leaderExited === undefined ? {} : { leaderExited: o.leaderExited }),
       ...(o.treeGone === undefined ? {} : { treeGone: o.treeGone }),
       ...(o.error === undefined ? {} : { error: o.error }),
+      ...(o.resume === undefined ? {} : { resume: o.resume }),
+      ...(o.orphan === undefined ? {} : { orphan: o.orphan }),
+      ...(o.crashed === undefined ? {} : { crashed: o.crashed }),
+      ...(o.generation === undefined ? {} : { generation: o.generation }),
     };
 
     this.#deps.log.append({
@@ -975,29 +1280,22 @@ class Worker implements WorkerHandle {
 
   // ── construction ───────────────────────────────────────────────────────────
 
-  async start(signal?: AbortSignal): Promise<void> {
-    // Seq 1 is ALWAYS `omni.worker_state{starting}` (§8.2 rule 2), so `?since=0` replays a
-    // worker's whole life from birth — including a worker that never made it past the handshake.
-    this.#setState("starting", "created", {});
-
+  /**
+   * spawn -> link -> watch, shared by `start()` and `wake()`.
+   *
+   * It exists so the wake path cannot drift from the create path: one spawn site (F10), one set
+   * of link handlers, and the crash watcher armed BEFORE the handshake in both — an agent that
+   * dies during `initialize` never rejects the in-flight request on a transport that only the
+   * process signals can tell us about.
+   */
+  async #openProcess(signal?: AbortSignal): Promise<AcpLink> {
     const spec = (this.#deps.toSpawnSpec ?? ((d, o) => defaultSpawnSpec(d, o, this.#deps.label)))(
       this.#deps.descriptor,
       { cwd: this.#deps.cwd },
     );
-
-    let proc: AgentProcess;
-    try {
-      proc = await this.#deps.supervisor.spawn(spec, signal);
-    } catch (e) {
-      // Nothing was created, so there is no tree to reclaim — but the log and the caller are
-      // owed the same two envelopes and the same error code as any other failure edge.
-      const error = OmniError.from(e, "agent_error");
-      await this.#closeWith("spawn_failed", { error });
-      throw error;
-    }
-
+    const proc = await this.#deps.supervisor.spawn(spec, signal);
     this.#proc = proc;
-    this.#link = openAcpLink(
+    const link = openAcpLink(
       proc.stream,
       {
         onSessionUpdate: (n) => {
@@ -1010,19 +1308,80 @@ class Worker implements WorkerHandle {
       },
       { logger: this.#logger },
     );
-
-    // Watch BEFORE the handshake: an agent that dies during `initialize` never rejects the
-    // in-flight request on a transport that only the process signals can tell us about, and the
-    // handshake budget is the wrong instrument for a process that is already gone.
+    this.#link = link;
+    this.#linkClosed = false;
+    this.#agentGone = false;
     this.#watchProcess(proc);
+    return link;
+  }
+
+  /**
+   * Give the process back, without closing the worker: hibernate's rungs 1-2 (§15.2) and the
+   * cleanup after a failed wake. `#proc` and `#link` are dropped FIRST, so `#watchProcess`'s
+   * identity guard stops classifying an exit we asked for as a crash.
+   */
+  async #reclaimProcess(o: { force: boolean }): Promise<void> {
+    const proc = this.#proc;
+    const link = this.#link;
+    this.#proc = null;
+    this.#link = null;
+    this.#linkClosed = false;
+    this.#agentGone = false;
+    if (proc !== null) {
+      // stdin EOF FIRST, then the graceful ladder (§15.2 rung 2): the agent gets its normal
+      // shutdown, because we are hibernating it rather than crashing it. A wake that already
+      // failed skips the courtesy — there is nothing left to say to a half-initialized process.
+      if (!o.force) proc.closeStdin();
+      try {
+        await proc.terminate(
+          o.force ? { force: true } : { gracefulMs: this.#deps.limits.gracefulMs },
+        );
+      } catch (e) {
+        this.#logger.error("terminate() threw while reclaiming the process", {
+          error: String(e),
+        });
+      }
+    }
+    link?.close();
+  }
+
+  async start(signal?: AbortSignal): Promise<void> {
+    // Seq 1 is ALWAYS `omni.worker_state{starting}` (§8.2 rule 2), so `?since=0` replays a
+    // worker's whole life from birth — including a worker that never made it past the handshake.
+    this.#setState("starting", "created", {});
+
+    let link: AcpLink;
+    try {
+      link = await this.#openProcess(signal);
+    } catch (e) {
+      // Nothing was created, so there is no tree to reclaim — but the log and the caller are
+      // owed the same two envelopes and the same error code as any other failure edge.
+      const error = OmniError.from(e, "agent_error");
+      await this.#closeWith("spawn_failed", { error });
+      throw error;
+    }
 
     try {
-      const { capabilities, sessionId } = await runHandshake(this.#link, {
-        cwd: this.#deps.cwd,
-        timeoutMs: this.#deps.limits.handshakeTimeoutMs,
-        clock: this.#deps.clock,
-        ...(signal === undefined ? {} : { signal }),
-      });
+      // SEAM 2 (M1-PLAN §1.2): with a `SessionStrategy` injected, the Worker calls `open()` on
+      // create and `reopen()` on wake and never names `initialize` or `session/new` itself.
+      // ABSENT, it runs M0's inline handshake unchanged — a required dependency whose only
+      // implementation is M1-WP-C's would have taken every M0 test with it (Land note S3).
+      const strategy = this.#deps.session;
+      const { capabilities, sessionId } =
+        strategy === undefined
+          ? await runHandshake(link, {
+              cwd: this.#deps.cwd,
+              timeoutMs: this.#deps.limits.handshakeTimeoutMs,
+              clock: this.#deps.clock,
+              ...(signal === undefined ? {} : { signal }),
+            })
+          : await strategy.open(this.#asLinkLike(link), {
+              cwd: this.#deps.cwd,
+              descriptor: this.#runtime(),
+              mcpServers: [],
+              budgetMs: this.#deps.limits.handshakeTimeoutMs,
+              ...(signal === undefined ? {} : { signal }),
+            });
       this.#capabilities = capabilities;
       this.#sessionId = sessionId;
       // One process has now handshaken. `generation` is "processes this worker has had", so it
