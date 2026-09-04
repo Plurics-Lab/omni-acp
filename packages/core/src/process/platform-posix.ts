@@ -1,12 +1,13 @@
 import {
-  OmniError,
   type AgentProcess,
   type PlatformOps,
   type PlatformOwnership,
+  type RunUtility,
   type TerminationRung,
 } from "@omni-acp/protocol";
 import { constants, promises as fs } from "node:fs";
 import { delimiter, join } from "node:path";
+import { fingerprintOf } from "./fingerprint.js";
 
 /**
  * POSIX process ownership: `detached: true` at spawn gives the child `setsid()`, so
@@ -96,8 +97,32 @@ async function resolveOnPath(command: string): Promise<string> {
   return command;
 }
 
-export function createPosixPlatformOps(): PlatformOps {
+/**
+ * `platform.ts` is the ONLY file allowed to read `process.platform` (§6.1, and a guard test
+ * asserts it), so the POSIX flavour arrives here by INJECTION rather than by inspection.
+ *
+ * Both members are optional, and both are only about §15.7's fingerprint:
+ *
+ *  - without `platform`, `fingerprint()` resolves `null` — "this construction was never told
+ *    which POSIX this is", which is the value that FORBIDS signalling a pid after a restart, and
+ *    therefore the safe answer rather than a guess;
+ *  - without `runUtility`, darwin cannot run `ps -o lstart=` and answers `null` for the same
+ *    reason. Linux needs neither: `/proc` is a file read.
+ *
+ * The production path always goes through `createPlatformOps`, which supplies both.
+ */
+export interface PosixPlatformDeps {
+  readonly platform?: NodeJS.Platform;
+  readonly runUtility?: RunUtility;
+}
+
+/** The stand-in for "no utility was injected": it fails, and `fingerprintOf` answers null. */
+const NO_UTILITY: RunUtility = () =>
+  Promise.reject(new Error("no RunUtility was injected into createPosixPlatformOps()"));
+
+export function createPosixPlatformOps(deps: PosixPlatformDeps = {}): PlatformOps {
   const groupOf = (p: AgentProcess): number | null => p.info.groupId;
+  const run = deps.runUtility ?? NO_UTILITY;
 
   return {
     ownership: OWNERSHIP,
@@ -144,18 +169,46 @@ export function createPosixPlatformOps(): PlatformOps {
       return Promise.resolve(probe(p.info.pid) === "gone");
     },
 
-    // ── M1 (§15.7), owned by M1-WP-C ────────────────────────────────────────
+    // ── M1 (§15.7) ──────────────────────────────────────────────────────────
 
-    fingerprint(_pid: number): Promise<string | null> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    /**
+     * The incarnation token, taken at spawn while the process is KNOWN live.
+     *
+     * `linux:<btime>:<starttime>` and `darwin:<lstart-epoch>` are both kernel state and both
+     * survive a daemon restart, which is what lets a later boot prove that the pid it is about
+     * to signal is the same process it recorded — and refuse when it cannot.
+     */
+    fingerprint(pid: number): Promise<string | null> {
+      const platform = deps.platform;
+      if (platform === undefined) return Promise.resolve(null);
+      return fingerprintOf(pid, platform, run);
     },
 
-    signalTreeByGroup(_groupId: number, _sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    /**
+     * Signal a tree we did NOT spawn, addressed by the group id a previous boot recorded.
+     *
+     * The GROUP and not the leader, for §6.5's reason: the agent's MCP servers and shells are in
+     * that group, and killing the leader alone converts one orphan into several. There is no
+     * `AgentProcess` to fall back to here — an orphan is precisely a process this daemon has no
+     * handle for — so an unaddressable group is a no-op rather than a bare leader kill.
+     */
+    signalTreeByGroup(groupId: number, sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung> {
+      const rung: TerminationRung = sig === "SIGTERM" ? "sigterm" : "sigkill";
+      if (!isAddressableGroup(groupId)) return Promise.resolve(rung);
+      try {
+        process.kill(-groupId, sig);
+      } catch {
+        // The send fails once the last member is gone. `isGroupGone` proves that separately;
+        // there is nothing to report from here.
+      }
+      return Promise.resolve(rung);
     },
 
-    isGroupGone(_groupId: number): Promise<boolean> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    isGroupGone(groupId: number): Promise<boolean> {
+      // No addressable group means no proof, and a reaper that cannot prove what it killed is
+      // exactly what §6.6's honesty contract forbids.
+      if (!isAddressableGroup(groupId)) return Promise.resolve(false);
+      return Promise.resolve(probe(-groupId) === "gone");
     },
   };
 }

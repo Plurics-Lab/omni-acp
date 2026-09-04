@@ -140,6 +140,21 @@ export function stubPlatform(o?: {
       leaderProbes.count += 1;
       return Promise.resolve(platform.leaderGone);
     },
+
+    // ── M1 (§15.7) ──────────────────────────────────────────────────────────
+    //
+    // The double models the PLATFORM SPLIT and nothing else, exactly as testkit's fake does: a
+    // POSIX stub takes a token (so "reap only on a match" has something to match) and a Windows
+    // stub returns null (so "never signal without one" has the real refusal behind it). Nothing
+    // here talks to `/proc` or to `ps`.
+    fingerprint: (pid: number) => Promise.resolve(windows ? null : `stub:${String(pid)}`),
+    signalTreeByGroup: (_groupId: number, sig: "SIGTERM" | "SIGKILL") => {
+      signals.push(sig);
+      return Promise.resolve<TerminationRung>(
+        sig === "SIGTERM" ? "sigterm" : windows ? "taskkill" : "sigkill",
+      );
+    },
+    isGroupGone: () => Promise.resolve(ownership.confirmsTreeGone && platform.treeGone),
   };
   return platform;
 }
@@ -182,6 +197,9 @@ export function ladderHarness(
     startedAt: new Date(0).toISOString(),
     command: "stub",
     argsRedacted: [],
+    // §15.7: a double that never spawned has no incarnation token, and `null` is the value
+    // that FORBIDS a later boot from signalling this pid.
+    fingerprint: null,
   };
 
   const holder: { process: AgentProcess | null; harness: LadderHarness | null } = {
@@ -255,6 +273,9 @@ export function processHandle(o: {
     startedAt: new Date(0).toISOString(),
     command: "stub",
     argsRedacted: [],
+    // §15.7: a double that never spawned has no incarnation token, and `null` is the value
+    // that FORBIDS a later boot from signalling this pid.
+    fingerprint: null,
   };
   return { pid: o.pid, info } as AgentProcess;
 }

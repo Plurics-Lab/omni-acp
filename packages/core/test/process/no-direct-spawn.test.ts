@@ -234,4 +234,42 @@ describe("guard: no-direct-spawn", () => {
       expect(violations([file])).toEqual([]);
     });
   });
+
+  // ── M1's two new spawn-shaped call sites (M1-PLAN §3, "extended to runtime/probe.ts") ──────
+  //
+  // M1 adds two places a reader would reasonably expect a `child_process` import to appear, and
+  // neither may have one:
+  //
+  //  - `runtime/probe.ts` (M1-WP-E) launches an agent to ask it what it implements;
+  //  - `process/fingerprint.ts` (M1-WP-C) runs `ps -o lstart=` on darwin (§15.7).
+  //
+  // Both go through the seams that already exist — `Supervisor.spawn` and the injected
+  // `RunUtility` — so the allowlist stays at one file. The assertions below are IN the scanned
+  // tree rather than about it, so they go red the moment either file grows an import.
+  describe("M1's new launch sites stay behind the existing seams", () => {
+    const covered = (path: string): SourceFile => {
+      const file = files.find((f) => f.path === path);
+      if (file === undefined) throw new Error(`the scan does not cover ${path}`);
+      return file;
+    };
+
+    for (const path of [
+      "packages/core/src/runtime/probe.ts",
+      "packages/core/src/process/fingerprint.ts",
+    ]) {
+      it(`${path} is scanned, and imports nothing from node:child_process`, () => {
+        const file = covered(path);
+        expect(moduleReferences(file)).toEqual([]);
+        expect(spawnCallSites(file)).toEqual([]);
+      });
+    }
+
+    it("fingerprint.ts reaches `ps` only through the injected RunUtility", () => {
+      const source = covered("packages/core/src/process/fingerprint.ts").text;
+      expect(source).toContain("RunUtility");
+      // Never by importing the module that owns the spawn — the same rule review R8 set for
+      // `platform-windows.ts`'s `taskkill` / `tasklist`.
+      expect(source).not.toMatch(/from\s+["']\.\/spawn\.js["']/);
+    });
+  });
 });

@@ -106,6 +106,32 @@ function waitForStart(child: ChildProcess): Promise<Error | null> {
   });
 }
 
+/**
+ * §15.7's incarnation token, taken through `PlatformOps` so this file never branches on the
+ * platform (§6.1) and so a test can hand the whole mechanism a double.
+ *
+ * `PlatformOps.fingerprint` is contracted never to throw, but a spawn must not be able to fail
+ * because a diagnostic did — so the belt is here and the braces are in `fingerprint.ts`.
+ */
+async function fingerprintAt(
+  pid: number,
+  platform: PlatformOps,
+  logger: Logger,
+): Promise<string | null> {
+  try {
+    return await platform.fingerprint(pid);
+  } catch (e) {
+    logger.debug(
+      "could not fingerprint the agent process; it will never be reaped by a later boot",
+      {
+        pid,
+        error: messageOf(e),
+      },
+    );
+    return null;
+  }
+}
+
 export async function spawnAgentProcess(
   spec: SpawnSpec,
   platform: PlatformOps,
@@ -227,10 +253,17 @@ export async function spawnAgentProcess(
   );
 
   const pid = child.pid ?? null;
+  // 7. The incarnation token (§15.7), taken HERE — after the start gate, while the process is
+  //    known live — because that is the only moment at which it is certainly this process's.
+  //    Taking it later would race the exit; taking it earlier would race the fork.
+  //
+  //    It NEVER fails a spawn: `PlatformOps.fingerprint` is contracted to answer `null` rather
+  //    than throw (win32 always does), and `null` is the value that FORBIDS signalling this pid
+  //    after a restart — so the failure mode of the whole mechanism is "we leak an orphan and
+  //    say so", never "we kill somebody else's process" and never "the worker did not start".
+  const fingerprint = pid === null ? null : await fingerprintAt(pid, platform, deps.logger);
   const info: ProcessInfo = {
-    // Captured at spawn by M1-WP-C (`process/fingerprint.ts`); until then it is honestly absent,
-    // and an absent fingerprint is the value that FORBIDS signalling this pid after a restart.
-    fingerprint: null,
+    fingerprint,
     pid: pid ?? -1,
     // POSIX `detached` means setsid(), so pgid === pid. Windows has no addressable group, and
     // this is derived from the ownership decision rather than from `process.platform` (§6.1).

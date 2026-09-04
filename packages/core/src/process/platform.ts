@@ -25,7 +25,12 @@ export function createPlatformOps(
   deps?: { runUtility: RunUtility },
 ): PlatformOps {
   const target = platform ?? process.platform;
+  const runUtility = deps?.runUtility ?? defaultRunUtility;
   return target === "win32"
-    ? createWindowsPlatformOps({ runUtility: deps?.runUtility ?? defaultRunUtility })
-    : createPosixPlatformOps();
+    ? createWindowsPlatformOps({ runUtility })
+    : // §15.7's fingerprint is the reason the POSIX side now takes both: `linux` and `darwin`
+      // take DIFFERENT incarnation tokens, and this is the one file that may know which one it
+      // is running on. `platform-posix.ts` never reads `process.platform` itself — a guard test
+      // says so, and it is what keeps the choice at construction rather than at kill time.
+      createPosixPlatformOps({ platform: target, runUtility });
 }

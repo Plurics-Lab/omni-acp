@@ -1,5 +1,4 @@
 import {
-  OmniError,
   type AgentProcess,
   type Clock,
   type KillOutcome,
@@ -120,12 +119,100 @@ export function createSupervisor(o: SupervisorOptions): Supervisor {
     /**
      * §15.7 / L18. Kill a process this daemon did NOT spawn, gated on the incarnation token a
      * previous boot recorded. ALWAYS resolves: a reap failure is data (`reapSkipped`), never an
-     * exception. Owned by M1-WP-C.
+     * exception.
+     *
+     * The whole function is one rule, stated four ways: **never signal a pid you cannot prove is
+     * the same process.** Linux pid reuse wraps at `pid_max`, so killing a stale pid after a
+     * reboot is a coin flip on somebody else's process — which is why every early return below
+     * records WHY it declined rather than quietly doing nothing (ruling M1-R9).
      */
-    reapOrphan(_o: OrphanRecord): Promise<OrphanRecord> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    async reapOrphan(record: OrphanRecord): Promise<OrphanRecord> {
+      const skip = (reapSkipped: string): OrphanRecord => ({
+        ...record,
+        reaped: false,
+        reapSkipped,
+      });
+
+      // 1. `supervisor.reapOrphans: "never"` — the operator said report-only.
+      if (config.reapOrphans === "never") return skip("policy");
+
+      // 2. No token was ever taken, so no proof can ever be produced. This is win32 by
+      //    construction (§15.7 fixes its fingerprint at null and WP-C acceptance 7 asserts it),
+      //    and it is any POSIX spawn whose `/proc` read or `ps` call failed.
+      if (record.fingerprint === null) return skip("unsupported_platform");
+
+      // 3. An orphan is a process we have no handle for, so the GROUP id a previous boot wrote
+      //    is the only address we have. §6.5's rule — kill the group, not the leader — is why:
+      //    the agent's MCP servers and shells are in that group, and killing the leader alone
+      //    turns one orphan into several.
+      //    `0` is "every process in MY group" — this daemon — and `1` is init; neither is ever a
+      //    tree we own, on any platform, and the blast radius of signalling one is the machine.
+      //    `platform-posix.ts` refuses them again; this is the belt to that pair of braces, and
+      //    it is here so the ladder below cannot report `reaped: true` for a group nothing was
+      //    ever sent to.
+      const groupId = record.groupId;
+      if (groupId === null || !Number.isInteger(groupId) || groupId <= 1) {
+        return skip("unsupported_platform");
+      }
+
+      try {
+        // 4. THE PROOF. A pid whose current token differs from the recorded one is a different
+        //    process wearing a recycled number, and a pid with no current token is one we can no
+        //    longer identify — both are refusals, and neither is a signal.
+        const current = await platform.fingerprint(record.pid);
+        if (current === null) return skip("gone");
+        if (current !== record.fingerprint) return skip("fingerprint_mismatch");
+
+        // 5. Proven. §6.5's ladder, minus the rungs that need a handle we do not have: SIGTERM,
+        //    confirm, then SIGKILL. The agent gets its normal shutdown first — we are reclaiming
+        //    a process, not punishing it.
+        await platform.signalTreeByGroup(groupId, "SIGTERM");
+        if (!(await confirmGone(platform, groupId, o.clock, config.killConfirmMs))) {
+          await platform.signalTreeByGroup(groupId, "SIGKILL");
+          await confirmGone(platform, groupId, o.clock, config.killConfirmMs);
+        }
+        o.logger.info("reaped an orphaned agent tree from a previous boot", {
+          pid: record.pid,
+          groupId,
+        });
+        return { ...record, reaped: true, reapSkipped: null };
+      } catch (e) {
+        // "ALWAYS resolves: a reap failure is data, not an exception." An unexpected failure is
+        // NOT rounded up to "gone" or down to "policy": both would put a false statement in the
+        // adoption envelope an operator reads to decide whether a tree is still running.
+        o.logger.error("reaping an orphan failed", {
+          pid: record.pid,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        return skip("error");
+      }
     },
   };
+}
+
+/**
+ * Poll `isGroupGone` until it says yes or the budget runs out.
+ *
+ * `KillOutcome.treeGone` is never optimistic (§6.6) and neither is this: "we could not confirm"
+ * returns false and the caller escalates, which is the safe direction in both places.
+ */
+async function confirmGone(
+  platform: PlatformOps,
+  groupId: number,
+  clock: Clock,
+  budgetMs: number,
+): Promise<boolean> {
+  const deadline = clock.now() + budgetMs;
+  for (;;) {
+    if (await platform.isGroupGone(groupId)) return true;
+    if (clock.now() >= deadline) return false;
+    await new Promise<void>((resolve) => {
+      // A short poll rather than one long sleep: a tree that dies on SIGTERM usually does so in
+      // single-digit milliseconds, and waiting the whole confirm window for it would make every
+      // boot adoption pay the worst case.
+      clock.setTimer(Math.min(25, Math.max(1, deadline - clock.now())), resolve);
+    });
+  }
 }
 
 /**
