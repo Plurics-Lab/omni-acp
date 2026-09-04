@@ -59,11 +59,17 @@ export interface WorkerRegistryOptions {
    * `lease.assertHolder(who)` as their first statement, and `delete()` below does too.
    *
    * Absent ⇒ `alwaysGrantedLease`, which is M0's behaviour exactly: one in-process controller by
-   * construction, every mutating verb a `bad_request` naming M1-WP-D. M1-WP-D implements
-   * `createLease` in its own files and M1-WP-E flips this default in `create-daemon.ts` — neither
-   * of them edits the hunk the other owns.
+   * construction. `create-daemon.ts` defaults it to M1-WP-D's `createLease`.
+   *
+   * The third parameter is the worker's own event log, and it is why this declaration is WIDER
+   * than `DaemonDeps.leaseFactory` (which is frozen at two). §16.1 rule L9 says every lease
+   * transition appends `omni.lease` TO THE WORKER'S LOG, and `LeaseOptions.onEvent` is the sink
+   * that does it — so a factory that is never handed the log can only build a lease whose audit
+   * trail goes nowhere. The log is in scope at both call sites below, and a two-parameter
+   * function stays assignable to this type, so an injected `DaemonDeps.leaseFactory` written
+   * against the frozen shape keeps working and simply ignores the argument.
    */
-  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId) => Lease;
+  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId, log: EventLog) => Lease;
   /**
    * The durable half (§14). Absent or `null` ⇒ memory only, which is `createDaemon()`'s default
    * (ruling M1-R17) and M0's behaviour exactly: no store to read, so `list()` is the live map,
@@ -361,7 +367,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         // worker uses the same inline handshake `worker.ts` falls back to, and M1-WP-C's
         // `createRehydratedWorker` is the one that knows how to say that.
         session: o.session as SessionStrategy,
-        lease: leaseFor(owner, workerId),
+        lease: leaseFor(owner, workerId, log),
         clock: o.clock,
         ids: o.ids,
         logger: o.logger.child({ workerId, agent: row.agentId, rehydrated: true }),
@@ -570,8 +576,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
   };
 
   /** Seam 3's one call site. The default IS M0: `alwaysGrantedLease` grants every `assertHolder`. */
-  const leaseFor = (owner: ClientRef, workerId: WorkerId): Lease =>
-    o.leaseFactory?.(owner, workerId) ?? alwaysGrantedLease(owner, workerId);
+  const leaseFor = (owner: ClientRef, workerId: WorkerId, log: EventLog): Lease =>
+    o.leaseFactory?.(owner, workerId, log) ?? alwaysGrantedLease(owner, workerId);
 
   return {
     /** Live workers — the number `maxWorkers` is compared against. A closed worker holds no slot. */
@@ -637,7 +643,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               ids: { synth: (prefix: string) => `${prefix}_${o.ids.request()}` },
             }),
             responder: o.responder,
-            lease: leaseFor(auth.asClientRef(), workerId),
+            lease: leaseFor(auth.asClientRef(), workerId, log),
             toSpawnSpec: (d, spawnOpts) => o.catalog.toSpawnSpec(d, spawnOpts),
             ...(o.session === undefined ? {} : { session: o.session }),
             runtime,
@@ -885,7 +891,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
      */
     async hibernate(id, auth): Promise<WorkerSnapshot> {
       const handle = get(id, auth);
-      if (auth.role !== "admin") handle.lease.assertHolder(auth.asClientRef());
+      // NO admin bypass, unlike `delete()` below. Rule L3 grants one for `DELETE` and for
+      // nothing else, and H18 says only "Lease-gated" — D13 gives an admin the power to STEAL
+      // the lease, which is audited, rather than to reach past a holder mid-session in silence.
+      handle.lease.assertHolder(auth.asClientRef());
       if (
         handle.snapshot().state !== "hibernated" &&
         countHibernated() >= o.config.hibernate.maxHibernated

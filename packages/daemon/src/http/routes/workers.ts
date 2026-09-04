@@ -64,4 +64,16 @@ export function registerWorkerRoutes(app: Hono, daemon: Daemon): void {
   app.delete("/v1/workers/:wid", auth, async (c) =>
     c.json(await daemon.workers.delete(workerId(c), authOf(c.req.raw))),
   );
+
+  // H18. `200 WorkerSnapshot{state:"hibernated"}`. Every other answer — `409 worker_busy` while a
+  // turn is live, `422 not_resumable`, `423 lease_held`, `429 worker_limit` — is an `OmniError`
+  // the registry throws and the ONE error mapper turns into a status (§9, D15).
+  app.post("/v1/workers/:wid/hibernate", auth, async (c) =>
+    c.json(await daemon.workers.hibernate(workerId(c), authOf(c.req.raw))),
+  );
+
+  // H19. Same shape: `200 WorkerSnapshot`, and `429` / `422` / `502` / `504` arrive as codes.
+  app.post("/v1/workers/:wid/wake", auth, async (c) =>
+    c.json(await daemon.workers.wake(workerId(c), authOf(c.req.raw))),
+  );
 }

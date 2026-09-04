@@ -279,14 +279,16 @@ describe("the hybrid fixture, end to end — F24 and the last corpus gap", () =>
     ]);
     // F4: `TurnResult.usage` is the `usage_update` shape, and it arrives.
     expect(result.usage).toEqual({ used: 1_234, size: 200_000 });
-    // F21's `tokens` does NOT, and the reason is a frozen file rather than the reducer: the
-    // fixture really does return `usage` on its prompt response, and `TurnInput.prompt_result`
-    // really does carry a `usage` field — but `worker.ts` builds that input with
-    // `{type, stopReason, at}` and drops it. The reducer's own half is proven in
-    // `ladder.test.ts` ("puts the prompt RESPONSE's v2 Usage block on `idle`"); the one-line
-    // producer edit is in M1-WP-B's hand-off notes, and this asserts the CURRENT truth rather
-    // than the intended one, so that landing the edit turns this red.
-    expect(result.tokens).toBeUndefined();
+    // F21's `tokens` arrives too, now that the producer edit M1-WP-B's hand-off notes asked for
+    // has landed in `worker.ts`: `#runPrompt` forwards `PromptResponse.usage` onto the
+    // `prompt_result` input instead of dropping it. This is the END of the wire the reducer's
+    // own half is proven on in `ladder.test.ts` ("puts the prompt RESPONSE's v2 Usage block on
+    // `idle`") — a real agent process, a real `session/prompt` response, a real reduce.
+    //
+    // The two are DIFFERENT numbers on purpose: `usage` above is the v1 context gauge
+    // (`{used, size}`) and `tokens` here is the v2 per-turn `Usage`, which is exactly the type
+    // pun §5.1 warns against and the reason the reducer shape-checks rather than casts.
+    expect(result.tokens).toEqual({ totalTokens: 30, inputTokens: 10, outputTokens: 20 });
 
     // The agent's English is CARRIED and never read: `rawOutput` is on the view, and the verdict
     // did not come from it.

@@ -132,8 +132,8 @@ describe("422 not_resumable flows through the same mapper, carrying the ResumeRe
    * Raised from `prompt`, which is where a `422` is REACHABLE today: H8 says a `hibernated`
    * worker auto-wakes, so a wake that the agent refuses surfaces on the prompt the client made.
    *
-   * `POST …/wake` (H19) is the other door and it is not registered yet — see the block below,
-   * which says so out loud rather than leaving the gap to a comment.
+   * `POST …/wake` (H19) is the other door, registered now, and the block below drives a `422`
+   * through it directly.
    */
   it("names which of D2's four states fired, and on what evidence", async () => {
     const daemon = fixture({
@@ -172,25 +172,13 @@ describe("422 not_resumable flows through the same mapper, carrying the ResumeRe
 });
 
 /**
- * H18 and H19 have no route yet, and this test exists so that fact is a RED LINE in the suite
- * rather than a sentence in a hand-off note.
+ * H18 and H19, now that the two lines `src/http/routes/workers.ts` owed them are there.
  *
- * `WorkerRegistry.hibernate` / `.wake` are implemented (M1-WP-E, `registry.ts`) and their
- * behaviour is proven in `registry-persistence.test.ts`. What is missing is two lines in
- * `src/http/routes/workers.ts`, which the ownership map (M1-PLAN §3) freezes to the Land step —
- * and CONTRACTS §5.7 names only `registerLeaseRoutes` and `registerAgentRoutes` as new route
- * registrars, so there is no other file either of them could legally live in.
- *
- * The exact change, ready to apply:
- *
- *   app.post("/v1/workers/:wid/hibernate", auth, async (c) =>
- *     c.json(await daemon.workers.hibernate(workerId(c), authOf(c.req.raw))));
- *   app.post("/v1/workers/:wid/wake", auth, async (c) =>
- *     c.json(await daemon.workers.wake(workerId(c), authOf(c.req.raw))));
- *
- * DELETE this block in the same commit that adds them, and the two 200/422 cases move here.
+ * This block replaces the red line that stood here while they were missing (it asserted both
+ * paths were `400 unknown route`). Registration is asserted structurally AND at runtime, because
+ * a route that exists in the source but was never reached by a request is not a route.
  */
-describe("H18 / H19 are NOT registered — two lines are owed to a Land-frozen file", () => {
+describe("H18 / H19 — hibernate and wake are three moves, like every other worker route", () => {
   const workersRoutes = readFileSync(
     join(
       dirname(fileURLToPath(import.meta.url)),
@@ -204,18 +192,97 @@ describe("H18 / H19 are NOT registered — two lines are owed to a Land-frozen f
     "utf8",
   );
 
-  it("`src/http/routes/workers.ts` registers neither /hibernate nor /wake", () => {
-    expect(workersRoutes).not.toContain("/hibernate");
-    expect(workersRoutes).not.toContain("/wake");
+  it("registers exactly one POST for each, and decides no status of its own", () => {
+    expect(workersRoutes).toContain('app.post("/v1/workers/:wid/hibernate"');
+    expect(workersRoutes).toContain('app.post("/v1/workers/:wid/wake"');
+    // D15 constraint 1: parse, ONE daemon call, serialize. A status literal or a branch in the
+    // route body is the thing this forbids — `http-has-no-logic` proves it for the whole file,
+    // and this pins it to the two routes that were just added.
+    for (const verb of ["hibernate", "wake"]) {
+      const from = workersRoutes.indexOf(`app.post("/v1/workers/:wid/${verb}"`);
+      expect(from, `${verb} must be registered`).toBeGreaterThan(-1);
+      // Up to the statement's own terminator at the registration's indent — NOT to the next
+      // `app.`, which would swallow the following route's comment and its `429 / 422 / 502`.
+      const rest = workersRoutes.slice(from);
+      const end = rest.indexOf("\n  );");
+      expect(end, `${verb}'s registration must be one statement`).toBeGreaterThan(-1);
+      const body = rest.slice(0, end);
+      expect(body).toContain(`daemon.workers.${verb}(workerId(c), authOf(c.req.raw))`);
+      expect(body, `${verb} must not name a status`).not.toMatch(/\b[45]\d\d\b/);
+      // Exactly one daemon call: a second would be a decision the route is making.
+      expect([...body.matchAll(/\bdaemon\./g)]).toHaveLength(1);
+    }
   });
 
-  it("so both paths are `400 unknown route`, which is at least an honest answer", async () => {
-    const daemon = fixture({});
-    for (const path of [`/v1/workers/${WID}/hibernate`, `/v1/workers/${WID}/wake`]) {
-      const res = await send(daemon, "POST", path);
-      expect(res.status).toBe(400);
-      expect(await res.json()).toMatchObject({ code: "bad_request", message: "unknown route" });
-    }
+  it("200 WorkerSnapshot on the happy path, for both", async () => {
+    const hibernated = { workerId: WID, state: "hibernated" } as unknown as WorkerSnapshot;
+    const ready = { workerId: WID, state: "ready" } as unknown as WorkerSnapshot;
+    const calls: string[] = [];
+    const daemon = fixture({
+      workers: {
+        hibernate: (id: WorkerId) => {
+          calls.push(`hibernate:${id}`);
+          return Promise.resolve(hibernated);
+        },
+        wake: (id: WorkerId) => {
+          calls.push(`wake:${id}`);
+          return Promise.resolve(ready);
+        },
+      } as unknown as Daemon["workers"],
+    });
+
+    const h = await send(daemon, "POST", `/v1/workers/${WID}/hibernate`);
+    expect(h.status).toBe(200);
+    expect(await h.json()).toEqual(hibernated);
+
+    const w = await send(daemon, "POST", `/v1/workers/${WID}/wake`);
+    expect(w.status).toBe(200);
+    expect(await w.json()).toEqual(ready);
+
+    // The worker id came off the PATH and reached the daemon; exactly one call per request.
+    expect(calls).toEqual([`hibernate:${WID}`, `wake:${WID}`]);
+  });
+
+  it("423 lease_held on hibernate carries the holder — H18 is lease-gated (rule L2)", async () => {
+    const daemon = fixture({
+      workers: {
+        hibernate: () => Promise.reject(new OmniError("lease_held", "held", { lease: LEASE })),
+      } as unknown as Daemon["workers"],
+    });
+    const res = await send(daemon, "POST", `/v1/workers/${WID}/hibernate`);
+    expect(res.status).toBe(423);
+    expect(await res.json()).toEqual({ code: "lease_held", message: "held", lease: LEASE });
+  });
+
+  it("422 not_resumable on hibernate carries the ResumeReport (M1-R15)", async () => {
+    const daemon = fixture({
+      workers: {
+        hibernate: () =>
+          Promise.reject(
+            new OmniError("not_resumable", "the agent advertises no resume spelling", {
+              resume: RESUME,
+            }),
+          ),
+      } as unknown as Daemon["workers"],
+    });
+    const res = await send(daemon, "POST", `/v1/workers/${WID}/hibernate`);
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      code: "not_resumable",
+      message: "the agent advertises no resume spelling",
+      resume: RESUME,
+    });
+  });
+
+  it("429 worker_limit on wake — the capacity answer arrives BEFORE a cold start (H14)", async () => {
+    const daemon = fixture({
+      workers: {
+        wake: () => Promise.reject(new OmniError("worker_limit", "daemon worker limit reached")),
+      } as unknown as Daemon["workers"],
+    });
+    const res = await send(daemon, "POST", `/v1/workers/${WID}/wake`);
+    expect(res.status).toBe(429);
+    expect(await res.json()).toMatchObject({ code: "worker_limit" });
   });
 });
 

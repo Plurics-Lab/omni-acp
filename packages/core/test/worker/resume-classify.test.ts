@@ -37,6 +37,7 @@ function attempt(over: Partial<ResumeAttempt> = {}): ResumeAttempt {
     replayDropped: 0,
     capabilityAdvertised: true,
     requiresSameCwd: false,
+    silentlyCreates: false,
     cwdChanged: false,
     durationMs: 12,
     at: AT,
@@ -252,10 +253,39 @@ const TABLE: readonly Row[] = [
     rule: "rule4:unclassified-jsonrpc",
   },
 
-  // ── rules 5 and 7 ─────────────────────────────────────────────────────────
+  // ── rules 5, 6 and 7 ──────────────────────────────────────────────────────
   {
     name: "rule 5: a DIFFERENT session came back — our pointer is worthless, and we hold the new one",
     input: attempt({ returned: "sess_other" as SessionId }),
+    outcome: "rejected_permanent",
+    hint: "silently_created",
+    rule: "rule5:silently-created",
+    landedOn: "sess_other" as SessionId,
+    historyLost: true,
+  },
+  {
+    // Live now that `ResumeAttempt` carries `silentlyCreates` (the M1 integration step added it
+    // beside `requiresSameCwd`). This row and the two below it are the SAME successful answer
+    // read against two different descriptors — which is the whole content of rule 6: a runtime
+    // that mints a new session rather than erroring makes a bare success uninformative.
+    name: "rule 6: this runtime silently creates, and the answer did not say whether it did",
+    input: attempt({ silentlyCreates: true, returned: SESSION }),
+    outcome: "unknown",
+    hint: "unclassified",
+    rule: "rule6:silent-create-inconclusive",
+    historyLost: false,
+  },
+  {
+    name: "rule 6: a v1 null body from a silently-creating runtime is equally uninformative",
+    input: attempt({ silentlyCreates: true, returned: null }),
+    outcome: "unknown",
+    hint: "unclassified",
+    rule: "rule6:silent-create-inconclusive",
+    historyLost: false,
+  },
+  {
+    name: "rule 6 does NOT override rule 5: a different id is proof, not a suspicion",
+    input: attempt({ silentlyCreates: true, returned: "sess_other" as SessionId }),
     outcome: "rejected_permanent",
     hint: "silently_created",
     rule: "rule5:silently-created",

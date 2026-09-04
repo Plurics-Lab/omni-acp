@@ -49,6 +49,7 @@ import {
   type WorkerStatePayload,
 } from "@omni-acp/protocol";
 import { openAcpLink, type AcpLink } from "../acp/link.js";
+import type { EventLogCore } from "../event-log/log-core.js";
 import { DEFAULT_V1_PROFILE } from "../runtime/known.js";
 import { runHandshake } from "./handshake.js";
 
@@ -476,8 +477,8 @@ export class Worker implements WorkerHandle {
       generation: this.#generation,
       runtimeId: this.#deps.runtimeId ?? `${this.#deps.descriptor.id}@unresolved`,
       // The log knows whether it has a durable side; the worker must not restate the answer.
-      // "degraded" — a durable write FAILED — is M1-WP-A's to report through the log it owns.
-      persistence: this.#deps.log.persistent ? "durable" : "memory",
+      // "degraded" — a durable write FAILED — is M1-WP-A's, reported through the log it owns.
+      persistence: persistenceOf(this.#deps.log),
     };
   }
 
@@ -575,6 +576,12 @@ export class Worker implements WorkerHandle {
       this.#feed({
         type: "prompt_result",
         stopReason: stopReasonOf(res),
+        // F21. `PromptResponse.usage` is the ONLY place a per-turn token count is reported —
+        // `usage_update` is a context-window gauge (`{used, size}`), not a cost. Forwarded raw:
+        // the reducer decides whether it is the v2 `Usage` shape and drops it when it is not
+        // (`ladder.test.ts`, "omits `usage` entirely when the response's block is not the v2
+        // shape"), which keeps the type pun §5.1 warns about out of this file.
+        usage: (res as { usage?: unknown } | null)?.usage,
         at: this.#deps.clock.now(),
       });
     } catch (e) {
@@ -1070,8 +1077,16 @@ export class Worker implements WorkerHandle {
         return;
       case "cancel":
         // Rung 4. The notification only; the reducer owns the grace that follows it.
+        //
+        // The `catch` is not decoration. `AcpLink.notify` returns a promise and a write to a
+        // stdin the agent is in the middle of dying on REJECTS; unhandled, that rejection takes
+        // the whole process down under vitest's default. It is also the right semantics, and
+        // `cancel()`'s own rule already says so: a failed send is not a failed cancel — the next
+        // rung's deadline is already running and will terminate the tree regardless.
         if (this.#link !== null && !this.#linkClosed && this.#sessionId !== null) {
-          this.#link.notify("session/cancel", { sessionId: this.#sessionId });
+          void this.#link.notify("session/cancel", { sessionId: this.#sessionId }).catch(() => {
+            // Deliberately silent: rung 5 is the answer to a cancel that did not arrive.
+          });
         }
         return;
       case "terminate":
@@ -1675,4 +1690,19 @@ export async function createWorker(
   const worker = new Worker(deps);
   await worker.start(signal);
   return worker;
+}
+
+/**
+ * §14.3's THREE answers, read off the log rather than re-derived here.
+ *
+ * `EventLog.persistent` is a boolean and has only two of them: it cannot say "the write-through
+ * FAILED" — a log still perfectly correct in RAM whose history a restart will not recover.
+ * M1-WP-A's `EventLogCore` adds the third as `persistence`, and this reads it STRUCTURALLY so
+ * that every plain `EventLog` (the daemon's doubles, `arrayLog`, an embedder's own) keeps
+ * answering exactly what it answered in M0. The fallback is M0's expression, unchanged.
+ */
+function persistenceOf(log: EventLog): "memory" | "durable" | "degraded" {
+  const reported = (log as Partial<EventLogCore>).persistence;
+  if (reported === "memory" || reported === "durable" || reported === "degraded") return reported;
+  return log.persistent ? "durable" : "memory";
 }

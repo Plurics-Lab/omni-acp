@@ -201,6 +201,9 @@ export function createSessionStrategy(o: SessionStrategyOptions): SessionStrateg
           replayDropped: readCounts().dropped,
           capabilityAdvertised,
           requiresSameCwd: quirks.resumeRequiresSameCwd,
+          // §15.4 rule 6's input, live now that `ResumeAttempt` carries the field: a runtime
+          // that silently creates cannot report a `landed` from a bare success.
+          silentlyCreates: quirks.resumeSilentlyCreates,
           // We only ever reopen at the worker's OWN cwd, so from this side the cwd never moves.
           // F15's failure is the agent disagreeing with us about it, which rule 4 diagnoses from
           // the error's shape and not from this flag.

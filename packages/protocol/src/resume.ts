@@ -85,6 +85,18 @@ export interface ResumeAttempt {
   /** false when the handshake advertised no resume spelling at all (§15.5). */
   readonly capabilityAdvertised: boolean;
   readonly requiresSameCwd: boolean;
+  /**
+   * `Quirks.resumeSilentlyCreates` — §15.4's rule 6.
+   *
+   * A runtime that answers a resume for an id it has forgotten by minting a NEW session, with no
+   * error, is indistinguishable from one that really resumed: the call succeeds and the id comes
+   * back either way. So a success from such a runtime is `unknown` rather than `landed`, and
+   * only rule 8's deferred promotion (which needs a settled turn to look at) can raise it.
+   *
+   * §15.4 calls the classifier pure over `{…, quirks}` and this is the second of them; without
+   * it rule 6 has no input and the table has a row nothing can reach.
+   */
+  readonly silentlyCreates: boolean;
   readonly cwdChanged: boolean;
   readonly durationMs: number;
   readonly at: string;

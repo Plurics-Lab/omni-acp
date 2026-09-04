@@ -15,7 +15,7 @@ import {
   type WhoAmIResponse,
   type WorkerId,
 } from "@omni-acp/protocol";
-import { createBaselineResponder, createSupervisor } from "@omni-acp/core";
+import { createBaselineResponder, createLease, createSupervisor } from "@omni-acp/core";
 import type { AddressInfo } from "node:net";
 import type { Hono } from "hono";
 import { createTokenStore } from "./auth.js";
@@ -162,10 +162,41 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     clock,
     ids,
     logger: logger.child({ mod: "registry" }),
-    // Seam 3: absent ⇒ `alwaysGrantedLease` inside the registry. M1-WP-E defaults this to
-    // `createLease` once M1-WP-D lands it; until then an injected factory is the only way a test
-    // gets an enforcing lease, and it is one line rather than a shared hunk.
-    ...(deps?.leaseFactory === undefined ? {} : { leaseFactory: deps.leaseFactory }),
+    /**
+     * Seam 3, closed: M1-WP-D's enforcing lease is the daemon's default (D5).
+     *
+     * `onEvent` is rule L9's sink — every acquire / release / steal / expiry appends one
+     * `omni.lease` envelope to the worker's OWN log, so an observer's SSE stream carries the
+     * control history alongside the turn it belongs to (WP-D acceptance 3). The registry hands
+     * the log in as the third argument precisely so this line can point at it; see the comment
+     * on `WorkerRegistryOptions.leaseFactory`.
+     *
+     * An injected factory still wins, which is what lets a test drive `alwaysGrantedLease` or a
+     * spy without the daemon composing one behind its back.
+     */
+    leaseFactory:
+      deps?.leaseFactory ??
+      ((owner, workerId, log) =>
+        createLease({
+          workerId,
+          clock,
+          config: resolved.lease,
+          initialHolder: owner,
+          onEvent: (payload) => {
+            try {
+              log.append({ kind: "omni.lease", payloadVersion: 2, turnId: null, payload });
+            } catch (e) {
+              // A lease transition that cannot be audited is still a lease transition: control
+              // has already moved, and throwing here would turn a full log or a closed one into
+              // a failed `acquire`. The write failure is the log's own to report (§14.3).
+              logger.warn("appending an omni.lease envelope failed", {
+                workerId,
+                op: payload.op,
+                error: String(e),
+              });
+            }
+          },
+        })),
     // Seam 2: absent ⇒ `worker.ts`'s inline M0 handshake, so the M0 suite runs untouched.
     ...(deps?.session === undefined ? {} : { session: deps.session }),
     persistence,

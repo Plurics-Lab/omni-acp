@@ -108,15 +108,14 @@ interface Verdict {
 /**
  * The quirk rule 4 and rule 6 need that `ResumeAttempt` does not (yet) carry.
  *
- * §15.4 describes the classifier as pure over `{…, quirks}`, but the landed
- * `protocol/src/resume.ts` gives it only `requiresSameCwd`. `resumeSilentlyCreates` therefore
- * arrives as an OPTIONAL extra property on the same record: reading it here is inert for every
- * caller that does not set it, and rule 6 becomes live the moment the field is added to the
- * frozen interface. See this work package's notes — the exact one-line change is recorded there
- * rather than made here, because `packages/protocol/src/resume.ts` is Land-frozen.
+ * §15.4 describes the classifier as pure over `{…, quirks}`, and `ResumeAttempt` now carries the
+ * second of them (`silentlyCreates`, added at the M1 integration step alongside
+ * `requiresSameCwd`). The predicate stays a function rather than an inline `a.silentlyCreates`
+ * so rule 6 has one named reading, which is where a future `=== true` vs truthy question gets
+ * answered once.
  */
 function silentlyCreates(a: ResumeAttempt): boolean {
-  return (a as { silentlyCreates?: unknown }).silentlyCreates === true;
+  return a.silentlyCreates;
 }
 
 function decide(a: ResumeAttempt): Verdict {

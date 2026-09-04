@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   OmniError,
   type EventEnvelope,
+  type EventLog,
   type WorkerState,
   type WorkerStatePayload,
 } from "@omni-acp/protocol";
@@ -219,5 +220,57 @@ describe("the worker state machine (WP-4 acceptance 12)", () => {
       stopReason: null,
       result: null,
     });
+  });
+});
+
+/**
+ * §14.3's THIRD answer reaches `WorkerSnapshot.persistence`.
+ *
+ * M1-WP-A's log is what discovers a failed durable write ("degraded" — still correct in RAM, but
+ * a restart will come back short) and M1-WP-A's hand-off asked for the one line in `worker.ts`
+ * that stops the snapshot from optimistically restating `persistent ? "durable" : "memory"`.
+ * That line reads the member STRUCTURALLY, which is what these three cases pin: the two answers
+ * a plain M0 `EventLog` can give are unchanged, and the third is passed through when a log
+ * offers it.
+ */
+describe("WorkerSnapshot.persistence — the log's answer, not the worker's guess (§14.3)", () => {
+  const withPersistence = (
+    base: EventLog,
+    persistence: "memory" | "durable" | "degraded",
+  ): EventLog => Object.create(base, { persistence: { value: persistence, enumerable: true } });
+
+  it('reports "memory" for a log with no durable side — M0 behaviour, unchanged', async () => {
+    const h = harness();
+    h.supervisor.enqueue(scriptedAgent());
+    const w = await h.create();
+    // The M0 fallback, and the reason a plain `EventLog` needs no change to keep working.
+    expect(h.log.persistent).toBeFalsy();
+    expect(w.snapshot().persistence).toBe("memory");
+    await w.close("client_request");
+  });
+
+  it('reports "degraded" when the log says so, overriding what the boolean implies', async () => {
+    const h = harness();
+    h.supervisor.enqueue(scriptedAgent());
+    const w = await h.create({
+      overrides: { log: withPersistence(h.log, "degraded") },
+    });
+    // The point of the case: `persistent` is the M0 boolean and it has only two values, so on
+    // its own it answers "memory" here — indistinguishable from a log that never had a durable
+    // side at all, when what actually happened is that the durable side FAILED. The log's own
+    // answer wins, which is the only way an operator learns the difference.
+    expect(h.log.persistent).toBeFalsy();
+    expect(w.snapshot().persistence).toBe("degraded");
+    await w.close("client_request");
+  });
+
+  it('reports "durable" when the log says so, so the third answer is not a one-way door', async () => {
+    const h = harness();
+    h.supervisor.enqueue(scriptedAgent());
+    const w = await h.create({
+      overrides: { log: withPersistence(h.log, "durable") },
+    });
+    expect(w.snapshot().persistence).toBe("durable");
+    await w.close("client_request");
   });
 });

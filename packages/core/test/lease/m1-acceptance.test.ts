@@ -455,16 +455,22 @@ describe("acceptance 8 — lease.requireClientId", () => {
 
 describe("acceptance 9 — M0's two-workers-do-not-interfere.itest.ts still passes untouched", () => {
   it("because nothing here changes what a daemon does WITHOUT a leaseFactory", () => {
-    // That integration test builds a daemon with no `leaseFactory`, so `registry.ts` falls back
-    // to `alwaysGrantedLease` — M0's behaviour, exactly. Two properties keep it true, and both
-    // are asserted rather than assumed:
+    // The M1 integration step flipped the daemon's default from `alwaysGrantedLease` to
+    // `createLease`, so this is no longer "the enforcing lease never runs". It is the narrower
+    // and now load-bearing claim that the ONE seam is still the only way it gets there, which is
+    // what keeps `two-workers-do-not-interfere.itest.ts` and `curl-shapes.itest.ts` green: the
+    // creator holds its own worker's lease from birth (H5 `lease: "take"`), so a single-client
+    // daemon behaves exactly as it did under `alwaysGrantedLease`.
     //
-    //  1. WP-D added NO call site: `createLease` is referenced by the barrel and by its own
-    //     tests, and by nothing that runs by default.
-    //  2. `alwaysGrantedLease` still grants every `assertHolder`, which `always-granted.test.ts`
-    //     asserts in full.
+    //  1. `registry.ts` DELEGATES — it never reaches for the enforcing lease itself, so an
+    //     embedder passing `DaemonDeps.leaseFactory` still fully controls what a worker gets.
+    //  2. `alwaysGrantedLease` is still the fallback when no factory is supplied, which is the
+    //     behaviour every core-level harness in this repo depends on.
     const registry = readFileSync(join(REPO_TEST_ROOT, "daemon/src/registry.ts"), "utf8");
-    expect(registry).toContain("o.leaseFactory?.(owner, workerId) ?? alwaysGrantedLease(");
+    // Three arguments, not two: rule L9's `omni.lease` envelope needs the worker's own log, and
+    // the registry is the only frame that has one. `DaemonDeps.leaseFactory` stays frozen at two
+    // and stays assignable.
+    expect(registry).toContain("o.leaseFactory?.(owner, workerId, log) ?? alwaysGrantedLease(");
     // A CALL, not the word: `registry.ts`'s own comment names `createLease` as the thing WP-D
     // implements elsewhere, and a guard that fired on its own rationale would teach the next
     // person to delete the rationale (amendment A8).
@@ -473,10 +479,10 @@ describe("acceptance 9 — M0's two-workers-do-not-interfere.itest.ts still pass
     );
 
     const createDaemon = readFileSync(join(REPO_TEST_ROOT, "daemon/src/create-daemon.ts"), "utf8");
-    // M1-WP-E flips this default; until it does, and after it does, the seam is the ONE line
-    // above. If this ever fails it is because somebody wired the enforcing lease in by hand
-    // instead of through `DaemonDeps.leaseFactory` — which is the change that would break the
-    // M0 integration test.
-    expect(createDaemon).toContain("deps?.leaseFactory");
+    // The composition point, and the only one. An INJECTED factory still wins — `??`, not a
+    // hand-wired call — which is the property that lets a test take the enforcing lease back out
+    // again without editing the daemon.
+    expect(createDaemon).toContain("deps?.leaseFactory ??");
+    expect(createDaemon).toContain("createLease({");
   });
 });
