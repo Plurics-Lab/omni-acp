@@ -601,6 +601,42 @@ describe("the replay window, through the Worker (D6, F16, acceptance 3)", () => 
     expect(r.h.log.all.filter((e) => e.replay === true)).toHaveLength(2);
   });
 
+  it("counts the replayed updates onto `ResumeReport.replayedEvents` (F16)", async () => {
+    const r = await rig();
+    await r.worker.hibernate("client_request");
+    r.next({ onResume: { kind: "ok" }, replay: REPLAY });
+    await r.worker.wake(OWNER);
+
+    // No `replayMeter` is injected anywhere in this rig: the number reaches the strategy through
+    // `controls.replayCounts()`, which is the production path. Before that wiring the field was
+    // structurally pinned to 0 and could not tell a replay of two from a replay of none.
+    expect(r.worker.snapshot().resume?.replayedEvents).toBe(2);
+    // Not measured, and therefore reported as 0 rather than guessed: the drop happens in the
+    // Normalizer under ruling M1-R5's `resume.replay: "drop_duplicates"`, which M1 does not ship.
+    expect(r.worker.snapshot().resume?.replayDropped).toBe(0);
+  });
+
+  it("reports THIS wake's replay, not the running total — a second wake starts from zero", async () => {
+    const r = await rig();
+    await r.worker.hibernate("client_request");
+    r.next({ onResume: { kind: "ok" }, replay: REPLAY });
+    await r.worker.wake(OWNER);
+    expect(r.worker.snapshot().resume?.replayedEvents).toBe(2);
+
+    // A second hibernate/wake cycle that replays ONE update. The Worker's counter is cumulative
+    // for the worker's whole life, so a report that forgot to subtract its baseline would say 3.
+    await r.worker.hibernate("client_request");
+    r.next({
+      onResume: { kind: "ok" },
+      replay: [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ONE" } }],
+    });
+    await r.worker.wake(OWNER);
+    expect(r.worker.snapshot().resume?.replayedEvents).toBe(1);
+    // …and the log still holds all three, which is what makes 1 the right answer rather than a
+    // counter somebody reset.
+    expect(r.h.log.all.filter((e) => e.replay === true)).toHaveLength(3);
+  });
+
   it("the flag reaches the reducer on the INPUT, which is the only place it exists (§15.3)", async () => {
     const r = await rig();
     await r.worker.hibernate("client_request");

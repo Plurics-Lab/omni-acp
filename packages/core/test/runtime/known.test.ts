@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { AgentDescriptor } from "@omni-acp/protocol";
 import { descriptorFingerprint, runtimeIdOf } from "../../src/runtime/descriptor.js";
+import { claudeAcpDescriptor } from "../normalizer/support/claude-acp.js";
 import {
   BUILTIN_RUNTIMES,
   CLAUDE_ACP_UNVERIFIED,
@@ -202,5 +203,50 @@ describe("descriptorFingerprint (§17.2)", () => {
     const fingerprint = descriptorFingerprint(agent({}));
     expect(runtimeIdOf("claude", fingerprint)).toBe(`claude@${fingerprint.slice(0, 12)}`);
     expect(runtimeIdOf("claude", fingerprint)).toHaveLength("claude@".length + 12);
+  });
+});
+
+/**
+ * The two independent readings of §17.2 must agree — the reconciliation both work packages
+ * asked for at the merge.
+ *
+ * M1-WP-B transcribed §17.2's table into its own test tree because `BUILTIN_RUNTIMES` was still
+ * `[]` when the corpus goldens were written, and every one of those goldens maps against that
+ * transcription. M1-WP-E then wrote the shipped builtin from the same table. If the two drift,
+ * the corpus is proving the map correct against a runtime nobody runs — which is the exact
+ * failure mode a golden suite is supposed to catch and cannot catch about itself.
+ *
+ * The comparison is TOTAL (`toEqual` over the whole descriptor) rather than field by field, so a
+ * field added to `Quirks` in M2 has to be reconciled rather than silently forgotten. Two fields
+ * are excluded and each for a stated reason.
+ */
+describe("§17.2 has ONE table: the builtin and M1-WP-B's transcription agree", () => {
+  const transcribed = claudeAcpDescriptor();
+
+  it("is the same descriptor, field for field", () => {
+    expect({
+      ...transcribed,
+      // The corpus fixture pins a fingerprint so its goldens have a stable `runtimeId`; the
+      // shipped builtin carries the sentinel until a probe resolves it (Land note S6). The
+      // fingerprint describes a PROGRAM, not a table, so it is not part of the agreement.
+      fingerprint: CLAUDE.fingerprint,
+    }).toEqual(CLAUDE);
+  });
+
+  it("agrees about the two fields that diverged before the merge", () => {
+    // §17.2 lists TWO setConfig spellings: `session/set_model` is `-32601` on this agent (F18).
+    expect(CLAUDE.prefer.setConfig.spellings).toEqual([
+      "session/set_config_option",
+      "session/set_mode",
+    ]);
+    expect(transcribed.prefer.setConfig.spellings).toEqual(CLAUDE.prefer.setConfig.spellings);
+    // Not in §17.2's table at all, so it takes the conservative `Quirks` default: the corpus
+    // always sends `mcpServers: []`, so this agent was never asked to tolerate the omission.
+    expect(CLAUDE.quirks.toleratesOmittedMcpCapabilities).toBe(false);
+    expect(transcribed.quirks.toleratesOmittedMcpCapabilities).toBe(false);
+  });
+
+  it("agrees about `unverified`, which is what makes the compat suite refuse to assert (§18.3)", () => {
+    expect([...transcribed.unverified].sort()).toEqual([...CLAUDE_ACP_UNVERIFIED].sort());
   });
 });

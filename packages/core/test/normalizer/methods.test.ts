@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createNormalizer } from "@omni-acp/core";
 import { fakeRuntime } from "@omni-acp/testkit";
 import { transcriptError, transcriptResult } from "./support/corpus-facts.js";
-import type { OutboundCall } from "@omni-acp/protocol";
+import type { OutboundCall, RuntimeDescriptor } from "@omni-acp/protocol";
 import { mapCapabilities } from "../../src/normalizer/map/capabilities.js";
 import { classifyError } from "../../src/normalizer/map/errors.js";
 import { mapRequest, resolveInboundMethod, untagIds } from "../../src/normalizer/map/methods.js";
@@ -25,6 +25,31 @@ const call = (
   params: Record<string, unknown> = {},
   unsupported: ReadonlySet<string> = new Set(),
 ): OutboundCall => mapRequest(method, params, D, unsupported);
+
+/**
+ * A runtime whose `setConfig` table carries the THIRD spelling.
+ *
+ * §12.3 row 26 is explicit that `session/set_model` is `-32601` on claude-acp and "present on 8
+ * multica runtimes", and §17.2's table for this agent therefore lists two spellings, not three.
+ * So the row is about a runtime that HAS `set_model` — driving it off claude-acp's own table
+ * would only work by putting a spelling into that table which the corpus proved this agent
+ * answers `-32601`, which is the one thing §17.2 says its fields may never be.
+ */
+const THREE: RuntimeDescriptor = {
+  ...D,
+  prefer: {
+    ...D.prefer,
+    setConfig: {
+      spellings: ["session/set_config_option", "session/set_mode", "session/set_model"],
+      onFailure: "fail",
+    },
+  },
+};
+const callThree = (
+  method: string,
+  params: Record<string, unknown> = {},
+  unsupported: ReadonlySet<string> = new Set(),
+): OutboundCall => mapRequest(method, params, THREE, unsupported);
 
 describe("§17.3 — preference order over spellings", () => {
   it("picks the FIRST spelling not already known unsupported", () => {
@@ -51,7 +76,7 @@ describe("§17.3 — preference order over spellings", () => {
   });
 
   it("row 26: `set_model` is a SPELLING, and its params are renamed when it is the one in force", () => {
-    const out = call(
+    const out = callThree(
       "session/set_config_option",
       { configId: "model", value: "sonnet" },
       new Set(["session/set_config_option", "session/set_mode"]),
@@ -64,8 +89,21 @@ describe("§17.3 — preference order over spellings", () => {
     });
   });
 
-  it("reports `spelling: null` once every spelling is exhausted, rather than guessing a name", () => {
+  it("does NOT reach for `set_model` on claude-acp, whose table stops at two (F18)", () => {
+    // The other half of row 26, and the reason the row needs its own descriptor: this agent
+    // answers `session/set_model` with `-32601`, so its §17.2 table never offers it and the walk
+    // ends rather than sending a call the corpus already recorded failing.
+    expect(D.prefer.setConfig.spellings).toEqual(["session/set_config_option", "session/set_mode"]);
     const out = call(
+      "session/set_config_option",
+      { configId: "model", value: "sonnet" },
+      new Set(["session/set_config_option", "session/set_mode"]),
+    );
+    expect(out.spelling).toBeNull();
+  });
+
+  it("reports `spelling: null` once every spelling is exhausted, rather than guessing a name", () => {
+    const out = callThree(
       "session/set_config_option",
       { configId: "model", value: "x" },
       new Set(["session/set_config_option", "session/set_mode", "session/set_model"]),

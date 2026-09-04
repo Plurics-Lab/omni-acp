@@ -23,9 +23,13 @@ export function claudeAcpDescriptor(): RuntimeDescriptor {
     prefer: {
       // F18: both work, on one process.
       resume: { spellings: ["session/resume", "session/load"], onFailure: "fail" },
-      // F18: `session/set_model` is -32601 HERE, so it comes last rather than not at all.
+      // F18: `session/set_model` is -32601 HERE, so §17.2's table lists TWO spellings and not
+      // three. The three-spelling walk (the registry learning -32601 and moving on) is a property
+      // of `mapRequest`, proven on a test descriptor in `runtime/registry.test.ts`; putting a
+      // spelling this agent does not answer into this agent's own table would make every golden
+      // assert against a runtime that is not the one we recorded.
       setConfig: {
-        spellings: ["session/set_config_option", "session/set_mode", "session/set_model"],
+        spellings: ["session/set_config_option", "session/set_mode"],
         onFailure: "fail",
       },
       // -32601 in transcript 08. A vendor extension we offered, so a WARNING (review R2).
@@ -49,7 +53,11 @@ export function claudeAcpDescriptor(): RuntimeDescriptor {
       emitsUsageUpdateOnV1: true,
       emitsStateUpdate: false,
       configIdField: "configId", // F17 — learned from -32602 data.configId._errors
-      toleratesOmittedMcpCapabilities: true,
+      // NOT an observation: the corpus always sends `mcpServers: []`, so this agent was never
+      // asked to tolerate the omission. §17.2's table does not list the field, so it takes the
+      // `Quirks` default — and `false` is the conservative one, which is what the shipped builtin
+      // carries. MCP is M2 (§2.3).
+      toleratesOmittedMcpCapabilities: false,
       unknownMethodErrorCode: -32601,
     },
     extensions: {

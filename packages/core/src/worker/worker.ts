@@ -41,6 +41,7 @@ import {
   type ResumeReport,
   type RuntimeDescriptor,
   type SessionOpenResult,
+  type SessionReopenOptions,
   type SessionStrategy,
   type WorkerId,
   type WorkerRow,
@@ -50,6 +51,7 @@ import {
 } from "@omni-acp/protocol";
 import { openAcpLink, type AcpLink } from "../acp/link.js";
 import type { EventLogCore } from "../event-log/log-core.js";
+import type { ReplayCounts } from "./session-open.js";
 import { DEFAULT_V1_PROFILE } from "../runtime/known.js";
 import { runHandshake } from "./handshake.js";
 
@@ -346,6 +348,13 @@ export class Worker implements WorkerHandle {
    * reducer carries `replay: true` (§15.3).
    */
   #replayWindow = 0;
+  /**
+   * F16's counter: how many `session/update` notifications have arrived inside a replay window,
+   * cumulative for the life of this worker. `ResumeReport.replayedEvents` wants a DELTA over one
+   * wake, which the strategy takes by reading this before and after — see `controls.replayCounts`
+   * in `#doWake`.
+   */
+  #replayEvents = 0;
 
   /**
    * True only while §13.2's CLOSE_OUT ladder is being driven. It exists because `#closing` gates
@@ -801,6 +810,21 @@ export class Worker implements WorkerHandle {
       // D6's replay window: the resume call happens INSIDE it, which is why the wake path is the
       // one that opens it, and `controls.replayWindow()` lets the strategy narrow it to the exact
       // request/response pair (F16). The refcount makes that nesting free.
+      /**
+       * The strategy is handed an `AcpLinkLike` and cannot see notifications — the Worker routes
+       * those — so `ResumeReport.replayedEvents` has no source but this one.
+       *
+       * `replayCounts` is an ADDITIONAL member on the object `SessionReopenOptions.controls`
+       * types, read structurally by `session-open.ts`. A strategy written against the frozen
+       * declaration ignores it and reports 0, exactly as before; the frozen type needs no change.
+       * `dropped` stays 0 until ruling M1-R5's `resume.replay: "drop_duplicates"` lands in the
+       * Normalizer, which is where the drop happens — reporting a number we do not measure would
+       * be worse than reporting the zero we do.
+       */
+      const controls: SessionReopenOptions["controls"] & { replayCounts(): ReplayCounts } = {
+        replayWindow: () => this.#openReplayWindow(),
+        replayCounts: () => ({ events: this.#replayEvents, dropped: 0 }),
+      };
       opened = await this.#withReplayWindow(() =>
         strategy.reopen(this.#asLinkLike(link), {
           cwd: this.#deps.cwd,
@@ -811,7 +835,7 @@ export class Worker implements WorkerHandle {
             timeoutMs ?? this.#deps.limits.wakeTimeoutMs ?? this.#deps.limits.handshakeTimeoutMs,
           sessionId,
           capabilities: this.#capabilities,
-          controls: { replayWindow: () => this.#openReplayWindow() },
+          controls,
         }),
       );
     } catch (e) {
@@ -1148,11 +1172,13 @@ export class Worker implements WorkerHandle {
     // D6: every update that arrives inside the replay window is MARKED, and the reducer copies
     // the flag onto each `EventInput` it emits — so the window lives here, in the Worker, and the
     // reducer stays pure and carries no window state of its own (§15.3).
+    const replay = this.#replayWindow > 0;
+    if (replay) this.#replayEvents += 1;
     this.#feed({
       type: "agent_update",
       update: n.update,
       at: this.#deps.clock.now(),
-      ...(this.#replayWindow > 0 ? { replay: true as const } : {}),
+      ...(replay ? { replay: true as const } : {}),
     });
   }
 

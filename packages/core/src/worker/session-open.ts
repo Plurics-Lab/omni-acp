@@ -51,12 +51,17 @@ export interface ReplayCounts {
  * How many `session/update` notifications arrived inside the replay window, and how many were
  * dropped before `append()` under `resume.replay: "drop_duplicates"`.
  *
- * It is INJECTED rather than observed here because a `SessionStrategy` is handed an
- * `AcpLinkLike` — `request`, `notify`, `closed` — while notifications are routed by the Worker,
- * which the strategy cannot see. `SessionReopenOptions.controls` offers only `replayWindow()`,
- * with no counter and no count on the closer, so from `worker.ts` today both numbers are 0 and
- * `ResumeReport` reports 0 honestly rather than inventing a figure. The exact frozen change that
- * would let the Worker supply them is recorded in this work package's notes.
+ * It cannot be observed HERE: a `SessionStrategy` is handed an `AcpLinkLike` — `request`,
+ * `notify`, `closed` — while notifications are routed by the Worker, which the strategy cannot
+ * see. So the count arrives from outside, by either of two routes, and `countsFor` below picks:
+ *
+ *  1. `SessionReopenOptions.controls.replayCounts()`, which `worker.ts` supplies as an extra
+ *     member beyond the frozen `{replayWindow()}` declaration. This is the production path.
+ *  2. `SessionStrategyOptions.replayMeter`, for a caller that has its own source (a test, or an
+ *     embedder driving `reopen` directly).
+ *
+ * Neither present ⇒ both numbers are 0, which `ResumeReport` reports honestly rather than
+ * inventing a figure.
  */
 export interface ReplayMeter {
   /** Called once, when the wake begins. The returned reader may be called repeatedly. */
@@ -65,6 +70,31 @@ export interface ReplayMeter {
 
 const ZERO_COUNTS: ReplayCounts = { events: 0, dropped: 0 };
 const ZERO_METER: ReplayMeter = { begin: () => () => ZERO_COUNTS };
+
+/** The extra member `worker.ts` puts on `controls`; absent on a hand-rolled `SessionReopenOptions`. */
+interface CountingControls {
+  replayCounts(): ReplayCounts;
+}
+
+/**
+ * The reader for ONE wake, as a DELTA.
+ *
+ * The Worker's counter is cumulative for the worker's whole life — a second wake must not report
+ * the first one's replay as its own — so the baseline is taken here, when the wake begins, and
+ * every read subtracts it.
+ */
+function countsFor(
+  controls: SessionReopenOptions["controls"],
+  fallback: ReplayMeter,
+): () => ReplayCounts {
+  const live = (controls as Partial<CountingControls>).replayCounts;
+  if (typeof live !== "function") return fallback.begin();
+  const from = live.call(controls);
+  return () => {
+    const now = live.call(controls);
+    return { events: now.events - from.events, dropped: now.dropped - from.dropped };
+  };
+}
 
 export interface SessionStrategyOptions {
   readonly descriptor: RuntimeDescriptor;
@@ -184,7 +214,7 @@ export function createSessionStrategy(o: SessionStrategyOptions): SessionStrateg
         ...(call.signal === undefined ? {} : { signal: call.signal }),
       });
       const startedAt = o.clock.now();
-      const readCounts = meter.begin();
+      const readCounts = countsFor(call.controls, meter);
 
       const reportFor = (attempt: RawAttempt | null, capabilityAdvertised: boolean): ResumeReport =>
         classifyResume({
