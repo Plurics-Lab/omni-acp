@@ -28,6 +28,12 @@ const CAPABILITY_OF: Readonly<Record<string, string>> = {
   "session/set_options": "setOptions",
   "session/list": "list",
   "session/close": "close",
+  // Row 23, marked `unverified`: claude-acp advertises `auth: {logout:{}}` and `authMethods: []`
+  // and the corpus never exercises it. With no `prefer` entry the spelling resolves to `null`,
+  // which is how a capability nobody has proven reports itself — and it is what lets an operator
+  // add `authLogin: {spellings:[…]}` to a descriptor without a code change.
+  "auth/login": "authLogin",
+  "auth/logout": "authLogout",
 };
 
 /**
