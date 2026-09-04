@@ -58,6 +58,8 @@ export interface Harness {
   readonly supervisor: FakeSupervisor;
   readonly log: ArrayLog;
   readonly normalizer: RecordingNormalizer;
+  /** The one lease every `deps()` and `create()` from this harness shares (§15.2's counter). */
+  readonly lease: RecordingLease;
   /** `append:<kind>` and `write:<method>` in the order they actually happened. */
   readonly trace: string[];
   readonly logger: Logger;
@@ -73,10 +75,18 @@ export interface Harness {
 /** A lease that records every `assertHolder`, so the "who" plumbing is observable. */
 export interface RecordingLease extends Lease {
   readonly asserted: readonly ClientRef[];
+  /**
+   * How many times `releaseForHibernate()` was called.
+   *
+   * §15.2 step 3 is an ORDERING claim — "process reclaimed, THEN lease released, THEN the
+   * envelope" — and an ordering claim needs a counter, not a boolean.
+   */
+  readonly hibernateReleases: number;
 }
 
 export function recordingLease(holder: ClientRef): RecordingLease {
   const asserted: ClientRef[] = [];
+  let hibernateReleases = 0;
   // M1's `Lease` returns a snapshot from every verb (§5.1 contracts.ts). The double grants
   // unconditionally and records WHO asked, which is the only property these tests are about.
   const snapshot = (): LeaseSnapshot => ({
@@ -108,6 +118,7 @@ export function recordingLease(holder: ClientRef): RecordingLease {
       return () => {};
     },
     releaseForHibernate(): LeaseSnapshot {
+      hibernateReleases += 1;
       return snapshot();
     },
     onChange(): () => void {
@@ -115,6 +126,9 @@ export function recordingLease(holder: ClientRef): RecordingLease {
     },
     close(): void {},
     asserted,
+    get hibernateReleases(): number {
+      return hibernateReleases;
+    },
   };
 }
 
@@ -128,6 +142,9 @@ export function harness(o?: { quietMs?: number; hardMs?: number }): Harness {
     hardMs: o?.hardMs ?? 5_000,
   });
   const logger = nullLogger();
+  // ONE lease per harness rather than one per `deps()` call: `releaseForHibernate` is counted,
+  // and a counter on an object the worker under test never received counts nothing.
+  const lease = recordingLease(OWNER);
 
   const base = (): CreateWorkerDeps => ({
     workerId: WORKER_ID,
@@ -141,7 +158,7 @@ export function harness(o?: { quietMs?: number; hardMs?: number }): Harness {
     normalizer,
     // M0 wires exactly this one (L7, §7.4); a test that wants the allow branch overrides it.
     responder: createBaselineResponder("deny", clock),
-    lease: recordingLease(OWNER),
+    lease,
     clock,
     ids: seqIds(),
     logger,
@@ -153,6 +170,7 @@ export function harness(o?: { quietMs?: number; hardMs?: number }): Harness {
     supervisor,
     log,
     normalizer,
+    lease,
     trace,
     logger,
     deps(overrides) {
@@ -238,6 +256,9 @@ export function controlledProcess(stream: AcpStream): ControlledProcess {
     startedAt: new Date(0).toISOString(),
     command: "controlled",
     argsRedacted: [],
+    // §15.7: a double that never spawned has no incarnation token, and `null` is the value
+    // that FORBIDS a later boot from signalling this pid.
+    fingerprint: null,
   };
 
   const finish = (code: number | null, signal: string | null, requested: boolean): void => {

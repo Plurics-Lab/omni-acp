@@ -1,6 +1,7 @@
 import {
   OmniError,
   type AgentProcess,
+  type Logger,
   type PlatformOps,
   type PlatformOwnership,
   type RunUtility,
@@ -76,6 +77,8 @@ export interface WindowsPlatformDeps {
    * the Windows contract that CAN be exercised off-Windows, given an environment to read.
    */
   readonly env?: NodeJS.ProcessEnv;
+  /** Diagnostics only. Absent ⇒ the two no-op M1 rungs below say nothing at all. */
+  readonly logger?: Logger;
 }
 
 export function createWindowsPlatformOps(deps: WindowsPlatformDeps): PlatformOps {
@@ -212,12 +215,26 @@ export function createWindowsPlatformOps(deps: WindowsPlatformDeps): PlatformOps
       return Promise.resolve(null);
     },
 
-    signalTreeByGroup(_groupId: number, _sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+    /**
+     * A DELIBERATE no-op, and unreachable in practice.
+     *
+     * There is no addressable group here — `ProcessInfo.groupId` is null on Windows for the same
+     * reason `isTreeGone` is always false — so a "group" a previous boot recorded cannot exist,
+     * and `Supervisor.reapOrphan` never gets this far: a Windows orphan's fingerprint is null,
+     * which stops it at `reapSkipped: "unsupported_platform"` (§15.7, ruling M1-R9).
+     *
+     * It signals NOTHING rather than falling back to the pid. Reaping by pid alone is the coin
+     * flip §15.7 forbids, and it is exactly what a well-meaning "at least kill the leader" edit
+     * would introduce.
+     */
+    signalTreeByGroup(_groupId: number, sig: "SIGTERM" | "SIGKILL"): Promise<TerminationRung> {
+      deps.logger?.debug("signalTreeByGroup is a no-op on Windows: no addressable group", { sig });
+      return Promise.resolve<TerminationRung>(sig === "SIGTERM" ? "sigterm" : "taskkill");
     },
 
+    /** Nothing here can prove a tree is gone, so nothing here ever claims it (§6.6). */
     isGroupGone(_groupId: number): Promise<boolean> {
-      throw new OmniError("internal", "unimplemented: M1-WP-C");
+      return Promise.resolve(false);
     },
   };
 }

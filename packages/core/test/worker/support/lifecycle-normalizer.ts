@@ -17,6 +17,8 @@ import type {
 
 export interface RecordingNormalizer extends Normalizer {
   readonly inputs: readonly TurnInput["type"][];
+  /** Every input VERBATIM — D6's `replay` flag arrives on the input and nowhere else. */
+  readonly seen: readonly TurnInput[];
 }
 
 const running = (): NormalizedSessionUpdate =>
@@ -48,6 +50,7 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
   let hardCutoff: number | null = null;
   let stopReason: StopReason | null = null;
   const inputs: TurnInput["type"][] = [];
+  const seen: TurnInput[] = [];
 
   const out = (
     emit: readonly EventInput[],
@@ -70,8 +73,10 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
     slice: "m1-full",
     descriptor: fakeRuntime(),
     inputs,
+    seen,
     step(input: TurnInput): TurnOutput {
       inputs.push(input.type);
+      seen.push(input);
       switch (input.type) {
         case "prompt_sent": {
           state = "running";
@@ -96,12 +101,17 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
         case "agent_update": {
           // §7.5: forwarded verbatim, `payloadVersion: 1`, `_meta` preserved by forwarding the
           // object rather than rebuilding it.
+          //
+          // D6 / §15.3: "The Normalizer's only job is to COPY the flag onto every `EventInput` it
+          // emits for that update; it carries no window state, and stays pure." That is this one
+          // spread — the Worker owns the window, the reducer owns the copy.
           const emit: EventInput[] = [
             {
               kind: "acp.session_update",
               payloadVersion: 1,
               turnId,
               payload: input.update as NormalizedSessionUpdate,
+              ...(input.replay === true ? { replay: true as const } : {}),
             },
           ];
           if (state !== "settling") return out(emit, null, null);
