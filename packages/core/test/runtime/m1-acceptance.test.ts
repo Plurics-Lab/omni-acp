@@ -100,9 +100,15 @@ describe("M1-WP-E — runtime descriptors, vendor registry, probe, daemon wiring
     expect(true).toBe(true);
   });
 
-  it.todo(
-    "10. migration: empty file, a v1 file (no-op), and a schema_version FROM THE FUTURE => a " +
-      "startup failure NAMING the version — the STORE half belongs to M1-WP-A's openPersistence; " +
-      "the wiring half (the failure reaches createDaemon's caller) is in daemon/test/event-store.test.ts",
-  );
+  it("10. migration: empty file, a v1 file (no-op), a schema_version FROM THE FUTURE => a named failure", () => {
+    // Both halves landed, so this row is an index entry like the nine above rather than a todo.
+    // The STORE half is M1-WP-A's `openPersistence` / `migrate`
+    // (`core/test/persist/event-store.test.ts`): an empty file is created at `SCHEMA_VERSION`, a
+    // file already at it is a no-op, one from the FUTURE throws naming BOTH versions — never a
+    // silent downgrade, which would write rows that quietly drop whatever columns the newer
+    // schema added — and an unreadable version is rewritten rather than guessed at.
+    // The WIRING half is `daemon/test/event-store.test.ts`: that failure REACHES `createDaemon`'s
+    // caller instead of being swallowed into a daemon that quietly runs on memory.
+    expect(true).toBe(true);
+  });
 });
