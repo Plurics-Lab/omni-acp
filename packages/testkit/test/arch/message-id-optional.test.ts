@@ -1,3 +1,4 @@
+import { reduceTurn, type EventEnvelope, type TurnId, type WorkerId } from "@omni-acp/protocol";
 import { describe, expect, it } from "vitest";
 import { blankOutNonCode, identifierHits, packageSources } from "./source-scan.js";
 
@@ -40,11 +41,94 @@ describe("guard: message-id-optional", () => {
   });
 
   /**
-   * M1-WP-B lands the reads; M1-WP-F lands this assertion over them (M1-PLAN §3). It is stated
-   * as a todo rather than left unwritten so that the obligation is visible in the file that owns
-   * it, which is the whole reason the guard was renamed rather than deleted.
+   * The property the guard is actually protecting, over the three files allowed to name the
+   * field: v1 types `ContentChunk.messageId` OPTIONAL and v2 REQUIRES it, so every read has to
+   * tolerate absence. "Tolerates absence" is made mechanical as: the line either DECLARES the
+   * field nullable, or reads it through an accessor whose result type includes `null`.
+   *
+   * The shapes are enumerated rather than sniffed for `??`, because the map does not use `??` at
+   * all — it uses `str()`, which returns `string | null` — and a guard that demanded a particular
+   * operator would have been satisfied by `chunk.messageId ?? ""`, which is the bug (an empty
+   * string is a message id that groups every id-less chunk into one message).
    */
-  it.todo("every `messageId` read is `?? null`-guarded, and reduceTurn never requires one");
+  const TOLERATES_ABSENCE: readonly RegExp[] = [
+    // A DECLARATION of the field as nullable or optional. A declaration cannot assume presence.
+    /messageId\??\s*:\s*(string\s*\|\s*null|null\s*\|\s*string|string\s*\|\s*undefined)/,
+    // Read through `str()` / `has()`, whose results are `string | null` and `boolean`.
+    /\b(str|has)\(\s*payload\s*(,|\[)\s*["']messageId["']\s*\]?\s*\)/,
+    // Written from a value the caller already narrowed to `string | null`.
+    /messageId:\s*id\b/,
+    // The signature that hands the id out as nullable in the first place.
+    /Pick<MappedUpdate,\s*["']messageId["']>/,
+  ];
+
+  it("every `messageId` read tolerates absence, in all three files allowed to name it", () => {
+    const offenders: string[] = [];
+    for (const source of sources) {
+      if (!ALLOWED.has(source.path)) continue;
+      const lines = source.text.split("\n");
+      for (const line of identifierHits(source, "messageId")) {
+        const text = lines[line - 1] ?? "";
+        if (TOLERATES_ABSENCE.some((shape) => shape.test(text))) continue;
+        offenders.push(`${source.path}:${String(line)}: ${text.trim()}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("scans a corpus that actually contains the reads — otherwise the rule above is vacuous", () => {
+    const hits = sources
+      .filter((s) => ALLOWED.has(s.path))
+      .flatMap((s) => identifierHits(s, "messageId"));
+    expect(hits.length).toBeGreaterThan(2);
+  });
+
+  it("would catch the shape that looks guarded and is not", () => {
+    // `?? ""` is the bug this rule exists for, and it is the one a `??`-sniffing guard would
+    // wave through: an empty string is a message id, and it groups every id-less chunk from
+    // every kind into ONE message.
+    const planted = {
+      path: "packages/core/src/normalizer/map/message-id.ts",
+      absolute: "<planted>",
+      text: 'const id = payload.messageId ?? "";\n',
+      code: blankOutNonCode('const id = payload.messageId ?? "";\n'),
+    };
+    const line = planted.text.split("\n")[0] ?? "";
+    expect(identifierHits(planted, "messageId")).toEqual([1]);
+    expect(TOLERATES_ABSENCE.some((shape) => shape.test(line))).toBe(false);
+  });
+
+  it("reduceTurn never requires one: a turn of id-less chunks folds normally", () => {
+    // The other half of the property, and the one a consumer feels: v1 agents send chunks with
+    // no `messageId` at all (86 of 86 in the claude-acp corpus carry one, but `thought.mjs`
+    // exists precisely because another agent's do not), and the aggregate must not depend on it.
+    const workerId = "w_01J00000000000000000000001" as WorkerId;
+    const turnId = "t_01J00000000000000000000001" as TurnId;
+    const envelope = (seq: number, payload: Record<string, unknown>): EventEnvelope =>
+      ({
+        seq,
+        ts: `2026-01-01T00:00:0${String(seq)}.000Z`,
+        daemonId: "d_01J00000000000000000000001",
+        workerId,
+        sessionId: "s1",
+        turnId,
+        payloadVersion: 2,
+        kind: "acp.session_update",
+        payload,
+      }) as EventEnvelope;
+
+    const result = reduceTurn(turnId, [
+      envelope(1, { sessionUpdate: "state_update", state: "running" }),
+      // No `messageId` on either chunk.
+      envelope(2, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "a" } }),
+      envelope(3, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "b" } }),
+      envelope(4, { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" }),
+    ]);
+
+    expect(result.text).toBe("ab");
+    expect(result.stopReason).toBe("end_turn");
+    expect(result.verdict).toBe("ok");
+  });
 
   it("would catch a real read while ignoring the prose", () => {
     // The mechanism, asserted: the scan runs over code with comments and string literals

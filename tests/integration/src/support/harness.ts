@@ -4,8 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OmniACP, type Server } from "@omni-acp/client";
 import { createDaemon } from "@omni-acp/daemon";
-import type { Daemon, DaemonConfig } from "@omni-acp/protocol";
-import { fixtureAgentPath, sdkExampleAgentPath, type FixtureAgentName } from "@omni-acp/testkit";
+import {
+  SSE_CONTROL,
+  type Daemon,
+  type DaemonConfig,
+  type EventEnvelope,
+} from "@omni-acp/protocol";
+import {
+  fixtureAgentPath,
+  parseSse,
+  sdkExampleAgentPath,
+  type FixtureAgentName,
+} from "@omni-acp/testkit";
+
+/** The out-of-band frames that are not envelopes and consume no seq (§8.4). */
+const CONTROL_EVENTS = new Set<string>(Object.values(SSE_CONTROL));
 
 /**
  * The Tier-3 harness: real processes, real ndJSON, real loopback HTTP.
@@ -129,6 +142,61 @@ export function curl(
         ...(init?.headers as Record<string, string> | undefined),
       },
     });
+}
+
+/**
+ * Every envelope a worker's stream has to offer right now, over the REAL socket.
+ *
+ * `collectSse` stops on a count, a predicate or `omni.stream_end` and THROWS on a timeout, which
+ * is the right shape for a test that knows what it is waiting for. A LIVE worker's stream ends
+ * for none of those reasons — `stream_end` only ever arrives for a closed worker (§8.4) — so
+ * reading "everything so far" needs a reader that stops when the stream goes QUIET and hands
+ * back what it got. Swallowing `collectSse`'s timeout instead would return an empty array on
+ * every call and make an assertion about envelopes pass by having none.
+ */
+export async function readEnvelopes(
+  base: string,
+  token: string,
+  workerId: string,
+  o: { since?: number; quietMs?: number; timeoutMs?: number } = {},
+): Promise<EventEnvelope[]> {
+  const quietMs = o.quietMs ?? 150;
+  const controller = new AbortController();
+  const response = await fetch(
+    `${base}/v1/workers/${workerId}/events?since=${String(o.since ?? 0)}`,
+    {
+      headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" },
+      signal: controller.signal,
+    },
+  );
+  if (!response.ok || response.body === null) {
+    throw new Error(`GET /events answered ${String(response.status)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let lastAt = Date.now();
+  const deadline = Date.now() + (o.timeoutMs ?? 10_000);
+
+  const pump = (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      text += decoder.decode(value, { stream: true });
+      lastAt = Date.now();
+    }
+  })().catch(() => {});
+
+  while (Date.now() < deadline && (text === "" || Date.now() - lastAt < quietMs)) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  controller.abort();
+  await pump;
+
+  return parseSse(text)
+    .filter((f) => f.event !== undefined && !CONTROL_EVENTS.has(f.event))
+    .map((f) => JSON.parse(f.data) as EventEnvelope);
 }
 
 /** Polls a condition. Returns false on timeout rather than throwing, so callers can report. */

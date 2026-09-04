@@ -470,7 +470,11 @@ describe("acceptance 9 — M0's two-workers-do-not-interfere.itest.ts still pass
     // Three arguments, not two: rule L9's `omni.lease` envelope needs the worker's own log, and
     // the registry is the only frame that has one. `DaemonDeps.leaseFactory` stays frozen at two
     // and stays assignable.
-    expect(registry).toContain("o.leaseFactory?.(owner, workerId, log) ?? alwaysGrantedLease(");
+    // Whitespace-insensitive: the expression is one prettier reflow away from failing a literal
+    // substring match, and what this asserts is the DELEGATION, not the line breaks.
+    expect(registry.replace(/\s+/g, " ")).toContain(
+      "o.leaseFactory?.(owner, workerId, log) ?? alwaysGrantedLease(",
+    );
     // A CALL, not the word: `registry.ts`'s own comment names `createLease` as the thing WP-D
     // implements elsewhere, and a guard that fired on its own rationale would teach the next
     // person to delete the rationale (amendment A8).
@@ -479,10 +483,21 @@ describe("acceptance 9 — M0's two-workers-do-not-interfere.itest.ts still pass
     );
 
     const createDaemon = readFileSync(join(REPO_TEST_ROOT, "daemon/src/create-daemon.ts"), "utf8");
-    // The composition point, and the only one. An INJECTED factory still wins — `??`, not a
-    // hand-wired call — which is the property that lets a test take the enforcing lease back out
-    // again without editing the daemon.
-    expect(createDaemon).toContain("deps?.leaseFactory ??");
+    // The composition point, and the only one. An INJECTED factory still WINS, which is the
+    // property that lets a test take the enforcing lease back out again without editing the
+    // daemon.
+    //
+    // It stopped being a bare `??` at the M1 integration step and the reason is worth stating:
+    // `DaemonDeps.leaseFactory` is frozen at `(owner: ClientRef, …)` and has no way to express
+    // "nobody holds this yet", which is exactly what a REHYDRATED worker needs (ruling M1-R8 —
+    // the lease is not persisted across a restart). So the injected factory is consulted for
+    // every held case and the null case composes the daemon's own. The assertion is on the
+    // precedence, not on the operator that expresses it.
+    const flat = createDaemon.replace(/\s+/g, " ");
+    expect(flat).toContain("const injected = deps?.leaseFactory;");
+    expect(flat).toContain(
+      "if (injected !== undefined && owner !== null) return injected(owner, workerId);",
+    );
     expect(createDaemon).toContain("createLease({");
   });
 });

@@ -180,29 +180,35 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
      * An injected factory still wins, which is what lets a test drive `alwaysGrantedLease` or a
      * spy without the daemon composing one behind its back.
      */
-    leaseFactory:
-      deps?.leaseFactory ??
-      ((owner, workerId, log) =>
-        createLease({
-          workerId,
-          clock,
-          config: resolved.lease,
-          initialHolder: owner,
-          onEvent: (payload) => {
-            try {
-              log.append({ kind: "omni.lease", payloadVersion: 2, turnId: null, payload });
-            } catch (e) {
-              // A lease transition that cannot be audited is still a lease transition: control
-              // has already moved, and throwing here would turn a full log or a closed one into
-              // a failed `acquire`. The write failure is the log's own to report (§14.3).
-              logger.warn("appending an omni.lease envelope failed", {
-                workerId,
-                op: payload.op,
-                error: String(e),
-              });
-            }
-          },
-        })),
+    leaseFactory: (owner, workerId, log) => {
+      // An INJECTED factory still wins — that is what lets a test drive `alwaysGrantedLease` or a
+      // spy without the daemon composing one behind its back. It cannot be consulted for an
+      // UNHELD lease, though: `DaemonDeps.leaseFactory` is frozen at `(owner: ClientRef, …)` and
+      // has no way to say "nobody holds this yet", which is exactly what a rehydrated worker
+      // needs (ruling M1-R8). So the null case composes the daemon's own.
+      const injected = deps?.leaseFactory;
+      if (injected !== undefined && owner !== null) return injected(owner, workerId);
+      return createLease({
+        workerId,
+        clock,
+        config: resolved.lease,
+        initialHolder: owner,
+        onEvent: (payload) => {
+          try {
+            log.append({ kind: "omni.lease", payloadVersion: 2, turnId: null, payload });
+          } catch (e) {
+            // A lease transition that cannot be audited is still a lease transition: control
+            // has already moved, and throwing here would turn a full log or a closed one into
+            // a failed `acquire`. The write failure is the log's own to report (§14.3).
+            logger.warn("appending an omni.lease envelope failed", {
+              workerId,
+              op: payload.op,
+              error: String(e),
+            });
+          }
+        },
+      });
+    },
     /**
      * SEAM 2, closed: M1-WP-C's `SessionStrategy` is the daemon's default.
      *

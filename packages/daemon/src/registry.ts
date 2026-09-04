@@ -71,7 +71,7 @@ export interface WorkerRegistryOptions {
    * function stays assignable to this type, so an injected `DaemonDeps.leaseFactory` written
    * against the frozen shape keeps working and simply ignores the argument.
    */
-  readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId, log: EventLog) => Lease;
+  readonly leaseFactory?: (owner: ClientRef | null, workerId: WorkerId, log: EventLog) => Lease;
   /**
    * The durable half (§14). Absent or `null` ⇒ memory only, which is `createDaemon()`'s default
    * (ruling M1-R17) and M0's behaviour exactly: no store to read, so `list()` is the live map,
@@ -395,7 +395,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         // worker uses the same inline handshake `worker.ts` falls back to, and M1-WP-C's
         // `createRehydratedWorker` is the one that knows how to say that.
         session: o.session as SessionStrategy,
-        lease: leaseFor(owner, workerId, log),
+        // Unheld, per ruling M1-R8 — see `leaseFor`.
+        lease: leaseFor(null, workerId, log),
         clock: o.clock,
         ids: o.ids,
         logger: o.logger.child({ workerId, agent: row.agentId, rehydrated: true }),
@@ -671,8 +672,21 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
   };
 
   /** Seam 3's one call site. The default IS M0: `alwaysGrantedLease` grants every `assertHolder`. */
-  const leaseFor = (owner: ClientRef, workerId: WorkerId, log: EventLog): Lease =>
-    o.leaseFactory?.(owner, workerId, log) ?? alwaysGrantedLease(owner, workerId);
+  /**
+   * `owner === null` means the worker is created lease-FREE, which is two things at once:
+   * `CreateWorkerRequest.lease: "observe"`, and — the one that matters here — a worker
+   * REHYDRATED from a previous boot.
+   *
+   * Ruling M1-R8: the lease is not persisted across a restart, because a lease over a process
+   * that no longer exists is meaningless. Seeding a rehydrated worker's lease with the row's
+   * owner instead would make it `{tokenId, clientId: null}` — the token's DEFAULT client — and
+   * every SDK client mints a ULID per `connect()` (§16.1 rule L4), so no client could ever match
+   * it: a restarted worker would answer `423` to its own owner forever. Starting unheld lets
+   * rule L5's implicit acquire do exactly what it is for.
+   */
+  const leaseFor = (owner: ClientRef | null, workerId: WorkerId, log: EventLog): Lease =>
+    o.leaseFactory?.(owner, workerId, log) ??
+    alwaysGrantedLease(owner ?? { tokenId: "", clientId: null }, workerId);
 
   return {
     /** Live workers — the number `maxWorkers` is compared against. A closed worker holds no slot. */
@@ -882,7 +896,19 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
 
     async closeAll(reason, opts): Promise<void> {
       const budget = opts?.timeoutMs ?? DEFAULT_CLOSE_ALL_MS;
-      const all = [...entries.values()].map((entry) =>
+      /**
+       * A HIBERNATED worker is skipped, and that is §15.2's whole point rather than an
+       * optimisation: it owns no process, so there is nothing here to reclaim, and closing it
+       * would discard the session pointer hibernation exists to preserve. Before this, a graceful
+       * `stop()` closed every sleeping worker on the way out and the next boot adopted a fleet of
+       * `closed` rows — which makes "a hibernated worker survives a restart" (§14.8, §15.6) false
+       * for the only shutdown path anybody uses. `closed` is skipped for the plainer reason.
+       */
+      const reclaimable = [...entries.values()].filter((entry) => {
+        const state = entry.handle.snapshot().state;
+        return state !== "hibernated" && state !== "closed";
+      });
+      const all = reclaimable.map((entry) =>
         closeEntry(entry, reason).catch((e: unknown) => {
           o.logger.warn("worker close failed during shutdown", {
             workerId: entry.id,

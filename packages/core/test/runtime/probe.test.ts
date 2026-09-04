@@ -60,7 +60,7 @@ const run = (
   o: { config?: ResolvedProbeConfig; signal?: AbortSignal; fingerprint?: string } = {},
 ) =>
   probeAgent({
-    agentId: "claude",
+    agentId: AGENT_ID,
     spec: SPEC,
     descriptor: CLAUDE,
     config: o.config ?? config(),
@@ -71,10 +71,22 @@ const run = (
     ...(o.fingerprint === undefined ? {} : { fingerprint: o.fingerprint }),
   });
 
-/** Temp directories this test could have leaked, by the prefix `probeAgent` uses. */
+/** The agent id every `run()` in this file probes; `probeAgent` puts it in the workspace name. */
+const AGENT_ID = "claude";
+
+/**
+ * Temp directories THIS test could have leaked, by the prefix `probeAgent` uses.
+ *
+ * The prefix is `omni-probe-<agentId>-` and the agent id here is `AGENT_ID`, which matters: a
+ * bare `omni-probe-` also matches `omni-probe-cache-` and `omni-probe-svc-`, the prefixes the
+ * DAEMON package's own tests use. Those run in a sibling vitest project against the same
+ * `os.tmpdir()`, so the loose filter made this assertion a race between two projects — green or
+ * red depending on which one happened to be mid-`mkdtemp`, and reporting a leak in `probe.ts`
+ * either way. Narrowing to the agent id is what makes it an assertion about the code under test.
+ */
 async function probeTempDirs(): Promise<string[]> {
   const entries = await readdir(tmpdir());
-  return entries.filter((e) => e.startsWith("omni-probe-"));
+  return entries.filter((e) => e.startsWith(`omni-probe-${AGENT_ID}-`));
 }
 
 describe("probeAgent — ONE throwaway process, ≈0 tokens (§17.4, corpus 08)", () => {
