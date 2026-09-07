@@ -1,0 +1,25 @@
+# omni-acp start --config daemon.example.yaml --print-token
+#
+# A daemon for ONE machine. Tokens are the only credential; each one carries its own boundaries.
+# `secret` may be replaced by `secretSha256` once you stop wanting the plaintext in a file.
+listen: { host: 127.0.0.1, port: 7777 }
+dataDir: ~/.omni-acp
+eventLog: { driver: sqlite, retentionDays: 7 } # `memory` for a throwaway daemon
+
+tokens:
+  - id: alice
+    secret: replace-me-with-32-random-chars-000
+    role: user # user | admin (admin sees every worker, can steal any lease)
+    agents: ["claude-acp", "codex-acp"] # or "*"
+    cwdRoots: ["/srv/alice"] # realpath containment: a worker's cwd must live under one of these
+    maxWorkers: 4
+
+agents:
+  - id: claude-acp
+    command: npx
+    args: ["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"]
+  - id: codex-acp
+    command: npx
+    args: ["-y", "@agentclientprotocol/codex-acp@1.8.0"]
+
+hibernate: { idleMs: 1800000 } # 30 min idle -> process reclaimed, session kept; next prompt wakes it
