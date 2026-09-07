@@ -717,6 +717,9 @@ export async function fakeCoreModule(
     createRehydratedWorker: (row, log) => testRehydratedWorker(row, log),
     alwaysGrantedLease: (holder) => ({
       holder,
+      // The registry disposes every lease on close/closeAll (its TTL timer must not outlive the
+      // worker); the real `alwaysGrantedLease` has a no-op `close()`, and so must this double.
+      close: () => {},
       assertHolder: () => {},
       acquire: () => {
         throw new OmniError("bad_request", "lease.acquire is not implemented until M1");

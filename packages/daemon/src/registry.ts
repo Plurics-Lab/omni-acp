@@ -480,6 +480,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     const onClosed = (): void => {
       release(entry.ownerTokenId, entry);
       entry.subscription?.close();
+      // The lease owns a TTL expiry timer (`lease.ttlMs`, 15 min by default). Nothing else
+      // cancels it once the worker is gone, and a live `setTimeout` keeps an embedded daemon's
+      // process alive for the rest of the TTL after `stop()` has returned.
+      entry.handle.lease.close();
       persistClose(entry);
     };
     void handle.closed.then(onClosed, onClosed);
@@ -859,6 +863,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         const onClosed = (): void => {
           release(auth.tokenId, entry);
           entry.subscription?.close();
+          // The lease's TTL timer (`lease.ttlMs`, 15 min by default) has no other owner once
+          // the worker is gone; left armed it keeps an embedded daemon's process alive after
+          // `stop()` returned. Same line on the rehydrate path.
+          handle.lease.close();
           // The LAST write, and the one §15.6 level 3 reads back: the persisted `CloseResult` is
           // what a `DELETE` after a restart replays byte-for-byte instead of recomputing.
           persistClose(entry);
@@ -987,6 +995,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         // exit until every idle budget elapsed. `cancel()` is terminal by design.
         entry.idleTimer?.cancel();
         entry.idleTimer = null;
+        // Shutdown means every timer this registry owns dies HERE, not on whatever microtask the
+        // worker's `closed` promise settles on — a hibernated entry never reaches `onClosed` at all,
+        // and its lease's TTL timer would otherwise outlive `stop()`.
+        entry.handle.lease.close();
       }
     },
 
