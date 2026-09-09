@@ -100,6 +100,26 @@ export interface CompatHarness {
   dispose(): Promise<void>;
   /** Re-opens a daemon on the SAME `dataDir` — §4 step 5's restart. */
   restart(): Promise<void>;
+  /**
+   * Replaces the daemon-config overlay and restarts on the SAME `dataDir` (review follow-up 2).
+   *
+   * This is the ONLY way an M2 compat case can reach a daemon-level setting, and it exists
+   * because two of them cannot be reached any other way: everything else M2 needs is per-worker
+   * on `CreateWorkerRequest` (watchdog, `parkTimeout*`, policy, patch) or built-in data (the four
+   * policy presets), but `webhooks` and `diff` are daemon config and their DEFAULTS make the
+   * cases vacuous — `webhooks.enabled:false` + `mode:"allowlist"` + empty `allow` refuses every
+   * delivery three ways over, and `diff.provider:"none"` can only ever produce `patch: null`.
+   *
+   * A start-time `HarnessOptions.config` cannot serve the webhook case either: the receiver's
+   * origin is not knowable until it has bound an ephemeral port, which happens inside the case.
+   *
+   * `null` clears the overlay and restores the base config. The overlay is applied inside the
+   * config factory, so `restart()` afterwards reproduces it rather than silently reverting.
+   *
+   * It RESTARTS: an already-created worker is hibernated and adopted exactly as §4 step 5 leaves
+   * it, so call this before creating the case's worker.
+   */
+  reconfigure(overlay: ((base: DaemonConfig) => DaemonConfig) | null): Promise<void>;
 }
 
 /** A temp directory safe to compare against a daemon-canonicalised `cwd` (Windows 8.3 names). */
@@ -111,6 +131,16 @@ export interface HarnessOptions {
   /** `hibernate.idleMs`. §4 step 3 re-creates a worker with a small one; the default is generous. */
   readonly idleMs?: number;
   readonly workspace?: string;
+  /**
+   * The CI matrix's daemon config, as an overlay on the base one below (review follow-up 2).
+   *
+   * Applied INSIDE the config factory, so `restart()` and `reconfigure()` reproduce it. Ruling
+   * M2-R16's disposition names three places that must carry `denyCidrs: []` and this is the third
+   * ("the CI matrix's daemon config"); the base config deliberately does not set it, because a
+   * harness that shipped an empty deny list by default would make every OTHER case run against a
+   * daemon with the SSRF gate disabled.
+   */
+  readonly config?: (base: DaemonConfig) => DaemonConfig;
 }
 
 export async function startCompatHarness(
@@ -123,7 +153,9 @@ export async function startCompatHarness(
   const tokenB = randomBytes(32).toString("hex");
   const launch = resolveLaunch(agent);
 
-  const config = (): DaemonConfig => ({
+  let overlay: ((base: DaemonConfig) => DaemonConfig) | null = o.config ?? null;
+
+  const baseConfig = (): DaemonConfig => ({
     dataDir,
     listen: { host: "127.0.0.1", port: 0 },
     logLevel: "warn",
@@ -148,6 +180,12 @@ export async function startCompatHarness(
       },
     ],
   });
+
+  /** The base config plus whatever overlay is in force — read on every start AND every restart. */
+  const config = (): DaemonConfig => {
+    const base = baseConfig();
+    return overlay === null ? base : overlay(base);
+  };
 
   let daemon = await createDaemon(config());
   await daemon.start();
@@ -174,6 +212,16 @@ export async function startCompatHarness(
   let B = await connect(tokenA);
   let disposed = false;
 
+  const restart = async (): Promise<void> => {
+    await A.close().catch(() => {});
+    await B.close().catch(() => {});
+    await daemon.stop({ graceful: true });
+    daemon = await createDaemon(config());
+    await daemon.start();
+    A = await connect(tokenA);
+    B = await connect(tokenA);
+  };
+
   const harness: CompatHarness = {
     get daemon(): Daemon {
       return daemon;
@@ -192,14 +240,10 @@ export async function startCompatHarness(
     workspace,
     dataDir,
     agentId: agent.id,
-    async restart(): Promise<void> {
-      await A.close().catch(() => {});
-      await B.close().catch(() => {});
-      await daemon.stop({ graceful: true });
-      daemon = await createDaemon(config());
-      await daemon.start();
-      A = await connect(tokenA);
-      B = await connect(tokenA);
+    restart,
+    async reconfigure(next): Promise<void> {
+      overlay = next;
+      await restart();
     },
     async dispose(): Promise<void> {
       if (disposed) return;

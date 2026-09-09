@@ -291,12 +291,16 @@ describe("PromptRequestBody", () => {
 
   /**
    * H28 (§5.8.6). The text-only `.refine` is DELETED, not widened, and the check MOVED into
-   * `WorkerRegistry.prompt()` → `assertPromptContent()` — the only layer that holds this agent's
-   * `promptCapabilities` and this token's `cwdRoots`, both of which DESIGN §5.1 requires.
+   * `Worker.prompt()` as the injected `deps.validateContent` → `@omni-acp/core`'s
+   * `assertPromptContent` — the only layer that holds this agent's `promptCapabilities` and this
+   * token's `cwdRoots`, both of which DESIGN §5.1 requires, and which the daemon's
+   * worker-creation path MUST bind. Absent an injection the fallback is `worker.ts`'s
+   * deliberately differently-spelled `assertTextOnlyContent` (review R2).
    *
    * So the SCHEMA now accepts a `resource_link`, and the 400 still comes back: from the worker.
-   * `assert-prompt-content-is-called` is the guard that keeps the move honest, because a schema
-   * that silently stopped enforcing containment looks exactly like one that got more capable.
+   * `assert-prompt-content-is-called` is the STRUCTURAL guard that keeps the move honest — it
+   * asserts the INJECTION, not a name — because a schema that silently stopped enforcing
+   * containment looks exactly like one that got more capable.
    */
   it("no longer decides block TYPES — that moved to assertPromptContent (H28)", () => {
     expect(

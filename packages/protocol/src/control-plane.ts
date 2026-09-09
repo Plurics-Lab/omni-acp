@@ -121,11 +121,15 @@ export interface ProbeResponse {
  * this diff: zod holds no worker, so it can enforce neither this agent's `promptCapabilities` nor
  * this token's `cwdRoots`, and DESIGN §5.1 requires BOTH.
  *
- * The semantic gate moves into `WorkerRegistry.prompt()` → `assertPromptContent()` (§26), whose
- * DEFAULT is M0's text-only whitelist — so the behaviour is unchanged at the Land step and the
+ * The semantic gate moves into **`Worker.prompt()`** as the injected `deps.validateContent` →
+ * `@omni-acp/core`'s `assertPromptContent` (§26.2), which the daemon's worker-creation path MUST
+ * bind to the token's `cwdRoots` and the worker's `promptCapabilities`. Absent an injection the
+ * fallback is `worker.ts`'s deliberately differently-spelled `assertTextOnlyContent` (review R2)
+ * — M0's text-only whitelist verbatim — so the behaviour is unchanged at the Land step and the
  * 400 still comes back, from the worker instead of from the schema. The
- * `assert-prompt-content-is-called` guard covers the move: a schema that silently stopped
- * enforcing containment looks exactly like a schema that got more capable.
+ * `assert-prompt-content-is-called` guard is STRUCTURAL: it asserts the INJECTION, not a name,
+ * because a schema that silently stopped enforcing containment looks exactly like a schema that
+ * got more capable.
  *
  * The blocks themselves are still NOT re-modelled: only `type` is inspected, and the array is
  * forwarded verbatim.

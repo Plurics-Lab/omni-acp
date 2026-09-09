@@ -118,7 +118,7 @@ worker.state:  starting → ready ⇄ running ⇄ requires_action → hibernated
 | `running` → `ready` | `state_update{idle}` | daemon 聚合 `TurnResult` 落盘 |
 | `ready` → `hibernated` | idle 超时（默认 30 min，per-worker 可配） | 进程回收、lease 释放、记录保留 |
 | `hibernated` → `starting` | `prompt` / `attach` | 重新 spawn + resume；结果四态见 D2 |
-| 任意 → `closed` | `DELETE` / `onUnresolved: fail` 触发 / 进程崩溃且不可 resume | `session/close`（能发则发）+ 杀进程组 |
+| 任意 → `closed` | `DELETE` / 进程崩溃且不可 resume | `session/close`（能发则发）+ 杀进程组。`onUnresolved: fail` **不在**此行——它取消本轮、worker 保持打开（裁决 M2-R24） |
 
 进程崩溃：agent 支持 resume → 转 `hibernated` 并标记 `crashed`，下次 prompt 自动恢复；不支持 → `closed`，`omni.worker_state` 带错误。
 
@@ -228,7 +228,7 @@ policy:
 
 **策略归属**：daemon 配置里有命名预设（`readonly` / `src-edit` / `full` …），client 在 `createAgent` 时既可引用预设也可内联规则；但每个 token 的 ACL 里有一条 **`policyCeiling`（最宽允许）**，内联规则与预设的合并结果不得超过它——超过返回 403 `policy_exceeds_ceiling`。管理员用 ceiling 给 token 划红线，使用者在红线内自由。
 
-**三种 `onUnresolved`**：`park` → session 进入 `requires_action`、发 webhook、等 lease 持有者，超时按 `parkTimeoutAction`；`deny` → 按上面规则 4；`fail` → `session/cancel` 并标记 run 失败。
+**三种 `onUnresolved`**：`park` → session 进入 `requires_action`、发 webhook、等 lease 持有者，超时按 `parkTimeoutAction`；`deny` → 按上面规则 4；`fail` → `session/cancel` 取消本轮并标记 run 失败，**worker 保持打开**（裁决 M2-R24：`fail` 是对一个请求的策略判决，不是对 session 的判决；§3.2 的 `任意 → closed` 行相应修订）。
 
 **v1/v2 差异**：v1 请求是 `{toolCall, options}`，v2 是 `{title, subject, options}`。Normalizer 统一成 v2 后再进引擎。
 

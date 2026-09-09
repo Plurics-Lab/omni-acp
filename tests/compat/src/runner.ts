@@ -5,7 +5,7 @@ import type { Worker } from "@omni-acp/client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { compatCases, type CompatCase, type CompatContext } from "./cases/index.js";
 import { compatDir, type CompatAgentConfig, type CompatSelection } from "./config.js";
-import { startCompatHarness, type CompatHarness } from "./harness.js";
+import { startCompatHarness, type CompatHarness, type HarnessOptions } from "./harness.js";
 
 /**
  * Runs `compatCases()` against every selected agent and writes `compat-report.json`
@@ -112,7 +112,19 @@ function reportPathOf(path: string): string {
   return isAbsolute(path) ? path : join(compatDir(), path);
 }
 
-export function runCompatSuite(selection: CompatSelection, o: { reportPath: string }): void {
+export function runCompatSuite(
+  selection: CompatSelection,
+  o: {
+    readonly reportPath: string;
+    /**
+     * Forwarded verbatim to every agent's `startCompatHarness` (review follow-up 2). It is how a
+     * CI job pins the daemon config the whole matrix runs against — ruling M2-R16's third
+     * `denyCidrs: []` site — without any case having to know it happened; a case that needs a
+     * setting only IT wants uses `ctx.withDaemonConfig` instead.
+     */
+    readonly harness?: HarnessOptions;
+  },
+): void {
   const results: CompatResult[] = [];
   const path = reportPathOf(o.reportPath);
 
@@ -169,7 +181,7 @@ export function runCompatSuite(selection: CompatSelection, o: { reportPath: stri
 
       beforeAll(async () => {
         try {
-          harness = await startCompatHarness(agent);
+          harness = await startCompatHarness(agent, o.harness);
           // §4 step 0. Its `ProbeSummary` drives every `capability` skip below, so a missing
           // capability is reported as a skip rather than as a failure.
           probe = (await harness.A.probe(agent.id)).probe;
@@ -205,6 +217,11 @@ export function runCompatSuite(selection: CompatSelection, o: { reportPath: stri
             if (shared !== null) return live.A.attach(shared.id);
             shared = await live.A.createAgent(agent.id, { cwd: live.workspace });
             return shared;
+          },
+          withDaemonConfig(overlay): Promise<void> {
+            // The shared worker survives as an id: `worker()` re-attaches rather than caching a
+            // handle, which is exactly the property §4 step 5's restart already depends on.
+            return live.reconfigure(overlay);
           },
         };
       };

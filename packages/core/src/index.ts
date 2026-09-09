@@ -84,7 +84,7 @@ export { probeAgent, type ProbeOptions } from "./runtime/probe.js";
 
 // ── ACP link and worker kernel (WP-4) ───────────────────────────────────────
 export { openAcpLink, type AcpLink, type AcpLinkHandlers } from "./acp/link.js";
-export { createBaselineResponder } from "./worker/permission-responder.js";
+export { createBaselineResponder, selectOption } from "./worker/permission-responder.js";
 export { createWorker, type CreateWorkerDeps } from "./worker/worker.js";
 
 // ── hibernate / wake / resume (M1-WP-C) ─────────────────────────────────────

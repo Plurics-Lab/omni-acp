@@ -654,6 +654,7 @@ const EXPECTED: Record<string, readonly string[]> = {
     "resolveWorkerEnv",
     "runRetention",
     "runUtility",
+    "selectOption",
     "signDelivery",
     "toPolicySubject",
     "viewConfigOptions",

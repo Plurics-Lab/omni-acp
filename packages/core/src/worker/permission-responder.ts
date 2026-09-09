@@ -1,7 +1,9 @@
 import {
+  OmniError,
   type Clock,
   type InteractionId,
   type MappedPermissionRequest,
+  type OptionChoice,
   type PermissionDecision,
   type PermissionOption,
   type PermissionResponder,
@@ -146,4 +148,37 @@ export function createBaselineResponder(mode: "allow" | "deny", clock: Clock): P
       return { response, record };
     },
   };
+}
+
+/**
+ * The ONE place in the repository an `optionId` may be chosen (§5.8.9, ruling M2-R16).
+ *
+ * The policy engine's whole vocabulary is `PolicyAction`; it never sees and never produces an
+ * option id, and the `policy-never-names-an-option` guard makes that structural rather than
+ * promised. This function is the other half of that split: everything below the engine that has
+ * to turn an "allow" or a "deny" into one of the ids the agent actually offered lives here, and
+ * D4's six hard rules are enforced in exactly this file.
+ *
+ * `cfg.allowSessionGrants` is the knob D4 rule 2's ordering needs once there is an operator
+ * policy: `false` makes a session-scoped grant no better than a plain `allow_once`, which is what
+ * an operator who does not want an approval to outlive one call is asking for. Rule 3 is NOT a
+ * knob — an `allow_always` is never selectable by any value of any field.
+ *
+ * `OptionChoice.optionId === null` is rule 4's "nothing acceptable was offered", and the caller
+ * answers JSON-RPC `-32603`. It never means cancel (rule 5).
+ *
+ * Unimplemented at the Land step ON PURPOSE, and declared here anyway: M2-B-WP-P extracts the
+ * body VERBATIM from `pickAllow` / `pickDeny` / `selectableGrant` above, after which
+ * `permission-responder.test.ts` must pass UNEDITED (§20.2, WP-P acceptance 2). The declaration
+ * is Land's because `packages/core/src/index.ts` is frozen for every work package, so a stub that
+ * did not exist here would turn a WP-P-local extraction into a cross-owner request.
+ *
+ * Owned by M2-B-WP-P.
+ */
+export function selectOption(
+  _action: "allow" | "deny",
+  _offered: readonly PermissionOption[],
+  _cfg: { allowSessionGrants: boolean },
+): OptionChoice {
+  throw new OmniError("internal", "unimplemented: M2-B-WP-P (option selection)");
 }

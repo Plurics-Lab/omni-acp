@@ -52,6 +52,8 @@ packages/client/src/worker.ts                        ← three delegating member
 packages/testkit/src/{index,scripted-agent}.ts       ← +1 generic client-request hook
 packages/testkit/src/stub-daemon.ts                  ← WP-I, WP-C and WP-R all build route tests on it
 tests/compat/src/cases/index.ts                      ← the case registry (the cases/ split, §1.4)
+tests/compat/src/cases/m1.ts                         ← M1's thirteen cases, moved VERBATIM, frozen
+packages/testkit/test/{stub-daemon,seq-ids}.test.ts  ← Land-edited alongside the two src files
 tests/compat/src/cases/support.ts                    ← CompatCase/CompatContext + the shared assertions
 tests/compat/src/{harness,runner,config}.ts
 ```
@@ -60,6 +62,26 @@ The last two rows are the files where six packages could still meet (review R9, 
 this plan already applies elsewhere: **a work package that needs a new shared helper puts it in its own case
 or test file, and a widening of `CompatContext` or of `stubDaemon` is a REQUEST to the Land owner.**
 `stubDaemon` already takes `Partial<Daemon>`, so no work package needs to edit it to override a verb.
+
+**One widening was GRANTED up front** (review follow-up 2), because it was the one gap no work package could
+have closed for itself: `startCompatHarness`'s `config()` **is** "the CI matrix's daemon config" that ruling
+M2-R16's disposition names, and it emitted no `webhooks` and no `diff` block at all — so with
+`WebhookConfig`'s defaults (`enabled:false`, `mode:"allowlist"`, empty `allow`, loopback-bearing
+`denyCidrs`) every delivery in `cases/webhook-run.ts` was refused three ways over, and with
+`diff.provider:"none"` `cases/patch.ts` could only ever observe `patch: null`. Both files are owned; the
+config they needed was in a frozen one. The Land surface therefore now carries three members, and no work
+package may widen it further without asking:
+
+| member | what it is for |
+| ------ | -------------- |
+| `HarnessOptions.config?: (base: DaemonConfig) => DaemonConfig` | a start-time overlay, applied INSIDE the config factory so `restart()` reproduces it rather than silently reverting |
+| `CompatHarness.reconfigure(overlay \| null)` | swaps the overlay and restarts on the SAME `dataDir` — the runtime path, because a webhook receiver's origin is not knowable until it has bound its ephemeral port |
+| `CompatContext.withDaemonConfig(overlay \| null)` | the per-case handle, delegating to `reconfigure`. It restarts, so a case calls it BEFORE `ctx.worker()` |
+
+`runner.ts` forwards an optional `HarnessOptions` from `runCompatSuite` to every agent's harness, which is
+how a CI job pins the matrix-wide config. `denyCidrs: []` belongs in the **webhook case's own overlay**, not
+in the base config: a base that disabled the CIDR gate for the whole matrix would make the compat suite the
+one place CONTRACTS §24.6's SSRF control is never exercised.
 
 **Land-written, then TRANSFERRED permanently** (one owner each, and nobody else may edit them):
 
@@ -238,9 +260,11 @@ return { …, lease,
 
 ### 1.6 What the Land step actually produced, where it differs from §1.1–§1.5, and why
 
-The Land step ran, was reviewed adversarially, and the review's eighteen findings were applied. The rows
-below are the deviations from the plan as written above — each one a decision with a reason, recorded here so
-a work-package owner reads the plan and the tree saying the same thing.
+The Land step ran, was reviewed adversarially, the review's eighteen findings were applied, and a second
+round of ten follow-ups was applied on top of that (rows 17-19, plus the document-consistency fixes recorded
+in the review's 处理记录). The rows below are the deviations from the plan as written above — each one a
+decision with a reason, recorded here so a work-package owner reads the plan and the tree saying the same
+thing.
 
 | # | deviation | why |
 | - | --------- | --- |
@@ -256,10 +280,13 @@ a work-package owner reads the plan and the tree saying the same thing.
 | 10 | the M1 corpus set is NAMED rather than globbed | `07e1086` added seven M2 transcripts without updating the M1 counts, so `corpus.test.ts` and the event-log acceptance were **already red on `main`** — confirmed by stashing and re-running. `corpus.test.ts` now asserts BOTH numbers, 11 M1 and 18 on disk, so a transcript nobody uses is still visible |
 | 11 | F42 is left UNFIXED in `session-open.ts`'s wake path | WP-I acceptance 2 is a regression test written FIRST; landing the fix would leave it passing on arrival. `handshake.ts` already threads `clientCapabilities` and records it AS SENT |
 | 12 | the seven fixture agents and the eight named guard tests were **not** created | they are behaviour, not signatures: each fixture encodes a recorded wire shape its owning package must get right, and several guards are specified as having to be demonstrated FAILING on a planted violation, which a stub cannot do. §3's "guard tests live with their owner" stands |
-| 13 | `Daemon.runs` / `Daemon.deliveries` are REQUIRED members filled by `unimplementedRuns()` / `unimplementedDeliveries()`; only the two list-shaped reads answer empty | every verb answers `bad_request` naming M2-B-WP-R — D29's honest "not implemented yet", the M1 Land precedent. A `list()` returning `[]` would say there are no runs, which is a different and worse lie |
+| 13 | `Daemon.runs` / `Daemon.deliveries` are REQUIRED members filled by `unimplementedRuns()` / `unimplementedDeliveries()`; **every HTTP-reachable verb throws**, and only the dispatcher-internal loop reads (`recover`, `due`, `claim`, `requeueStale`, `deliveries.list`) answer empty | every verb answers `bad_request` naming M2-B-WP-R — D29's honest "not implemented yet", the M1 Land precedent. `runs.list` threw from review follow-up 9 onward, because `registerRunRoutes` registers `GET /v1/runs` unconditionally and an empty array would answer `200 {"runs":[]}` — a client cannot tell that from "you have no runs". `deliveries.list` stays total because its route throws before reaching it, and `recover` because it is a startup path that must not fail a boot |
 | 14 | `AuthContext.assertEnv(undefined)` and `assertMcp(undefined)` answer honestly instead of throwing | a request that asked for no env and no MCP is every M1 request, and refusing it would refuse the whole existing suite. Every non-empty case throws naming M2-B-WP-S. `assertPolicy` always throws — there is no "asked for nothing" reading of a policy question |
 | 15 | `persist/schema.ts` still says `SCHEMA_VERSION = 1`; `agents.{ci,local}.yaml` and `runtime/known.ts`'s new rows are untouched | all three are a work package's, named in §1.1 and §2. The files were transferred, not edited |
 | 16 | four blockers and eleven other findings from the 2026-09-09 review were applied on top of the Land commit | `docs/review/2026-09-09-m2-contract-review.md` carries the per-finding 处理记录. The four blockers were seams that had been declared and not wired: seam D's hunk in `turn-lifecycle.ts`, the raw request on both interaction arms, `Worker.setConfig`'s body, and the testkit's generic client-request hook |
+| 17 | `HarnessOptions.config`, `CompatHarness.reconfigure` and `CompatContext.withDaemonConfig` were added to the frozen compat files | the granted widening of §1.1: `startCompatHarness`'s config factory IS ruling M2-R16's "CI matrix daemon config", and its `webhooks` / `diff` defaults made `cases/webhook-run.ts` and `cases/patch.ts` unrunnable by their own owners (review follow-up 2) |
+| 18 | `selectOption` is DECLARED (throwing `unimplemented: M2-B-WP-P`) in `permission-responder.ts` and exported from the frozen `core` barrel | the one §5.8.9 symbol the Land step missed. `packages/core/src/index.ts` is frozen for every work package, so without the stub WP-P's verbatim extraction — its acceptance bullet 2 — would have been a cross-owner request instead of a local change (review follow-up 8) |
+| 19 | `policy/engine.ts`'s header spells none of the five words `policy-never-names-an-option` forbids | the guard is defined BYTE-WISE with no comment-stripping pass, and the Land step's own prose had planted `optionId` twice inside the directory the guard covers. Settled in the ruling rather than left for WP-P to weaken the check it was told to make absolute (M2-R16, review follow-up 7) |
 
 ---
 
@@ -616,7 +643,7 @@ packages/core/src/runtime/known.ts          ← Land-written, transferred
 packages/daemon/src/{registry,create-daemon,auth,boot-recovery}.ts   ← Land-written, transferred
 packages/daemon/test/**  MINUS http/{interactions,config,runs,webhooks}.test.ts, policy/**, mcp.test.ts
 packages/client/src/{server,local,omni-acp,transport}.ts
-packages/client/test/**  MINUS {lease,interactions,config,runs}.test.ts
+packages/client/test/**  MINUS {interactions,config,runs}.test.ts
 packages/cli/{src,test}/**
 packages/testkit/src/git-fixture.ts
 packages/testkit/test/arch/**
@@ -676,7 +703,7 @@ package already owns.
 
 | Path | Owner |
 | ---- | ----- |
-| root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/core/src/worker/handshake.ts`, `packages/core/src/acp/link.ts`, `packages/core/src/normalizer/turn-lifecycle.ts`, `packages/client/src/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `packages/testkit/src/{index,scripted-agent,stub-daemon}.ts`, `tests/compat/src/{harness,runner,config}.ts`, `tests/compat/src/cases/support.ts` | **Land (frozen)** |
+| root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/core/src/worker/handshake.ts`, `packages/core/src/acp/link.ts`, `packages/core/src/normalizer/turn-lifecycle.ts`, `packages/client/src/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `packages/testkit/src/{index,scripted-agent,stub-daemon}.ts`, `tests/compat/src/{harness,runner,config}.ts`, `tests/compat/src/cases/{support,index,m1}.ts`, `packages/testkit/test/{stub-daemon,seq-ids}.test.ts` | **Land (frozen)** |
 | `packages/core/src/worker/interaction/**`, `packages/core/src/worker/session-open.ts`, `packages/core/src/normalizer/map/elicitation.ts`, `packages/core/test/worker/interaction/**`, `packages/core/test/normalizer/elicitation.test.ts`, `packages/daemon/src/http/routes/interactions.ts`, `packages/daemon/test/http/interactions.test.ts`, `packages/client/src/interactions.ts`, `packages/client/test/interactions.test.ts`, `packages/testkit/src/{interaction-conformance.ts, scripts/elicitation.ts}`, `packages/testkit/fixtures/agents/elicit-*.mjs`, `tests/compat/src/cases/elicitation.ts`, `tests/integration/src/{interaction-park,interaction-timeout,elicitation-gate}.itest.ts`, **and — transferred by review R4, because ruling M2-R3's `payloadVersion` flip is what changes them —** `packages/core/test/normalizer/golden/{03,04,09,10}-*.envelopes.json`, `packages/core/test/normalizer/support/emit.ts`, `packages/core/test/worker/permissions.test.ts` | **M2-A-WP-I** |
 | `packages/core/src/worker/{watchdog,watchdog-state}.ts`, `packages/core/test/worker/{watchdog,watchdog-state}.test.ts`, `packages/protocol/src/turn.ts`, `packages/protocol/test/{turn,turn-golden}.test.ts`, `packages/testkit/src/fake-diff-provider.ts`, `packages/testkit/fixtures/agents/stall-*.mjs`, `tests/compat/src/cases/watchdog.ts`, `tests/integration/src/watchdog.itest.ts` | **M2-A-WP-W** |
 | `packages/core/src/worker/config-options.ts`, `packages/core/test/worker/config-options.test.ts`, `packages/daemon/src/http/routes/config.ts`, `packages/daemon/test/http/config.test.ts`, `packages/client/src/config.ts`, `packages/client/test/config.test.ts`, `tests/compat/src/cases/config-option.ts`, `tests/integration/src/config-option.itest.ts` | **M2-A-WP-C** |
@@ -789,7 +816,9 @@ shows the paired `question_0_custom` property **absent from the wire** (F30's re
 **Step 4 — webhook (a local receiver, both agents).**
 
 - `fakeWebhookReceiver()` on loopback, its origin in `webhooks.allow` — **and `denyCidrs: []` in the setup
-  config above, which is the whole reason it is spelled there** (review R16). CONTRACTS §24.6 makes the CIDR
+  config above, which is the whole reason it is spelled there** (review R16). In the compat suite that
+  config is reached through `ctx.withDaemonConfig` (§1.1), because the receiver's origin is not knowable
+  until it has bound its port. CONTRACTS §24.6 makes the CIDR
   check absolute: an `allow` entry does not exempt an address, so the default `denyCidrs` (which contains
   `127.0.0.0/8`) would `403` every webhook run in this script, in `run-webhook.itest.ts` and in the hermetic
   CI matrix. WP-R acceptance 9's "resolves into `denyCidrs` ⇒ 403" fixture therefore uses a NON-loopback deny

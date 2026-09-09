@@ -613,6 +613,12 @@ function tokenRow(
  * Every verb is `bad_request` naming the work package, which is D29's honest "not implemented
  * yet" and the M1 Land precedent S8 — a 500 would say the daemon broke, and a silent empty list
  * would say there are no runs, which is a different and worse lie.
+ *
+ * `list` throws for exactly that reason (review follow-up 9): its ONE caller is `GET /v1/runs`,
+ * which `registerRunRoutes` registers unconditionally, so an empty array would answer `200
+ * {"runs":[]}` and leave a client unable to tell "this daemon has no run support" from "you have
+ * no runs". `recover` is the deliberate exception — it is a STARTUP path, it must be total, and
+ * "nothing was abandoned" is true of a daemon that never had a run.
  */
 function unimplementedRuns(): RunRegistry {
   const no = (): never => {
@@ -621,7 +627,7 @@ function unimplementedRuns(): RunRegistry {
   return {
     create: () => Promise.reject(new OmniError("bad_request", "runs are not enabled (M2-B-WP-R)")),
     get: no,
-    list: () => [],
+    list: no,
     cancel: () => Promise.reject(new OmniError("bad_request", "runs are not enabled (M2-B-WP-R)")),
     logFor: no,
     recover: () => ({ abandoned: 0 }),

@@ -3233,8 +3233,10 @@ export interface AgentCapabilitiesSnapshot {
  * One entry of the agent's live config catalogue, addressable without reshaping it.
  *
  * F34: the entry's own key is `id` while the REQUEST parameter is `configId` — two different words for
- * the same thing, and `id` is lifted through the descriptor's `configIdField` quirk so this file names
- * neither spelling. `raw` is the agent's object BY IDENTITY (§7.5): codex spells its model id two ways
+ * the same thing. Only the REQUEST word is a quirk (`Quirks.configIdField`, §17.3); the entry key is `id`
+ * on BOTH agents, measured in claude-acp transcript `15` and codex-acp transcript `07` (review R3), so
+ * `viewConfigOptions` reads `id` and there is no second quirk to keep in sync.
+ * `raw` is the agent's object BY IDENTITY (§7.5): codex spells its model id two ways
  * (`models.availableModels[].modelId: "gpt-5.6-sol[low]"` vs `configOptions[model].currentValue:
  * "gpt-5.6-sol"`), so anything that normalized `currentValue` would make a snapshot fail to match itself.
  */
@@ -3469,10 +3471,15 @@ export const WatchdogOverride = z.strictObject({
 /**
  * H28. M0's text-only `.refine` is **DELETED, not widened**, and that is the dangerous half of this
  * diff: zod holds no worker, so it can enforce neither this agent's `promptCapabilities` nor this
- * token's `cwdRoots`, and DESIGN §5.1 requires BOTH. The semantic gate moves into
- * `WorkerRegistry.prompt()` → `assertPromptContent()` (§26), and the `assert-prompt-content-is-called`
- * guard covers the move — a schema that silently stopped enforcing containment looks exactly like a
- * schema that got more capable.
+ * token's `cwdRoots`, and DESIGN §5.1 requires BOTH. The semantic gate moves into **`Worker.prompt()`**
+ * as the injected `deps.validateContent` → `@omni-acp/core`'s `assertPromptContent` (§26.2), which the
+ * daemon's worker-creation path MUST bind to the token's `cwdRoots` and the worker's
+ * `promptCapabilities`. Absent an injection the fallback is `worker.ts`'s deliberately
+ * differently-spelled `assertTextOnlyContent` (M0's text-only whitelist verbatim, review R2), so the
+ * behaviour is unchanged at the Land step and the 400 still comes back — from the worker instead of
+ * from the schema. The `assert-prompt-content-is-called` guard is STRUCTURAL: it asserts the INJECTION,
+ * not a name, because a schema that silently stopped enforcing containment looks exactly like a schema
+ * that got more capable.
  */
 export const PromptRequestBody = z.strictObject({
   content: z.array(ContentBlockLoose).min(1).max(64),
@@ -5023,7 +5030,7 @@ independent readings agree, the ruling is a recording, not a decision.
 | M2-R13 | D9's payload is seven keys. P2 and P3 both add `workerId`. | **Eight keys — `workerId` is added, and D9 is amended, not bent.** `/v1` is keyed on `workerId`; a receiver holding only `sessionId` cannot pull anything back, and the alternative is a `GET /v1/sessions/{sid}` that exists for no other reason. The `webhook-body-is-thin` guard pins the set at exactly eight. |
 | M2-R14 | Refuse `POST /v1/runs` under `eventLog.driver:"memory"`? | **No — allow it and report `RunSnapshot.persistence:"memory"`.** Consistent with `WorkerSnapshot.persistence` and with `local()`'s zero-file promise. A `local()` script gets working runs; it does not get a dead-letter queue, and it is **told so** rather than finding out. |
 | M2-R15 | `elicitation/create` arriving when the capability was NOT declared | **Register the handler always and answer `{action:"decline"}`** — D10's literal text ("仍发来则回 decline / cancel"). Not `-32601`: a `-32601` for a method the spec defines is a worse answer than a decline, and F28 shows the well-behaved case never asks anyway. |
-| M2-R16 | Where does option selection live once there is an engine? | **Below it, unchanged, in `permission-responder.ts`.** The engine's whole vocabulary is `PolicyAction`; it never sees and never produces an `optionId`. `selectOption` is extracted verbatim, `permission-responder.test.ts` passes **unedited**, and the `policy-never-names-an-option` guard fails the build if `core/src/policy/**` so much as contains the string `optionId`. That is what makes "D4's six hard rules preserved" a structural property rather than a promise. |
+| M2-R16 | Where does option selection live once there is an engine? | **Below it, unchanged, in `permission-responder.ts`.** The engine's whole vocabulary is `PolicyAction`; it never sees and never produces an `optionId`. `selectOption` is extracted verbatim, `permission-responder.test.ts` passes **unedited**, and the `policy-never-names-an-option` guard fails the build if `core/src/policy/**` so much as contains the string `optionId`. That is what makes "D4's six hard rules preserved" a structural property rather than a promise. **The literal reading stands, with no comment-stripping pass** (review follow-up 7): a guard that skipped comments would let the next author write the selection rule as prose and then implement it, and the reason it can stand is that a comment which needs one of the five forbidden words is a comment that belongs in `permission-responder.ts`. `engine.ts`'s own header was reworded ("never WHICH option id", "a persisted \"always\" grant") so that the Land step's scaffolding satisfies the guard its author has yet to write. |
 | M2-R17 | A `path`-only policy rule | **A config LOAD error, and a `path` clause matches only when every listed path matches.** F38: codex's `locations[]` under-reports what a call touched, so a path clause can only ever *narrow* an allow some other clause already made — it must never *authorise*. The all-must-match half stops an unlisted second path laundering the first. |
 | M2-R18 | A `cmd` clause on a `tool_call` subject | **Rejected at COMPILE.** F38 again: codex's two-file read carries no `rawInput` at all, so there is nothing for a command regex to match on. Shipping a rule that can never fire is shipping dead policy an operator will plan around. |
 | M2-R19 | May a HUMAN pick an `allow_always` option? | **No by default (`400`, quoting D4 rule 3 and citing F26); `interaction.allowAlways:"human"` is the operator's opt-in and it is LOUD** — `blindsPolicy` on the decision, sticky `WorkerSnapshot.policyBlinded`, and a `TurnWarning{code:"policy_blinded"}` on every subsequent turn. We cannot un-blind the session; we can refuse to be silent about it. |
@@ -7003,7 +7010,7 @@ Each is demonstrated **failing on a planted violation**, per §10.2's rule.
 
 | guard | rule |
 | ----- | ---- |
-| `policy-never-names-an-option` | `packages/core/src/policy/**` may not contain `optionId`, `allow_always`, `allow_once`, `reject_once` or `outcome`, and may not import `PermissionOption` (§20.1) |
+| `policy-never-names-an-option` | `packages/core/src/policy/**` may not contain `optionId`, `allow_always`, `allow_once`, `reject_once` or `outcome`, and may not import `PermissionOption` (§20.1). **Byte-wise over the raw file, comments included** — no comment-stripping pass (M2-R16, review follow-up 7); `engine.ts`'s header is worded to comply, so the guard's author starts from a green directory |
 | `no-elicitation-schema-parse` | no `z.object(` / `.parse(` on elicitation params anywhere under `core/src/**` reached from an elicitation path — a schema parse would strip the `_meta` marker F30 turns on (§19.3) |
 | `interaction-id-is-daemon-minted` | no read of a JSON-RPC `id` as an interaction id (F33) |
 | `assert-prompt-content-is-called` | the daemon's worker-creation path passes `deps.validateContent` (bound to the token's `cwdRoots` and the worker's `promptCapabilities`) and `Worker.prompt` awaits it before anything reaches the wire; the deleted zod refine cannot go silently unreplaced. **Structural, not name-based** — `worker.ts`'s M0 fallback is spelled `assertTextOnlyContent` precisely so a name match cannot stand in for the injection (§26.2, review R2) |

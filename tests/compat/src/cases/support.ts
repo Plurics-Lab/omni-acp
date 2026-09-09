@@ -8,7 +8,13 @@
  * paths; `m1.ts` holds M1's thirteen cases, likewise verbatim, and is FROZEN.
  */
 import { readdir } from "node:fs/promises";
-import { OmniError, reduceTurn, type EventEnvelope, type ProbeSummary } from "@omni-acp/protocol";
+import {
+  OmniError,
+  reduceTurn,
+  type DaemonConfig,
+  type EventEnvelope,
+  type ProbeSummary,
+} from "@omni-acp/protocol";
 import type { Worker } from "@omni-acp/client";
 import { waitGone } from "@omni-acp/testkit";
 import type { CompatAgentConfig } from "../config.js";
@@ -57,6 +63,23 @@ export interface CompatContext {
    * thirteen turns' worth of tokens for assertions that do not need a fresh process.
    */
   worker(): Promise<Worker>;
+  /**
+   * Restart this agent's daemon on the SAME `dataDir` with `overlay` applied to its config, or
+   * `null` to drop a previous overlay (review follow-up 2 → `CompatHarness.reconfigure`).
+   *
+   * The two settings that need it are `webhooks` and `diff`: both are daemon-level, and both have
+   * defaults that make an M2 case vacuous rather than failing — `webhooks.enabled:false` with
+   * `mode:"allowlist"` and an empty `allow` refuses every delivery, and `diff.provider:"none"`
+   * yields `patch: null` forever. Everything else M2 needs is per-worker on `CreateWorkerRequest`
+   * or is built-in preset data, so this is the whole daemon-config surface a case may reach.
+   *
+   * Ruling M2-R16's `denyCidrs: []` belongs in the WEBHOOK CASE'S overlay, not in the harness's
+   * base config: a base that disabled the CIDR gate for everyone would turn the compat matrix
+   * into the one place the SSRF control is never exercised.
+   *
+   * It restarts the daemon, so call it BEFORE `worker()`.
+   */
+  withDaemonConfig(overlay: ((base: DaemonConfig) => DaemonConfig) | null): Promise<void>;
   /** A short prompt, per agent kind — real agents get real English, fixtures get anything. */
   readonly prompts: {
     readonly plain: string;

@@ -192,11 +192,17 @@ function createAuthContext(
 
     policyCeiling: entry.policyCeiling,
 
-    /** D4. Throws `policy_exceeds_ceiling` (403) carrying `{ceiling, offending}` (§20.5). */
-    assertPolicy(sel) {
-      if (sel === undefined && entry.policyCeiling === null) {
-        throw new OmniError("internal", "unimplemented: M2-B-WP-P (policy engine)");
-      }
+    /**
+     * D4. Throws `policy_exceeds_ceiling` (403) carrying `{ceiling, offending}` (§20.5).
+     *
+     * ONE unconditional throw, and no `assertEnv`-shaped carve-out for "no selection, no ceiling"
+     * (review follow-up 10): an absent `env` map or preset list is a request that asked for
+     * nothing and resolves to nothing, but an absent policy selection still has to resolve to an
+     * ENGINE — the baseline the daemon will consult on every permission request — and that engine
+     * is precisely what M2-B-WP-P has yet to write. A branch that threw the byte-identical error
+     * would read as intent while changing no outcome.
+     */
+    assertPolicy(_sel) {
       throw new OmniError("internal", "unimplemented: M2-B-WP-P (policy engine)");
     },
 
