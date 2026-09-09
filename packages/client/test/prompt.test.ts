@@ -67,8 +67,13 @@ describe("Worker.prompt", () => {
     // rather than inventing a `quality` for a patch nobody produced.
     expect(result.patch).toBeNull();
     expect(result.patchInfo).toBeNull();
-    // The fold's two new honest-empty lists (§5.8.5).
-    expect(result.strandedToolCalls).toEqual([]);
+    // M2-A-WP-W, ruling M2-R8. `call_2` is the write this fixture DENIES, and the agent never
+    // sends a terminal `tool_call_update` for it — F36's shape, and exactly what
+    // `strandedToolCalls` reports rather than synthesizing a `failed` nobody sent. The turn is
+    // therefore honestly `partial`; it read `ok` only while the field was the Land step's `[]`
+    // stub (M2-PLAN §1.6 deviation 6).
+    expect(result.strandedToolCalls).toEqual(["call_2"]);
+    expect(result.verdict).toBe("partial");
     expect(result.pendingInteractions).toEqual([]);
     expect(result.error).toBeNull();
     expect(result.usage).toEqual({ used: 1_234, size: 200_000 });

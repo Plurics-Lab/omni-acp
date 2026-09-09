@@ -314,6 +314,16 @@ function readVendorPatch(raw: unknown): TurnResult["vendorPatch"] {
   return { format: "git_patch", text, source };
 }
 
+/**
+ * M2 (§21.3, ruling M2-R8). The two statuses that END a tool call, and the same set the idle
+ * watchdog's open-call fold uses — one definition of "terminal", so the tool budget and
+ * `strandedToolCalls` can never describe different turns.
+ *
+ * `cancelled` is deliberately absent: F36 says neither real agent sends it for a stranded call,
+ * and an agent that volunteered it would still be saying "this did not complete".
+ */
+const TERMINAL_TOOL_STATUS: ReadonlySet<string> = new Set(["completed", "failed"]);
+
 const WARNING_SOURCES: ReadonlySet<string> = new Set([
   "usage_meta",
   "stderr",
@@ -438,7 +448,16 @@ function applySessionUpdate(f: Fold, seq: Seq, payload: Record<string, unknown>)
           f.streamWarnings.push(...readWarnings(meta[WARNINGS_META]));
           // M2, seam D. The reducer that stamped this key does not know what it means; this
           // does, and it is the only place that does (ruling M2-R9).
-          if (PATCH_META in meta) f.patch = readPatch(meta[PATCH_META]);
+          if (PATCH_META in meta) {
+            f.patch = readPatch(meta[PATCH_META]);
+            // D8's "`null` is an answer, and it is always explained" (§25.3). Every warning the
+            // provider produced — `patch_not_a_repo`, `patch_timeout`, `patch_truncated`, … —
+            // rides INSIDE the `PatchResult`, because §25.1 says that block "is the only one a
+            // pure fold can read it from": `omni/warnings` is the REDUCER's own key and a
+            // provider must never be able to write it.
+            const block = record(meta[PATCH_META]);
+            if (block !== null) f.streamWarnings.push(...readWarnings(block["warnings"]));
+          }
         }
       }
       return;
@@ -673,15 +692,29 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
   // still a real denial, so it is kept — dropping it would under-report what we refused.
   const deniedToolCalls = f.denied;
 
-  // STILL EMPTY at the M2 Land step, exactly as `patch` was "STILL null in M1" — the field is
-  // declared here so `TurnResult`'s shape is settled once and every M1 golden gains its key
-  // additively, and M2-A-WP-W computes it (that package owns this file from the Land commit on).
+  // M2-A-WP-W, ruling M2-R8. Tool calls whose LAST observed status is neither `completed` nor
+  // `failed` when the turn ENDED — `null` counts, because "we were never told" is exactly the
+  // condition this reports — and ONLY for a TERMINAL turn, because a running turn strands
+  // nothing (`f.terminal === null` is the "still going" reading, which `running-partial` is).
   //
-  // The rule it will implement, so the reader knows what the empty array is standing in for
-  // (ruling M2-R8): tool calls whose LAST observed status is neither `completed` nor `failed`
-  // when the turn ENDED — `null` counts, because "we were never told" is exactly the condition
-  // this reports — and only for a TERMINAL turn, because a running turn strands nothing.
-  const strandedToolCalls: readonly string[] = [];
+  // F36 is the same fact on both real agents: cancelling with a tool genuinely in flight
+  // produces NO terminal `tool_call_update` at all (claude `16` leaves `"pending"`, codex `08`
+  // leaves `"in_progress"`). Synthesizing `failed` would assert something about the agent that
+  // is not true — the tool may well have completed agent-side — and blocking for a terminal
+  // update would hang the aggregate forever. So we report, in stream order, and the turn is
+  // `partial`.
+  //
+  // This is the ONE place the M2 fold can change an M1 verdict, and it does: a turn that ended
+  // holding a tool call nobody terminalized was never "ok", and two of the twelve golden
+  // transcripts say so (`permission-deny`'s denied write and `tool-call-upsert`'s second call,
+  // both left `pending` at `idle`). M2-PLAN §1.6 deviation 6 is the record that the Land step
+  // saw this coming and left the rule here to be implemented rather than inferred.
+  const strandedToolCalls: readonly string[] =
+    f.terminal === null
+      ? []
+      : toolCalls
+          .filter((c) => c.status === null || !TERMINAL_TOOL_STATUS.has(c.status))
+          .map((c) => c.toolCallId);
   const pendingInteractions = [...f.pending];
 
   const warnings: TurnWarning[] = [...f.streamWarnings];
