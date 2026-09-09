@@ -23,7 +23,12 @@ import type {
   WorkerState,
 } from "@omni-acp/protocol";
 import { buildElicitationContent, mapElicitation } from "../../normalizer/map/elicitation.js";
-import { selectOption } from "../permission-responder.js";
+import {
+  SESSION_WIDE_GRANT_KIND,
+  isSessionWideGrant,
+  selectGrant,
+  selectOption,
+} from "../permission-responder.js";
 import { clientCapabilitiesFor } from "./capability.js";
 import { pendingInteractionEvent, settlementEvents, type ParkBlock } from "./envelopes.js";
 import { createParkTimer } from "./park.js";
@@ -352,7 +357,7 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
     }
 
     if (verdict.action === "allow") {
-      const choice = chooseOption("allow", req.options, { allowSessionGrants: true });
+      const choice = selectGrant(req.options, { allowSessionGrants: true });
       if (choice.optionId !== null) {
         return {
           wire: { kind: "resolve", value: selected(choice.optionId) },
@@ -403,7 +408,7 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
         },
       };
     }
-    const choice = chooseOption("deny", req.options, { allowSessionGrants: true });
+    const choice = selectOption("deny", req.options, { allowSessionGrants: true });
     if (choice.optionId === null) {
       // Rule 4: nothing acceptable was offered. `failed` is the status M1 already used for it, so
       // a settle-time refusal that had a deadline stays `expired`/`cancelled` and an ordinary one
@@ -534,7 +539,7 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
     let chosen: PermissionOption | undefined;
     if (optionId === undefined) {
       // Rule 2's ordering picks when the caller did not: a session-grant id, then `allow_once`.
-      const choice = chooseOption("allow", req.options, { allowSessionGrants: true });
+      const choice = selectGrant(req.options, { allowSessionGrants: true });
       if (choice.optionId === null) {
         throw new OmniError(
           "bad_request",
@@ -563,18 +568,19 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
     // second Write of the same turn complete with NO second permission request, and nothing on
     // the wire announced the grant. `allowAlways:"never"` is the default and applies to EVERY
     // source, a human POST included (ruling M2-R19).
-    const blindsPolicy = chosen.kind === "allow_always";
+    const blindsPolicy = isSessionWideGrant(chosen);
     if (blindsPolicy && o.config.allowAlways !== "human") {
       throw new OmniError(
         "bad_request",
-        `"${chosen.optionId}" has kind "allow_always"; D4 rule 3 forbids selecting one, because ` +
+        `"${chosen.optionId}" has kind "${SESSION_WIDE_GRANT_KIND}"; D4 rule 3 forbids ` +
+          `selecting one, because ` +
           `F26 records that a session-wide grant is announced nowhere on the wire — set ` +
           `interaction.allowAlways: "human" to accept that consequence`,
       );
     }
     if (blindsPolicy) {
       // M2-R19: we cannot un-blind the session; we can refuse to be silent about it.
-      logger.warn("a human selected an allow_always option; the policy engine is now blind", {
+      logger.warn("a human selected a session-wide grant; the policy engine is now blind", {
         requestId: req.id,
         optionId: chosen.optionId,
       });
@@ -792,63 +798,4 @@ function newest(log: Pick<EventLog, "head" | "read"> | undefined): EventEnvelope
   const head = log.head;
   if (head <= 0) return null;
   return log.read((head - 1) as Seq, 1)[0] ?? null;
-}
-
-/**
- * §19.7 rule 2's ONE implementation of the allow ordering, resolved ONCE and lazily.
- *
- * `selectOption` lives in `permission-responder.ts` — M2-B-WP-P's file — and still throws
- * `unimplemented` at this commit, so the probe picks the real one the moment WP-P lands its body
- * and uses the identical rules until then. The rules are D4's, in D4's order: a known
- * session-grant id, then any `allow_once`, and NEVER an `allow_always` by any path (rule 3);
- * `deny` is the offered `reject_once` and nothing else (rule 4).
- */
-const SESSION_GRANT_OPTION_IDS: ReadonlySet<string> = new Set([
-  "allow_session",
-  "approve_for_session",
-]);
-
-type SelectFn = (
-  action: "allow" | "deny",
-  offered: readonly PermissionOption[],
-  cfg: { allowSessionGrants: boolean },
-) => OptionChoice;
-
-const localSelectOption: SelectFn = (action, offered, cfg) => {
-  if (action === "deny") {
-    const reject = offered.find((x) => x.kind === "reject_once");
-    return reject === undefined
-      ? { optionId: null, rule: "d4:rule4-nothing-offered" }
-      : { optionId: reject.optionId, rule: "d4:rule4-reject-once" };
-  }
-  if (cfg.allowSessionGrants) {
-    const grant = offered.find(
-      (x) => SESSION_GRANT_OPTION_IDS.has(x.optionId) && x.kind !== "allow_always",
-    );
-    if (grant !== undefined) return { optionId: grant.optionId, rule: "d4:rule2-session-grant" };
-  }
-  const once = offered.find((x) => x.kind === "allow_once");
-  return once === undefined
-    ? { optionId: null, rule: "d4:rule2-nothing-offered" }
-    : { optionId: once.optionId, rule: "d4:rule2-allow-once" };
-};
-
-let resolvedSelect: SelectFn | null = null;
-
-function chooseOption(
-  action: "allow" | "deny",
-  offered: readonly PermissionOption[],
-  cfg: { allowSessionGrants: boolean },
-): OptionChoice {
-  if (resolvedSelect === null) {
-    try {
-      // A deterministic probe with the one input whose answer is contracted: an empty menu is
-      // rule 4's "nothing acceptable was offered", i.e. `optionId: null` — never a throw.
-      selectOption("deny", [], { allowSessionGrants: true });
-      resolvedSelect = selectOption;
-    } catch {
-      resolvedSelect = localSelectOption;
-    }
-  }
-  return resolvedSelect(action, offered, cfg);
 }

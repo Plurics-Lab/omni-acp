@@ -23,8 +23,16 @@ const SESSION_GRANT_OPTION_IDS: ReadonlySet<string> = new Set([
   "approve_for_session",
 ]);
 
-/** The one kind that is never selected, whatever else is true about the option (D4 rule 3). */
-const FORBIDDEN_KIND = "allow_always";
+/**
+ * The one kind that is never selected, whatever else is true about the option (D4 rule 3).
+ *
+ * EXPORTED, because §19.6 requires the human path's `400` to "quote rule 3", and a message that
+ * spelled the word itself would put a second copy of D4's vocabulary in a second file — which is
+ * the thing ruling M2-R16 and the `policy-never-names-an-option` guard exist to prevent. This
+ * file owns the word; everybody else interpolates it.
+ */
+export const SESSION_WIDE_GRANT_KIND = "allow_always";
+const FORBIDDEN_KIND = SESSION_WIDE_GRANT_KIND;
 
 /** The kinds this responder understands. Anything else is a non-grant (D4 rule 6). */
 const ALLOW_ONCE_KIND = "allow_once";
@@ -136,6 +144,40 @@ export function selectOption(
   const rejection = pickDeny(options);
   if (rejection !== null) return { optionId: rejection.optionId, rule: "d4:4-reject-once" };
   return { optionId: null, rule: "d4:4-nothing-acceptable" };
+}
+
+/**
+ * D4 rule 3's predicate, so that the ONE comparison against the forbidden kind lives here.
+ *
+ * `InteractionStrategy` has to recognise a session-wide grant twice — to refuse one under
+ * `interaction.allowAlways:"never"`, and to stamp `blindsPolicy` on the record when an operator
+ * has opted in (M2-R19) — and neither is a SELECTION, so neither belongs in `selectOption`.
+ * Exporting the predicate rather than the rule keeps `permission-responder.ts` the only shipped
+ * source that names a grant kind in code, which is what makes M2-R16 structural.
+ */
+export function isSessionWideGrant(option: PermissionOption): boolean {
+  return !selectableGrant(option);
+}
+
+/**
+ * Rule 2's ordering ALONE — a grant, or nothing.
+ *
+ * `selectOption("allow", …)` is the POLICY path's door, and its downgrade to the offered
+ * rejection is part of that contract: an engine `allow` that cannot be honoured must still put a
+ * real answer on the wire rather than hang the agent (F1). A HUMAN `allow` is a different caller
+ * with a different answer — §19.6's `400`, because recording `decision:"allow"` beside an option
+ * that in fact denies would make the audit trail say the opposite of what happened — so it asks
+ * this instead. Both walk the SAME `pickAllow`, which is all §19.7 rule 2's "one implementation"
+ * has ever meant.
+ */
+export function selectGrant(
+  offered: readonly PermissionOption[],
+  cfg: { allowSessionGrants: boolean },
+): OptionChoice {
+  const grant = pickAllow(narrowOptions(offered), cfg.allowSessionGrants);
+  return grant === null
+    ? { optionId: null, rule: "d4:2-nothing-acceptable" }
+    : { optionId: grant.option.optionId, rule: grant.rule };
 }
 
 /**
