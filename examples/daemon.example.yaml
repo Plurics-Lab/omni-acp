@@ -13,6 +13,15 @@ tokens:
     agents: ["claude-acp", "codex-acp"] # or "*"
     cwdRoots: ["/srv/alice"] # realpath containment: a worker's cwd must live under one of these
     maxWorkers: 4
+    # ── M2: what this token may ASK FOR. Every one FAILS CLOSED. ──────────────
+    # The widest verdict this token's rules may reach. A request that exceeds it is
+    # `403 policy_exceeds_ceiling` at CREATE — before a process exists.
+    policyCeiling: { maxAction: park, denyKinds: [delete], commands: false, park: true }
+    policyPresets: ["readonly", "src-edit"] # or "*"; absent = "*"
+    mcpPresets: [] # DEFAULTS TO [] and not "*": an MCP server is arbitrary code on this machine
+    envAllow: [] # keys this token may set on a worker; the hard blacklist always wins
+    # A token with no signing key cannot create a webhook run at all.
+    webhookSecret: replace-me-too-32-random-chars-00
 
 agents:
   - id: claude-acp
@@ -23,3 +32,54 @@ agents:
     args: ["-y", "@agentclientprotocol/codex-acp@1.8.0"]
 
 hibernate: { idleMs: 1800000 } # 30 min idle -> process reclaimed, session kept; next prompt wakes it
+
+# ── M2 ────────────────────────────────────────────────────────────────────────
+
+# D4. The preset a worker gets when the request names none. `deny-all` is the fail-closed default;
+# an operator may REPLACE a shipped preset by declaring the same name here.
+policy:
+  default: deny-all
+  presets:
+    src-edit-strict:
+      extends: readonly
+      default: park
+      rules:
+        - { id: e1, match: { kind: [edit], path: ["src/**"] }, action: allow }
+        - { id: d1, match: { kind: [delete] }, action: deny }
+
+# What a PARKED interaction does when nobody answers. `allow` is deliberately not a value: an
+# auto-allow on a timer is a remote-execution primitive whose only guard is a clock.
+interaction:
+  parkTimeoutMs: 600000 # 0 = wait for a human forever
+  parkTimeoutAction: deny
+  allowAlways: never # "human" lets an operator pick an allow_always, and marks the worker blinded
+  maxParked: 8
+
+# DESIGN §7's dual budget. `silentMs` = nothing appended at all; `toolMs` = at least one tool call
+# open (an `npm install` that says nothing for 20 minutes is normal). `cancelTimeoutMs` MUST exceed
+# `turn.cancelGraceMs`, and the config refuses to load otherwise.
+watchdog: { enabled: true, silentMs: 300000, toolMs: 1800000, cancelTimeoutMs: 60000 }
+
+# D8. `none` (the default) never runs git; `git` produces `TurnResult.patch` from a temp index, so
+# the operator's own index and worktree are never touched. `tmpDir` must be OUTSIDE every worktree.
+diff: { provider: git, mode: on_write, timeoutMs: 15000, maxBytes: 4194304 }
+
+# D9. The daemon's first OUTBOUND surface, so all three gates default closed. `denyCidrs` is
+# absolute: an `allow` entry does not exempt an address (SSRF, and rebinding after it).
+webhooks:
+  enabled: false
+  mode: allowlist
+  allow: ["https://hooks.example.com"]
+  denyCidrs: ["127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "::1/128"]
+  secrets: { ci: replace-me-with-32-random-chars-000 }
+  timeoutMs: 10000
+
+# MCP servers are named by PRESET; a client can never put a command on the wire (DESIGN §8).
+mcpServers:
+  fs-readonly:
+    type: stdio
+    command: /usr/local/bin/mcp-fs
+    args: ["--readonly", "/srv/alice"]
+
+# Extends the hard environment blacklist; it can never shrink it.
+envDeny: ["MY_CI_TOKEN"]

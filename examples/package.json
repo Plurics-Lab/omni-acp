@@ -11,7 +11,9 @@
   "scripts": {
     "local": "node 01-local.mjs",
     "remote": "node 02-remote.mjs",
-    "daemon": "omni-acp start --config daemon.example.yaml --print-token"
+    "daemon": "omni-acp start --config daemon.example.yaml --print-token",
+    "interactive": "node 03-interactive.mjs",
+    "run-webhook": "node 04-run-webhook.mjs"
   },
   "dependencies": {
     "@omni-acp/cli": "workspace:*",
