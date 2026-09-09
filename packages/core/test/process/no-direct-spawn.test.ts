@@ -296,4 +296,39 @@ describe("guard: no-direct-spawn", () => {
       expect(source).not.toMatch(/from\s+["']\.\/spawn\.js["']/);
     });
   });
+
+  // ── M2's third launch site: the git diff provider (§27.4, "existing, extended") ────────────
+  //
+  // D8 runs `git` on every turn, in a directory a client chose, while a human may be using the
+  // same repository. It is the largest new process surface in M2 and it goes through the SAME
+  // injected `RunUtility` — which is what lets `git-provider.test.ts` run on a machine with no
+  // git at all, and what keeps the allowlist at one file.
+  describe("M2's git provider stays behind the same seam", () => {
+    const covered = (path: string): SourceFile => {
+      const file = files.find((f) => f.path === path);
+      if (file === undefined) throw new Error(`the scan does not cover ${path}`);
+      return file;
+    };
+
+    for (const path of [
+      "packages/core/src/diff/git-provider.ts",
+      "packages/core/src/diff/temp-index.ts",
+      "packages/core/src/diff/worktrees.ts",
+      // The fixture that BUILDS the repositories these tests diff. It creates `.git/` with
+      // `node:fs` precisely so that it needs neither a spawn nor `@omni-acp/core` (§3.1's DAG).
+      "packages/testkit/src/git-fixture.ts",
+    ]) {
+      it(`${path} is scanned, and imports nothing from node:child_process`, () => {
+        const file = covered(path);
+        expect(moduleReferences(file)).toEqual([]);
+        expect(spawnCallSites(file)).toEqual([]);
+      });
+    }
+
+    it("git-provider.ts reaches git only through the injected RunUtility", () => {
+      const source = covered("packages/core/src/diff/git-provider.ts").text;
+      expect(source).toContain("RunUtility");
+      expect(source).not.toMatch(/from\s+["'][^"']*process\/spawn\.js["']/);
+    });
+  });
 });

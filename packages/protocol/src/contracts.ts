@@ -222,7 +222,23 @@ export interface PlatformOwnership {
 export type RunUtility = (
   file: string,
   args: readonly string[],
-  o: { timeoutMs: number },
+  o: {
+    timeoutMs: number;
+    /**
+     * Extra variables for the child, MERGED OVER the parent's environment (never replacing it —
+     * `git` needs `PATH`, and a utility that lost it would fail with ENOENT on every platform).
+     *
+     * M2-WP-J widened this options object by exactly this one optional field, and it is
+     * load-bearing rather than convenient: D8's technique is `GIT_INDEX_FILE=$tmp git add -A`,
+     * and `GIT_INDEX_FILE` has **no command-line spelling** — the temp index that keeps us off
+     * the user's own index is reachable only through the environment (§25.2). Every other flag
+     * the provider needs (`-C`, `--no-ext-diff`, `--no-textconv`) is argv, and is spelled there.
+     *
+     * Optional and additive: an implementation written against the M0 shape (`{timeoutMs}`) is
+     * still assignable to this type and simply ignores it.
+     */
+    env?: Readonly<Record<string, string>>;
+  },
 ) => Promise<{ code: number | null; stdout: string }>;
 
 /** Platform-specific operations. Chosen ONCE, at Supervisor construction — never at kill time. */

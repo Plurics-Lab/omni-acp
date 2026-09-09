@@ -347,7 +347,7 @@ export async function spawnAgentProcess(
 export function runUtility(
   file: string,
   args: readonly string[],
-  o: { timeoutMs: number },
+  o: { timeoutMs: number; env?: Readonly<Record<string, string>> },
 ): Promise<{ code: number | null; stdout: string }> {
   return new Promise<{ code: number | null; stdout: string }>((resolve, reject) => {
     let child: ChildProcess;
@@ -358,6 +358,11 @@ export function runUtility(
         stdio: ["ignore", "pipe", "ignore"],
         shell: false,
         windowsHide: true,
+        // MERGED over the parent's, never replacing it: `git` resolved through `PATH` is the
+        // whole reason the diff provider can spell `"git"` rather than an absolute path, and a
+        // child that lost `PATH` would fail with ENOENT on every platform (§25.2, M2-WP-J).
+        // Absent ⇒ `env` is omitted entirely, which is M0's inherit-everything behaviour.
+        ...(o.env === undefined ? {} : { env: { ...process.env, ...o.env } }),
       });
     } catch (e) {
       reject(new OmniError("internal", `could not run "${file}": ${messageOf(e)}`, { cause: e }));
