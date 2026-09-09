@@ -1,11 +1,22 @@
 # Raw JSON-RPC transcripts — `claude-acp` 0.73.0
 
-Ground truth for the M1 Normalizer (DESIGN §6.1 / §6.2). Every file here is a byte-level record of what
-`npx -y @agentclientprotocol/claude-agent-acp@0.73.0` actually put on the wire on 2026-09-04, Linux,
-node 22.23.2, against a logged-in Claude Code. **Nothing is hand-written or reconstructed.**
+Ground truth for the Normalizer (DESIGN §6.1 / §6.2) and, from file 11 on, for M2 (DESIGN §11). Every file
+here is a byte-level record of what `npx -y @agentclientprotocol/claude-agent-acp@0.73.0` actually put on the
+wire, Linux, node 22.23.2, against a logged-in Claude Code. **Nothing is hand-written or reconstructed.**
 
-These are observations, not a spec. Where the adapter contradicts DESIGN §6.1, the adapter is what M1 has
-to ship against; the deltas are collected in "What the Normalizer contract must accommodate" below.
+Two recording sessions, same pinned adapter version:
+
+- **01–10** — 2026-09-04, the M1 corpus.
+- **11–17** — 2026-09-09, the M2 corpus: permission ALLOW-with-updates, elicitation (declared / declined /
+  not-declared control), `session/set_config_option`, cancel with a tool genuinely in flight, and
+  `resource_link` prompt content inside and outside `cwd`.
+
+The adapter version is pinned; the Claude Code host under it is not. Between the two sessions the wire
+surface moved on its own — see finding 16.
+
+These are observations, not a spec. Where the adapter contradicts DESIGN §6.1, the adapter is what we have
+to ship against; the deltas are collected in "What the Normalizer contract must accommodate" (findings 1–15,
+from the M1 corpus) and "What the M2 contract must accommodate" (findings 16–26) below.
 
 ## File format
 
@@ -19,7 +30,9 @@ One JSON object per line:
 ```
 
 `dir: "meta"` lines are the recorder's own annotations — `process_spawn`, `scenario`, `permission_decision`,
-`probe_method`, `workspace_after`, `process_exit`. They are not wire traffic; drop them when replaying.
+`elicitation_decision`, `config_option_probe`, `config_option_choice`, `prompt_content`, `cancel_trigger`,
+`prompt_done`, `probe_method`, `workspace_after`, `external_after`, `process_exit`. They are not wire
+traffic; drop them when replaying.
 
 Redaction: the recorder replaced the absolute home-dir prefix with `~` on write. No such prefix appears in
 the result — the workspaces are all `mkdtemp` dirs under `/tmp`, and those paths are left intact because the
@@ -34,16 +47,28 @@ stdio pipes — no SDK, no daemon — so that nothing in this corpus is filtered
 
 1. `spawn("npx", ["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"], { stdio: ["pipe","pipe","pipe"], detached: true })`
 2. `→ initialize { "protocolVersion": 1, "clientCapabilities": {} }` — deliberately empty, per D3.
+   **Exception:** scenarios 12 and 13 send
+   `{ "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false, "elicitation": { "form": {}, "url": {} } }`,
+   the `ElicitationCapabilities` shape from the v1 `schema.json` (`form` / `url`, each `{}` = supported).
+   Scenario 14 is the control: the identical prompt with `clientCapabilities: {}`.
 3. `→ session/new { "cwd": "<mkdtemp workspace>", "mcpServers": [] }` (scenario 07 sends `session/load` instead)
 4. `→ session/prompt { sessionId, prompt: [{ "type": "text", "text": "…" }] }`
 5. Agent→client requests are answered by a responder we control:
    - `session/request_permission` → `{ "outcome": { "outcome": "selected", "optionId": <chosen> } }`, choosing
      the offered option whose `kind` is `allow_once` (allow scenarios) or `reject_once` (deny scenario).
      **Never** `allow_always`, per D4 rule 3.
+   - `elicitation/create` → `{ "action": "accept", "content": { … } }` (scenario 12) or
+     `{ "action": "decline" }` (scenario 13). The accept content is built mechanically from
+     `requestedSchema.properties`: first `oneOf` const for a choice property, the literal string
+     `"omni-choice.txt"` for a free-text one.
    - anything else → JSON-RPC error `-32601`.
-6. Teardown: close stdin, `SIGTERM` the process group, then `SIGKILL`.
+6. Teardown: close stdin, `SIGTERM` the process group, then `SIGKILL`. (Files 12–17 keep the stderr that
+   arrives during teardown; file 11 was written before that flush order was fixed and ends at the last
+   wire message.)
 
-Client→agent request ids start at 1 and increment per process.
+Client→agent request ids start at 1 and increment per process. Cancel scenarios trigger off an observed
+event, not a fixed clock: 16 sends `session/cancel` 5 s after the permission answer, so the tool is really
+running when it lands.
 
 ## The transcripts
 
@@ -61,23 +86,35 @@ Client→agent request ids start at 1 and increment per process.
 | `09-permission-bad-option-id.jsonl` | Malformed permission answer | Same as 03, but the responder returned `{ outcome: "selected" }` with `optionId: undefined` | Kept deliberately. The agent does **not** fail the turn: each tool call goes `status: "failed"` with `rawOutput: "Tool permission request failed: Error: Permission option was not offered: undefined"`, and the turn still ends `end_turn`. This is the observed cost of D4 rule 1 being violated. |
 | `10-tool-edit-existing.jsonl` | Edit an existing file | *"In config.txt change slow to fast."* | `end_turn`. The only transcript with a diff whose `oldText` is non-null, and the one that shows `structuredPatch`. |
 
+### M2 (2026-09-09) — DESIGN §11
+
+| File | Scenario | Prompt / probe | Outcome |
+| --- | --- | --- | --- |
+| `11-permission-allow-with-updates.jsonl` | Permission ALLOW with `allow-with-updates` | *"Create a file a.txt containing exactly: A. Then create a file b.txt containing exactly: B. Then reply DONE."*, first permission answered `allow-with-updates` (`kind: allow_always`) | `end_turn`, **both** files written after **one** `request_permission`. The second Write is silent — no second request, and no notification announces the session-wide grant. |
+| `12-elicitation-declared-accept.jsonl` | Elicitation, declared, accepted | `clientCapabilities.elicitation = {form:{},url:{}}`; *"Before doing anything, ask me one clarifying question about which file name to use, wait for my answer, then create that file."* | `elicitation/create` (`mode: "form"`) arrives at 11.1 s. Answered `{action:"accept", content:{question_0:"notes.md", question_0_custom:"omni-choice.txt"}}` → the agent used the **custom** answer and created `omni-choice.txt`. `end_turn`. |
+| `13-elicitation-declared-decline.jsonl` | Elicitation, declared, declined | same caps + prompt | Answered `{action:"decline"}`. The `AskUserQuestion` tool call ends **`status: "completed"`** (not `failed`) with `rawOutput: "The user did not answer the questions."`; nothing written; `end_turn`. Also shows a read-only `ls -A <cwd>` Bash call (`kind: execute`) running with **no** permission request. |
+| `14-elicitation-not-declared-control.jsonl` | Control: elicitation **not** declared | `clientCapabilities: {}`, identical prompt | **No `elicitation/create`, no tool call at all.** The agent asks its question as prose and ends the turn. The capability gate is real. |
+| `15-set-config-option-model.jsonl` | `session/set_config_option` → model | `{configId:"model", value:"haiku"}` (chosen from `session/new`'s `configOptions`), then *"Reply with exactly the word PONG."* | Result `{ configOptions }` with `model.currentValue:"haiku"`, and the turn's `_meta.quota.model_usage[0].model` is `claude-haiku-4-5-20251001`. **No `config_option_update` notification.** The returned list **shrinks** from 4 options to 2. |
+| `16-cancel-during-tool-call.jsonl` | Cancel with a tool genuinely in flight | *"Run the shell command `python3 -c 'import time; time.sleep(30); print(\"WOKE\")'` and then reply DONE."*; permission answered `allow-once` at 6.97 s, `session/cancel` at 11.97 s | `stopReason: "cancelled"` 31 ms later. The in-flight tool call gets **no terminal `tool_call_update`** — its last status is the opening `tool_call`'s `"pending"`. |
+| `17-resource-link-in-and-outside-cwd.jsonl` | `resource_link` prompt content, in and out of `cwd` | `[text, resource_link(file://<cwd>/inside.txt), resource_link(file://<other tmpdir>/outside.txt)]` | Both accepted. The in-`cwd` Read runs silently; the out-of-`cwd` Read raises `request_permission` with `_meta.permission.description: "Reason: Path is outside allowed working directories"`. Answered `allow-once` → the agent read and echoed `OUTSIDE-SECRET-BETA`. |
+
 ## Every JSON-RPC method observed
 
-Client → agent (11 processes, 407 recorded lines total):
+Client → agent (18 processes, 794 recorded lines total):
 
 | Method | Calls | Result |
 | --- | --- | --- |
-| `initialize` | 11 | `{ protocolVersion: 1, agentCapabilities, agentInfo, authMethods: [], _meta }` |
-| `session/new` | 10 | `{ sessionId, modes, configOptions }` |
-| `session/prompt` | 10 | `{ stopReason, usage, _meta.quota }` |
-| `session/set_config_option` | 3 | `-32602` when called with `optionId`; **`{ configOptions }` when called with `configId`**; `-32603 Internal error` + `data.details: "Invalid value for config option model: no-such-model-xyz"` for a bad value |
+| `initialize` | 18 | `{ protocolVersion: 1, agentCapabilities, agentInfo, authMethods: [], _meta }`. `agentCapabilities` never mentions elicitation — the client capability is what gates it. |
+| `session/new` | 17 | `{ sessionId, modes, configOptions }` |
+| `session/prompt` | 17 | `{ stopReason, usage, _meta.quota }` |
+| `session/set_config_option` | 4 | `-32602` when called with `optionId`; **`{ configOptions }` when called with `configId`** (`15` changes the model for real); `-32603 Internal error` + `data.details: "Invalid value for config option model: no-such-model-xyz"` for a bad value. **Never emits a `config_option_update` notification.** |
 | `session/set_model` | 2 | `-32601` both times — **not implemented by this adapter** |
 | `session/resume` | 2 | `-32002 "Resource not found: <sessionId>"` when `cwd` does not match; **`{ sessionId, modes, configOptions }` when it does**. Accepts and ignores `replayFrom`. |
 | `session/set_options` | 1 | `-32601` |
 | `session/set_mode` | 1 | `{}` , plus one `config_option_update` notification |
 | `session/load` | 1 | `{ sessionId, modes, configOptions }`, preceded by replay notifications |
 | `session/list` | 1 | `{ sessions: [{ sessionId, cwd, title, updatedAt }, …] }` |
-| `session/cancel` | 1 | notification, no response |
+| `session/cancel` | 2 | notification, no response |
 | `session/notification` | 1 | `-32601` |
 | `omni/definitely_unknown_method` | 1 | `-32601` |
 
@@ -85,26 +122,29 @@ Agent → client:
 
 | Method | Calls | Notes |
 | --- | --- | --- |
-| `session/update` | 216 | Always a notification (never carries `id`). Params are exactly `{ sessionId, update }`. |
-| `session/request_permission` | 7 | Request. **Ids start at 0** and are a counter independent of the client's. |
+| `session/update` | 353 | Always a notification (never carries `id`). Params are exactly `{ sessionId, update }`. |
+| `session/request_permission` | 11 | Request. **Ids start at 0** and are a counter independent of the client's. |
+| `elicitation/create` | 2 | Request, only in `12`/`13` — i.e. only when the client declared `elicitation`. **Shares the same id counter as `session/request_permission`** (`12`: elicitation is id 0, the later permission is id 1). |
 
 Unknown-method error shape is uniform:
 `{ "code": -32601, "message": "\"Method not found\": <method>", "data": { "method": "<method>" } }`.
 
 ## Every `session/update` kind observed
 
-| `sessionUpdate` | Total | 01 | 02 | 03 | 04 | 05 | 05b | 06 | 07 | 08 | 09 | 10 |
-| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |
-| `agent_message_chunk` | 85 | 2 | 4 | 8 | 5 | 29 | 16 | 1 | 3 | · | 7 | 10 |
-| `usage_update` | 60 | 4 | 6 | 6 | 7 | 8 | 6 | 2 | 4 | · | 9 | 8 |
-| `tool_call_update` | 36 | · | 3 | 4 | 3 | 8 | 4 | · | · | · | 6 | 8 |
-| `available_commands_update` | 23 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 3 | 2 | 2 |
-| `tool_call` | 10 | · | 1 | 1 | 1 | 2 | 1 | · | · | · | 2 | 2 |
-| `user_message_chunk` | 1 | · | · | · | · | · | · | · | 1 | · | · | · |
-| `config_option_update` | 1 | · | · | · | · | · | · | · | · | 1 | · | · |
+| `sessionUpdate` | Total | 01 | 02 | 03 | 04 | 05 | 05b | 06 | 07 | 08 | 09 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| `agent_message_chunk` | 126 | 2 | 4 | 8 | 5 | 29 | 16 | 1 | 3 | · | 7 | 10 | 3 | 14 | 3 | 18 | 1 | · | 2 |
+| `usage_update` | 93 | 4 | 6 | 6 | 7 | 8 | 6 | 2 | 4 | · | 9 | 8 | 5 | 7 | 7 | 3 | 3 | 3 | 5 |
+| `tool_call_update` | 69 | · | 3 | 4 | 3 | 8 | 4 | · | · | · | 6 | 8 | 8 | 7 | 7 | · | · | 3 | 8 |
+| `available_commands_update` | 37 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 3 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+| `tool_call` | 19 | · | 1 | 1 | 1 | 2 | 1 | · | · | · | 2 | 2 | 2 | 2 | 2 | · | · | 1 | 2 |
+| `session_info_update` | 7 | · | · | · | · | · | · | · | · | · | · | · | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| `user_message_chunk` | 1 | · | · | · | · | · | · | · | 1 | · | · | · | · | · | · | · | · | · | · |
+| `config_option_update` | 1 | · | · | · | · | · | · | · | · | 1 | · | · | · | · | · | · | · | · | · |
 
-**Never observed, across all 11 runs:** `plan`, `agent_thought_chunk`, `current_mode_update`,
+**Never observed, across all 18 runs:** `plan`, `agent_thought_chunk`, `current_mode_update`,
 `state_update`, `available_terminals_update`. Their absence is itself a contract input — see the gaps below.
+`session_info_update` appears in **every** M2 run and **no** M1 run — see finding 16.
 
 ## What the Normalizer contract must accommodate
 
@@ -213,9 +253,119 @@ will order that update after events that belong to the turn.
 
 **15. Timings, for the descriptor.** `initialize` 0.94–1.03 s warm (the M0 smoke measured ~7 s cold);
 `session/new` a further 0.49–0.52 s; `session/load` with replay 0.55 s. Plain-answer turn 3.15 s; read-tool turn 5.19 s;
-write-with-permission turn 4.98 s; edit-existing turn 7.38 s.
+write-with-permission turn 4.98 s; edit-existing turn 7.38 s. The M2 runs agree: `initialize` 0.94–1.10 s
+warm (14.5 s once, cold npx, in `11`), `session/new` a further 0.82–0.95 s. Turns: one-word 1.77 s (`15`,
+on Haiku), prose-only 4.27 s, two writes under one grant 5.28 s, two reads via `resource_link` 6.09 s,
+elicitation round-trip 12.4 s accept / 15.4 s decline (the agent thinks before and after asking).
+
+## What the M2 contract must accommodate
+
+**16. `session_info_update` is on the wire now, and was not five days earlier.** All seven M2 runs emit
+exactly one per turn — `{ sessionUpdate: "session_info_update", title, updatedAt }` — and it lands **5–22 ms
+*after* `session/prompt` resolves**, in every single run. None of the eleven M1 runs emitted it, against the
+same pinned adapter version. The adapter version pins the adapter, not the Claude Code host under it, so the
+wire surface can move with no version change: the Runtime descriptor must be tolerant of new
+`sessionUpdate` kinds appearing at runtime, and §6.1 needs an explicit row (or an explicit drop) for this
+one. It is also the strongest form of finding 14 — **the turn does not end when `session/prompt` resolves**,
+now 7/7 rather than 1/1. M2's idle watchdog must start its quiet window *after* the last update, not at the
+response, or it will race a post-response update on literally every turn.
+
+**17. `allow-with-updates` really is a session-wide grant, and nothing on the wire announces it** (`11`).
+Answering the *first* `edit` permission with `optionId: "allow-with-updates"` (`kind: allow_always`) let the
+*second* Write of the same turn complete with **no second `session/request_permission`**: one request, two
+files on disk, `end_turn`. No `config_option_update`, no `current_mode_update`, no `session_info_update`
+field, nothing reports the grant. This is the measured cost of breaking D4 rule 3: after a single
+`allow_always` the daemon's policy engine is simply never consulted again for that session, and it receives
+no event telling it so. `allow_once` per call is the only setting under which every tool call passes policy.
+
+**18. The `allow_always` option's `name` is contextual; only `kind` and `optionId` are stable.** The same
+`{ optionId: "allow-with-updates", kind: "allow_always" }` arrived as three different names across the M2
+runs: *"Yes, allow all edits during this session"* (Write, `11`), *"Yes, and don't ask again for similar
+commands"* (Bash, `16`), *"Yes, allow reading from omni-m2-external-…/ during this session"* (Read outside
+`cwd`, `17`) — the last one even embeds a path. A policy engine that matches on `name` will mis-classify;
+match on `kind`, fall back to `optionId`, never on `name`.
+
+**19. Elicitation is gated on the *client* capability, and this adapter honours the gate.** With
+`clientCapabilities.elicitation = { form: {}, url: {} }` the "ask me a clarifying question first" prompt
+produced a real agent→client `elicitation/create` request (`12`, `13`). With `clientCapabilities: {}` and the
+byte-identical prompt (`14`) there is **no `elicitation/create` and no tool call at all** — the model asks its
+question as prose and ends the turn. `agentCapabilities` in the `initialize` response never mentions
+elicitation either way. That is D10's gating confirmed end to end: declaring elicitation only when
+`onUnresolved: "park"` genuinely changes agent behaviour, and *not* declaring it is safe — the agent degrades
+to prose rather than erroring, hanging, or guessing.
+
+**20. `elicitation/create` params, v1, as observed.**
+`{ mode: "form", sessionId, toolCallId, message, requestedSchema }`. The `ElicitationSessionScope` fields are
+**flattened into `params`**, not nested under a `scope` key, matching the schema's `allOf` composition — an
+M2 type that models scope as a nested object will not parse this. `requestedSchema` is
+`{ type: "object", properties: {…} }` with **no `required` array** in either observation, and no schema-level
+`title`/`description`. Only `mode: "form"` was seen; no `url` mode, no `elicitation/complete` notification,
+and no request-scoped (`requestId`) elicitation. The request is generated by Claude Code's `AskUserQuestion`
+tool and is mirrored in the stream as a `tool_call` with `_meta.claudeCode.toolName: "AskUserQuestion"`,
+`kind: "other"`, `title: "Asking for your input"` — so the same interaction shows up twice, once as a
+request the daemon must answer and once as a tool call it must not double-count.
+
+**21. Choices arrive as `oneOf`, not `enum`, and each question carries a paired free-text property.** One
+question becomes two properties: `question_0` (`type: "string"`, `title`, `oneOf: [{const, title,
+description}, …]`) and `question_0_custom` (`type: "string"`, `title: "Other"`, marked by
+`_meta._askUserQuestionCustomAnswer: { questionId: "question_0", isCustomAnswer: true }`). Our accept filled
+**both** — `{ question_0: "notes.md", question_0_custom: "omni-choice.txt" }` — and the agent used the
+**custom** one, creating `omni-choice.txt` and not `notes.md`. So the `_meta` marker silently wins, and a
+client that fills every declared property overrides the user's actual selection. M2's
+`worker.on("interaction", …)` → `answer(...)` mapping must send exactly one value per `questionId`, and must
+read `oneOf[].const` (the schema's own note says single-select uses "`enum` **or** `oneOf`").
+
+**22. Accept and decline both end the turn `end_turn`, and both leave the tool call `completed`.** Accept
+(`12`): `AskUserQuestion` → `status: "completed"`, `rawOutput: "The user answered: \"…\"=\"omni-choice.txt\". …"`,
+file written. Decline (`13`): the same tool call → **`status: "completed"` as well** (not `failed`),
+`rawOutput: "The user did not answer the questions."` plus a matching `content` block, nothing written, and
+the agent explains in prose. As with a denied permission (finding 7), `stopReason` carries no signal — and
+here neither does `tool_call_update.status`, which is the one place finding 7 said to look. The daemon must
+record the InteractionRequest outcome itself; `deny` and `parkTimeoutAction` results cannot be recovered
+from the agent's stream at all.
+
+**23. `session/set_config_option{configId:"model"}` works, notifies nothing, and returns a list that can
+shrink** (`15`). `{ configId: "model", value: "haiku" }` → `{ configOptions: [...] }` with
+`model.currentValue: "haiku"`; the next turn's `_meta.quota.model_usage[0].model` is
+`claude-haiku-4-5-20251001`, so the switch is real, not cosmetic. Two traps for `POST /v1/workers/{wid}/config`:
+(a) **no `config_option_update` notification is emitted** — unlike `session/set_mode`, which does notify
+(finding 11) — so `configOptions` on the snapshot must be refreshed from the method's own result, never from
+the event stream; (b) the result is a **full replacement whose membership changes**: `session/new` returned
+four options (`mode`, `model`, `effort`, `fast`) and the post-set result returned **two** (`mode`, `model`),
+because Haiku exposes no effort levels. Merging by `id` would leave a phantom `effort` on the snapshot that
+no longer exists — replace the list wholesale.
+
+**24. Cancelling a turn with a tool genuinely in flight strands that tool call with no terminal status**
+(`16`). Timeline: `tool_call` (`pending`) 6.07 s → `request_permission` 6.97 s → answered `allow-once`
+6.97 s → the 30-second sleep is running → `session/cancel` 11.97 s → `usage_update` 11.99 s →
+`stopReason: "cancelled"` 12.00 s. Between the permission answer and the response the tool call received
+**no `tool_call_update` at all**: no `failed`, no `cancelled`, no `completed`; its last observed `status` is
+the opening frame's `"pending"`. (`06` cancelled a turn with nothing in flight and so never showed this.)
+A cancelled turn can therefore leave tool calls non-terminal forever. M2's watchdog `cancel_timeout` close
+must synthesize the terminal status itself, and `TurnResult` aggregation must not block waiting for one.
+
+**25. `resource_link` prompt content is accepted, resolved by the agent, and contained only by a permission
+prompt** (`17`). A prompt of `[text, resource_link(file://<cwd>/inside.txt),
+resource_link(file://<other tmpdir>/outside.txt)]` was accepted with no error and no `promptCapabilities`
+complaint (`initialize` advertises `promptCapabilities: { image: true, embeddedContext: true }` — nothing
+about resource links). The agent expanded each link into its **own** `Read` tool call with the resolved
+absolute path in `rawInput.file_path` and in `locations[]`. The in-`cwd` read ran with **no permission
+request**. The out-of-`cwd` read raised a `session/request_permission` whose only distinguishing marker is
+the vendor string `_meta.permission.description: "Reason: Path is outside allowed working directories"` —
+a `_meta` string, not a field, and the `kind` is plain `read` like any other. We answered `allow-once` and
+the agent read and echoed `OUTSIDE-SECRET-BETA`. So the agent will read anywhere on disk the client permits:
+M2-B's prompt-content path containment must reject the link **before the prompt is sent**, and any policy
+preset that auto-allows `kind: read` exfiltrates every absolute path a client can name.
+
+**26. Some `execute` tool calls are auto-allowed and some are not.** In `13` a read-only
+`ls -A <cwd>` (`kind: "execute"`, `toolName: "Bash"`) ran to `completed` with **no** permission request; in
+`16` a `python3 -c …` in the same `cwd` did raise one. The split is decided inside Claude Code and is not
+visible in the `tool_call` frame, so the daemon cannot predict which calls will reach the policy engine —
+policy must be evaluated on what actually arrives, and "no permission request" must never be read as "no
+tool ran".
 
 ### Known gaps in this corpus
+
 
 - **No `plan` update, in two attempts.** This build's tool set has no todo/plan tool, so §6.1's
   `plan → plan_update` row has **no real-agent ground truth** here. It must be covered by a testkit fixture,
@@ -224,8 +374,22 @@ write-with-permission turn 4.98 s; edit-existing turn 7.38 s.
 - **No `current_mode_update`.** `session/set_mode` produced the v2 `config_option_update` instead, so the
   §6.1 row `current_mode_update → config_option_update` has no v1-side sample from this agent.
 - **No `fs/*` or `terminal/*` calls**, as D3 predicts under `clientCapabilities: {}`. Confirmed across all
-  11 runs: the only agent→client methods are `session/update` and `session/request_permission`.
-- **No `authenticate` / `auth/logout`, no MCP servers, no image or resource content blocks** — every run sent
-  `mcpServers: []` and text-only prompts.
+  18 runs — including `12`/`13`, which declared `fs: { readTextFile: false, writeTextFile: false }` and
+  `terminal: false` explicitly. The only agent→client methods anywhere in the corpus are `session/update`,
+  `session/request_permission` and `elicitation/create`.
+- **No `authenticate` / `auth/logout`, and no MCP servers** — every run sent `mcpServers: []`.
 - **No multi-turn tool-call interleaving** and no `tool_call_update` for a tool that fails on its own merits
   (as opposed to a denied permission).
+- **Elicitation: only `mode: "form"`, only session-scoped.** No `url`-mode elicitation, no
+  `elicitation/complete` notification, no request-scoped (`requestId`) elicitation, no multi-question form,
+  no `required` array, and no `action: "cancel"` response — M2 must handle those from the schema, not from
+  ground truth. Both observations came from the same `AskUserQuestion` tool; whether an MCP server's
+  elicitation would be forwarded the same way is untested (no MCP server was ever configured).
+- **No `parkTimeoutAction` observation.** Both elicitations were answered within ~1 ms. What the agent does
+  when an `elicitation/create` is left unanswered for minutes — and whether it ever times out on its own —
+  is untested.
+- **`resource_link` only.** No embedded `resource` content block (`type: "resource"` with inline text or
+  blob) was ever sent, so M2-B's containment rule has ground truth for links and none for embedded
+  resources.
+- **`set_config_option` observed only for `model`.** `effort` and `fast` were never set, and no value was
+  set *during* a turn, so whether a mid-turn config change is honoured or rejected is unknown.

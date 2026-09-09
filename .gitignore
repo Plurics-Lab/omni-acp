@@ -5,6 +5,8 @@ dist/
 coverage/
 vitest-report/
 *.log
+# ...but the raw agent transcripts are the corpus, not build noise
+!docs/research/transcripts/**/*.log
 .DS_Store
 .omni-acp/
 .claude/
