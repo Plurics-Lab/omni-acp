@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { reduceTurn, type DaemonConfig, type TurnStatus } from "@omni-acp/protocol";
 import { initGitRepoAt } from "@omni-acp/testkit";
+import type { CreateAgentOptions } from "@omni-acp/client";
 import { allEnvelopes, assert, deepEqual, type CompatCase, type CompatContext } from "./support.js";
 
 /**
@@ -20,6 +21,25 @@ import { allEnvelopes, assert, deepEqual, type CompatCase, type CompatContext } 
  *
  * Owned by M2-WP-J.
  */
+
+/**
+ * A worker that may actually WRITE.
+ *
+ * The daemon's default preset is `deny-all`, and a patch case whose agent was refused its edit
+ * would assert an EMPTY patch — which is the permission path under this case's name. The rule is
+ * the narrowest thing that lets the turn touch the disk; codex never asks at all, so for that
+ * agent the policy changes nothing and the same case measures the same thing (F38's asymmetry,
+ * which is why the suite runs one script against both).
+ */
+function writeOptions(cwd: string): CreateAgentOptions {
+  return {
+    cwd,
+    policy: {
+      default: "deny",
+      rules: [{ id: "edits", match: { kind: ["edit"] }, action: "allow" }],
+    },
+  };
+}
 
 /** `diff.provider` defaults to `"none"`, so without this overlay every patch is vacuously null. */
 const withGitProvider = (base: DaemonConfig): DaemonConfig => ({
@@ -59,7 +79,7 @@ export function patchCases(): readonly CompatCase[] {
         await mkdir(repo, { recursive: true });
         await initGitRepoAt(repo);
 
-        const worker = await ctx.harness.A.createAgent(ctx.agentId, { cwd: repo });
+        const worker = await ctx.harness.A.createAgent(ctx.agentId, writeOptions(repo));
         try {
           const result = await worker.prompt(ctx.prompts.write);
 
@@ -125,7 +145,7 @@ export function patchCases(): readonly CompatCase[] {
         const plain = join(ctx.cwd, "patch-not-a-repo");
         await mkdir(plain, { recursive: true });
 
-        const worker = await ctx.harness.A.createAgent(ctx.agentId, { cwd: plain });
+        const worker = await ctx.harness.A.createAgent(ctx.agentId, writeOptions(plain));
         try {
           const result = await worker.prompt(ctx.prompts.write);
 

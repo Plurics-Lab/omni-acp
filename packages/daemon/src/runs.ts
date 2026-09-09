@@ -84,6 +84,14 @@ export function createRunSubsystem(o: {
    * field D11 uses to address a daemon.
    */
   daemonId: DaemonId;
+  /**
+   * `DaemonDeps.webhooks`, when an embedder or a test injected one (M2-WP-J).
+   *
+   * It replaces the dispatcher this function would build, and it must be the SAME object the
+   * daemon's `stop()` drains — a seam that received the lifecycle calls while the run registry
+   * dispatched to a different dispatcher would be worse than no seam at all.
+   */
+  dispatcher?: WebhookDispatcher | null;
   /** Injected by the delivery tests so they need no network. */
   fetch?: typeof globalThis.fetch;
   /** Injected by the SSRF tests so they need no DNS. */
@@ -102,24 +110,26 @@ export function createRunSubsystem(o: {
   const transaction = durable?.transaction.bind(durable);
 
   const tokenSecrets = resolveTokenSecrets(o.config, logger);
-  const dispatcher = o.config.webhooks.enabled
-    ? createWebhookDispatcher({
-        store: deliveryStore,
-        config: o.config.webhooks,
-        secrets: o.config.webhooks.secrets,
-        tokenSecrets,
-        // A delivery outlives its boot and `webhook_deliveries` has no column for a secret NAME,
-        // so the name is recovered from the RUN row — which is on disk (§24.3). `null` means "the
-        // run named none", and the dispatcher then falls back to the token's own key.
-        secretRefFor: ({ runId }) => runStore.get(runId)?.webhook?.secret ?? null,
-        bootId: durable?.bootId ?? "boot_memory",
-        clock: o.clock,
-        ids: o.ids,
-        logger: logger.child({ mod: "webhooks" }),
-        resolve: o.resolve ?? systemResolver,
-        ...(o.fetch === undefined ? {} : { fetch: o.fetch }),
-      })
-    : null;
+  const dispatcher =
+    o.dispatcher ??
+    (o.config.webhooks.enabled
+      ? createWebhookDispatcher({
+          store: deliveryStore,
+          config: o.config.webhooks,
+          secrets: o.config.webhooks.secrets,
+          tokenSecrets,
+          // A delivery outlives its boot and `webhook_deliveries` has no column for a secret NAME,
+          // so the name is recovered from the RUN row — which is on disk (§24.3). `null` means "the
+          // run named none", and the dispatcher then falls back to the token's own key.
+          secretRefFor: ({ runId }) => runStore.get(runId)?.webhook?.secret ?? null,
+          bootId: durable?.bootId ?? "boot_memory",
+          clock: o.clock,
+          ids: o.ids,
+          logger: logger.child({ mod: "webhooks" }),
+          resolve: o.resolve ?? systemResolver,
+          ...(o.fetch === undefined ? {} : { fetch: o.fetch }),
+        })
+      : null);
 
   const runs = createRunRegistry({
     daemonId: o.daemonId,

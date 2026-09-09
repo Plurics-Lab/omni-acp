@@ -350,12 +350,16 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     ids,
     logger,
     daemonId,
+    // The seam, honoured WHOLE: an injected dispatcher receives the dispatches as well as the
+    // lifecycle calls. Handing `stop()` one object and the run registry another would be a seam
+    // that looks wired and is not.
+    ...(deps?.webhooks === undefined ? {} : { dispatcher: deps.webhooks }),
   });
   const recovered = runSubsystem.recover();
   if (recovered.abandoned > 0 || recovered.requeued > 0) {
     logger.info("recovered runs and deliveries from a previous boot", recovered);
   }
-  const dispatcher = deps?.webhooks ?? runSubsystem.dispatcher;
+  const dispatcher = runSubsystem.dispatcher;
   dispatcher?.start();
 
   // The retention sweep, armed last so it cannot race adoption for the same rows (§14.5).

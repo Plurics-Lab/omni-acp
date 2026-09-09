@@ -529,8 +529,13 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const descriptor = o.catalog.get(row.agentId);
       const runtime = o.catalog.descriptor(row.agentId);
       const runtimeId = o.catalog.list().find((e) => e.id === row.agentId)?.runtimeId;
+      // The ROW's per-worker env, re-applied over THIS boot's composition (§23.3): a woken worker
+      // that lost the variables it was created with is a different worker wearing the same id,
+      // which is the whole reason `WorkerRow.env` is persisted. `null` there means the request
+      // asked for `persist:false`, and then the honest answer is to reproduce nothing.
+      const spec = o.catalog.toSpawnSpec(descriptor, { cwd: row.snapshot.cwd });
       handle = createRehydratedWorker(row, log, {
-        descriptor,
+        descriptor: { ...descriptor, env: { ...spec.env, ...(rows.env ?? {}) } },
         supervisor: o.supervisor,
         // `session` is required by `RehydrateDeps`; without an injected strategy the rehydrated
         // worker uses the same inline handshake `worker.ts` falls back to, and M1-WP-C's

@@ -30,6 +30,20 @@ function parkOptions(ctx: CompatContext): CreateAgentOptions {
   return { cwd: ctx.cwd, onUnresolved: "park" };
 }
 
+/**
+ * The prompt that makes a real agent ELICIT, transcribed from claude `12`'s own `session/prompt`
+ * (M2-WP-J, from the first real run).
+ *
+ * It is the case's own rather than `ctx.prompts.*`, for the reason `watchdog.ts` keeps its own
+ * shell sentence: the five shared prompts are M1's, and a case whose subject is a SPECIFIC agent
+ * behaviour has to ask for that behaviour. `prompts.remember` ("Remember the token OMNI-M1 and
+ * reply OK") asks a question the agent can simply answer, so no real agent ever elicits for it —
+ * the fixtures elicit unconditionally, which is exactly why a fixture could not have found this.
+ */
+const ELICIT_PROMPT =
+  "Before doing anything, ask me one clarifying question about which file name to use, " +
+  "wait for my answer, then create that file.";
+
 const interactionsIn = (envelopes: readonly EventEnvelope[]): InteractionPayload[] =>
   envelopes.filter((e) => e.kind === "acp.interaction").map((e) => e.payload as InteractionPayload);
 
@@ -82,7 +96,7 @@ export function elicitationCases(): readonly CompatCase[] {
 
           // The CONTROL: the identical prompt with nothing declared. F28 says the agent asks in
           // prose and ends the turn — no request and no tool call at all.
-          const plain = await control.prompt(ctx.prompts.remember);
+          const plain = await control.prompt(ELICIT_PROMPT);
           assert(plain.verdict === "ok", `the control turn is ${plain.verdict}, not ok`);
           assert(
             interactionsIn(await allEnvelopes(ctx, control.id)).every(
@@ -93,7 +107,7 @@ export function elicitationCases(): readonly CompatCase[] {
 
           // The PARK worker. `prompt()` returns the TURN, so it is not awaited until the park has
           // been answered — a park is exactly the case where a turn outlives its request.
-          const turn = asked.prompt(ctx.prompts.remember);
+          const turn = asked.prompt(ELICIT_PROMPT);
           const handle = await park.handle;
           await until(() => asked.state === "requires_action", 120_000, 100);
           assert(
@@ -132,7 +146,7 @@ export function elicitationCases(): readonly CompatCase[] {
         const worker = await ctx.harness.A.createAgent(ctx.agentId, parkOptions(ctx));
         const park = firstPark(worker);
         try {
-          const turn = worker.prompt(ctx.prompts.remember);
+          const turn = worker.prompt(ELICIT_PROMPT);
           const handle = await park.handle;
           const field = handle.fields[0];
           assert(field !== undefined, "the mapped form has no answerable question");
@@ -191,7 +205,7 @@ export function elicitationCases(): readonly CompatCase[] {
         const worker = await ctx.harness.A.createAgent(ctx.agentId, parkOptions(ctx));
         const park = firstPark(worker);
         try {
-          const turn = worker.prompt(ctx.prompts.remember);
+          const turn = worker.prompt(ELICIT_PROMPT);
           const handle = await park.handle;
           // The deadline is PUBLISHED. A park that expires must say when; a park that never does
           // reads `null` rather than a deadline nothing is counting down to (§5.8.4).

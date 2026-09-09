@@ -56,6 +56,10 @@ agents:
       resumeMethod: session/resume
       unsupportedMethods: ["session/set_model", "session/set_options", "session/notification"]
       quirks: { resumeRequiresSameCwd: true }
+      # §27.2's row for this agent: `model` → `haiku`, which F34 records shrinking the returned
+      # list from four entries to two. The case asserts the shrink is REAL (no phantom `effort`
+      # survives on the snapshot), so the target is data here rather than a derivation.
+      configOption: { id: model, value: haiku }
     # The `config` skip source (§18.3). Every reason is at least 10 characters and names the
     # evidence, because a skip nobody can argue with is the only kind worth having.
     #
@@ -125,6 +129,9 @@ agents:
       protocolVersion: 1
       capabilities: { loadSession: true }
       resumeMethod: session/resume
+      # §27.2's row for codex: `mode` `agent → read-only`, whose acceptance is echoed in the full
+      # returned list (codex `07`).
+      configOption: { id: mode, value: read-only }
       # F35: `reasoning_effort` is not observable at all — the following turn still reports
       # `usage.thoughtTokens: 0` — so the config case asserts REPLACEMENT and never an effect.
       # A data row, not a code branch (§27.2).

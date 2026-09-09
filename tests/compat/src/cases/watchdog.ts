@@ -73,7 +73,17 @@ export function watchdogCases(): readonly CompatCase[] {
         // one, and `withDaemonConfig` restarts the daemon — which closes it. Re-attaching would
         // hand this case a CLOSED worker whose budgets are the ones it was created under, so the
         // assertion below would be about the previous configuration or about nothing at all.
-        const worker = await ctx.harness.A.createAgent(ctx.agentId, { cwd: ctx.cwd });
+        const worker = await ctx.harness.A.createAgent(ctx.agentId, {
+          cwd: ctx.cwd,
+          // The tool budget can only fire on a tool call that RAN, and the daemon's default
+          // preset is `deny-all` — a refused shell command stalls nothing. The rule is the
+          // narrowest one that lets this case reach its own subject (M2-WP-J, from the first
+          // real run: claude asks for the shell, codex does not, and the case must work for both).
+          policy: {
+            default: "deny",
+            rules: [{ id: "shell", match: { kind: ["execute"] }, action: "allow" }],
+          },
+        });
         assertWired(worker.snapshot, { toolMs: 8_000, silentMs: 300_000 });
 
         const started = Date.now();
