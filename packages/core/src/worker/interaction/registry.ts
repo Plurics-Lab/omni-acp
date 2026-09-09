@@ -33,7 +33,10 @@ export interface PendingInteractions {
   ): InteractionAnswerResult;
   get(id: InteractionId): InteractionSnapshot | null;
   readonly pending: readonly InteractionSnapshot[];
-  settleAll(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): void;
+  /** Returns only once every held JSON-RPC promise has RESOLVED — review R1: resolving a deferred
+   *  the link is holding writes the response bytes a microtask later, so a synchronous settle
+   *  followed by `session/cancel` would still put the cancel on stdin first (§19.8). */
+  settleAll(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): Promise<void>;
 }
 
 export function createPendingInteractions(_o: { readonly maxParked: number }): PendingInteractions {

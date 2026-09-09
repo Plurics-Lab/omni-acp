@@ -16,6 +16,12 @@ import type {
  * with `403 policy_exceeds_ceiling` naming `{ceiling, offending}`, so the operator sees it where
  * they can act on it.
  *
+ * `park: false` refuses THREE things, not one (review R6): `onUnresolved:"park"`, any RULE whose
+ * `action` is `park`, and a `default` of `park`. Checking only the create request was a hole — the
+ * shipped `src-edit` preset has `default: "park"`, so a token whose operator wrote `park: false`
+ * could still be driven into `requires_action` by a preset, holding a `maxWorkers` slot
+ * indefinitely under `parkTimeoutMs: 0`. Each offender is named in `body.policy.offending`.
+ *
  * Owned by M2-B-WP-P.
  */
 export function assertWithinCeiling(_doc: ResolvedPolicy, _c: PolicyCeiling): void {
@@ -32,6 +38,8 @@ export function assertWithinCeiling(_doc: ResolvedPolicy, _c: PolicyCeiling): vo
  * indistinguishable from a rule that never fired.
  *
  * `deny` and `fail` rank EQUAL in `dominates`: neither grants, and a tie resolves to the policy.
+ * Under `park: false` a runtime `park` verdict clamps to `deny` — the next action down the lattice
+ * the ceiling permits — so the static refusal and the clamp agree about what `park: false` means.
  *
  * Owned by M2-B-WP-P.
  */

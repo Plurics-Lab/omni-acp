@@ -91,8 +91,10 @@ export interface AgentCapabilitiesSnapshot {
  * One entry of the agent's live config catalogue, addressable without reshaping it (M2, §5.8.4).
  *
  * F34: the entry's own key is `id` while the REQUEST parameter is `configId` — two different
- * words for the same thing, and `id` is lifted through the descriptor's `configOptionIdField`
- * quirk so this file names neither spelling. `raw` is the agent's object BY IDENTITY (§7.5):
+ * words for the same thing. Only the REQUEST word is a quirk (`Quirks.configIdField`, §17.3); the
+ * entry key is `id` on BOTH agents, measured in claude-acp transcript `15` and codex-acp
+ * transcript `07` (review R3), so `viewConfigOptions` reads `id` and there is no second quirk to
+ * keep in sync. `raw` is the agent's object BY IDENTITY (§7.5):
  * codex spells its model id two ways (`models.availableModels[].modelId: "gpt-5.6-sol[low]"` vs
  * `configOptions[model].currentValue: "gpt-5.6-sol"`), so anything that normalized `currentValue`
  * would make a snapshot fail to match itself.

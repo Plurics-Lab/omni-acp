@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createNormalizer } from "@omni-acp/core";
+import { fakeRuntime } from "@omni-acp/testkit";
 import {
   OmniError,
   type EventInput,
@@ -636,5 +637,103 @@ describe("normalizer: the object itself", () => {
   it("throws rather than silently ignoring an input it does not know", () => {
     const n = make();
     expect(() => n.step({ type: "nope", at: T0 } as unknown as TurnInput)).toThrow(OmniError);
+  });
+});
+
+/**
+ * SEAM D (M2-PLAN §1.3, ruling M2-R9, review R10).
+ *
+ * The reducer is the middle of a three-part chain — `worker.ts` writes
+ * `TurnInput.prompt_result.meta`, this file merges it into `state_update{idle}._meta`, and
+ * `protocol/src/turn.ts` reads `_meta["omni/patch"]` back — and it is the ONLY part of that chain
+ * that must not know what a key means. These rows assert both halves of that: an arbitrary key
+ * arrives untouched, and a turn with no meta still emits byte-for-byte M0's payload.
+ */
+describe("seam D: prompt_result.meta reaches state_update{idle}._meta", () => {
+  const PATCH = { text: "diff --git a/x b/x\n", source: "git", quality: "exact" };
+
+  const idleOf = (out: TurnOutput): Record<string, unknown> => {
+    const e = out.emit.find(
+      (x) => x.kind === "acp.session_update" && x.payload["state"] === "idle",
+    );
+    if (e === undefined) throw new Error("no idle was emitted");
+    return e.payload as Record<string, unknown>;
+  };
+
+  it("carries an arbitrary provider key through to `_meta`, verbatim and by identity", () => {
+    const n = make({ quietMs: 0 });
+    n.step(promptSent(TURN_A, T0));
+    const out = n.step({
+      type: "prompt_result",
+      stopReason: "end_turn",
+      at: T0 + 1,
+      meta: { "omni/patch": PATCH },
+    });
+    const meta = idleOf(out)["_meta"] as Record<string, unknown>;
+    expect(meta["omni/patch"]).toBe(PATCH);
+  });
+
+  it("emits byte-for-byte M0's payload when there is no meta at all", () => {
+    const n = make({ quietMs: 0 });
+    n.step(promptSent(TURN_A, T0));
+    const payload = idleOf(n.step(promptResult(T0 + 1)));
+    expect(payload).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "end_turn",
+    });
+    expect("_meta" in payload).toBe(false);
+  });
+
+  it("reaches the SETTLING branch too — the meta is carried across the quiet window", () => {
+    const n = make({ quietMs: QUIET });
+    n.step(promptSent(TURN_A, T0));
+    const settling = n.step({
+      type: "prompt_result",
+      stopReason: "end_turn",
+      at: T0 + 1,
+      meta: { "omni/patch": PATCH },
+    });
+    expect(settling.emit).toEqual([]);
+    const meta = idleOf(n.step(tick(T0 + 1 + QUIET)))["_meta"] as Record<string, unknown>;
+    expect(meta["omni/patch"]).toBe(PATCH);
+  });
+
+  it("a reducer-owned key WINS over a provider key of the same name", () => {
+    // The merge ORDER is the safety property: `Object.assign` puts the provider's keys down
+    // first and the two reducer-owned keys over them, so a provider can never rewrite the turn's
+    // own warnings by naming them. Asserted on a turn that really HAS a warning, because on one
+    // that has none there is nothing for the reducer to win with.
+    const n = createNormalizer({
+      quietMs: 0,
+      hardMs: HARD,
+      descriptor: fakeRuntime({
+        errorRules: [
+          { id: "fatalStderr:oom", messageMatches: "^FATAL: ", classify: "agent_error" },
+        ],
+      }),
+    });
+    n.step(promptSent(TURN_A, T0));
+    n.step({ type: "stderr_line", line: "FATAL: out of memory", at: T0 + 1 });
+    const out = n.step({
+      type: "prompt_result",
+      stopReason: "end_turn",
+      at: T0 + 2,
+      meta: { "omni/warnings": "hijacked", "omni/patch": PATCH },
+    });
+    const meta = idleOf(out)["_meta"] as Record<string, unknown>;
+    expect(meta["omni/patch"]).toBe(PATCH);
+    expect(meta["omni/warnings"]).toEqual([
+      { code: "fatal_stderr", message: "stderr matched fatalStderr:oom", source: "stderr" },
+    ]);
+  });
+
+  it("does not carry one turn's meta into the next turn", () => {
+    const n = make({ quietMs: 0 });
+    n.step(promptSent(TURN_A, T0));
+    n.step({ type: "prompt_result", stopReason: "end_turn", at: T0 + 1, meta: { k: 1 } });
+    n.step(promptSent(TURN_B, T0 + 2));
+    const payload = idleOf(n.step(promptResult(T0 + 3)));
+    expect("_meta" in payload).toBe(false);
   });
 });

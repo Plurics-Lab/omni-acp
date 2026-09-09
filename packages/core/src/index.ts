@@ -147,7 +147,7 @@ export { initialWatchdogState, watchdogStep } from "./worker/watchdog-state.js";
 export { createWatchdog } from "./worker/watchdog.js";
 
 // ── session/set_config_option (M2-A-WP-C) ──────────────────────────────────
-export { setConfigOption, viewConfigOptions } from "./worker/config-options.js";
+export { configOptionsDelta, viewConfigOptions } from "./worker/config-options.js";
 
 // ── policy rule engine (M2-B-WP-P) ─────────────────────────────────────────
 export { createPolicyEngine } from "./policy/engine.js";

@@ -184,7 +184,7 @@ export interface InteractionListResponse {
 /**
  * H24. One option per call, mirroring `session/set_config_option`.
  *
- * `configId` is the REQUEST spelling (F34); the descriptor's `configOptionIdField` quirk decides
+ * `configId` is the REQUEST spelling (F34); the descriptor's `configIdField` quirk decides
  * what actually reaches the wire, so this body names the canonical word and
  * `Normalizer.mapRequest` does the translation (§17.3, corpus: `optionId` is `-32602` on
  * claude-acp).

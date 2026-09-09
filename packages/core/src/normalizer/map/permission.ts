@@ -61,6 +61,9 @@ function titleOf(request: Json, toolCall: Json | null): string {
  * subject, so `kind` / `locations` / `content` / `rawInput` — what M2's rule engine matches on —
  * arrive unmodified, and `_meta` survives for the vendor extractors.
  *
+ * `raw` is the agent's params by identity — `InteractionRequest.raw`'s "Verbatim params. NEVER
+ * reshaped" starts here, and a second application keeps the first's so idempotency holds.
+ *
  * `options` is NEVER RESHAPED, including an unknown `kind`, which D4 rule 6 needs in order to
  * fail closed. And `toolCallId` is lifted out here rather than in the responder: it is the join
  * §13.4 needs to turn "we denied" into `TurnResult.deniedToolCalls` without ever reading the
@@ -93,6 +96,12 @@ export function mapPermissionRequest(
     subject,
     options: options(r["options"]),
     toolCallId: subjectToolCall === null ? null : str(subjectToolCall["toolCallId"]),
+    // The agent's params VERBATIM and by identity (review R11, §7.5): `worker.ts` maps before the
+    // strategy sees the request (M1-R14) and is frozen, so without this the raw bytes
+    // `acp.interaction.raw` audits the AGENT with — as opposed to auditing our mapping — would
+    // be dropped at the seam. A request that already carries one keeps the FIRST one, which is
+    // what keeps `map(map(x))` equal to `map(x)`.
+    raw: record(r["raw"]) ?? r,
     ...(meta === null ? {} : { _meta: meta }),
   };
 }

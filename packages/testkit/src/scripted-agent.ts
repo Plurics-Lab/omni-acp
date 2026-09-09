@@ -29,6 +29,23 @@ export interface ScriptedAgent {
   emitUsage(used: number, size: number): Promise<void>;
   /** Issues session/request_permission and resolves with the option the client chose. */
   requestPermission(options: readonly PermissionOption[]): Promise<string | { error: number }>;
+  /**
+   * The GENERIC agent→client request (M2-PLAN §1.1's "+1 generic client-request hook", review
+   * R13): send ANY agent-to-client method and receive the client's answer.
+   *
+   * `requestPermission` above is the one shape M0 needed hard-coded; M2 has a second
+   * (`elicitation/create`) and D10 says they are ONE lifecycle, so the fixture gets one verb for
+   * both rather than a second special case. `params` reaches the wire untouched — that is the
+   * whole point for elicitation, where a schema parse would strip the
+   * `_meta._askUserQuestionCustomAnswer` marker and the flat scope (F29, F30).
+   *
+   * Resolves with the client's result, or `{error: code}` for a JSON-RPC error — `-32800` when
+   * the client cancelled — so a fixture asserts on the ANSWER without a try/catch per call.
+   */
+  request(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<{ result: unknown } | { error: number }>;
   resolvePrompt(stopReason: StopReason): void;
   /** Emit an update `ms` after the prompt response has already returned (the L5 case). */
   emitAfterPromptResolves(ms: number, text: string): void;
@@ -158,6 +175,19 @@ export function scriptedAgent(opts?: { name?: string }): ScriptedAgent {
           options: [...options],
         })) as RequestPermissionResponse;
         return res.outcome.outcome === "selected" ? res.outcome.optionId : { error: CANCELLED };
+      } catch (e) {
+        if (e instanceof AcpRequestError) return { error: e.code };
+        throw e;
+      }
+    },
+
+    async request(method, params) {
+      if (dead) throw new OmniError("internal", "scriptedAgent: the agent has died");
+      try {
+        // The same untyped `request` overload `requestPermission` selects: a fixture must be able
+        // to send a method the generated v1 union does not model, which is most of what a test
+        // double is for.
+        return { result: await cx.request(method, params) };
       } catch (e) {
         if (e instanceof AcpRequestError) return { error: e.code };
         throw e;

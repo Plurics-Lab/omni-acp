@@ -63,6 +63,15 @@ export interface TurnLifecycleState {
   readonly warnings: readonly TurnWarning[];
   /** The descriptor-registered vendor patch reconstruction, accumulated for THIS turn. */
   readonly vendorPatch: VendorPatch | null;
+  /**
+   * SEAM D (M2-PLAN §1.3, ruling M2-R9). `TurnInput.prompt_result.meta`, carried to `idle`.
+   *
+   * The reducer does not know what any key in it MEANS — it is the same generic `_meta` channel
+   * `omni/vendorPatch` and `omni/warnings` already ride (§12.5) — which is exactly what lets the
+   * git provider land with zero further edits to this file. `null` outside a turn, and reset by
+   * every `prompt_sent`, because a patch is a per-turn aggregate like the warnings beside it.
+   */
+  readonly meta: Readonly<Record<string, unknown>> | null;
   readonly rung: Rung;
   /** Why the ladder will report `settled` when it reaches rung 5. */
   readonly ladderReason: SettleReason | null;
@@ -90,6 +99,7 @@ const IDLE: TurnLifecycleState = Object.freeze({
   usage: null,
   warnings: Object.freeze([]),
   vendorPatch: null,
+  meta: null,
   rung: 0,
   ladderReason: null,
 });
@@ -120,6 +130,11 @@ const running = (turnId: TurnId): EventInput => ({
 function idle(state: TurnLifecycleState, turnId: TurnId): EventInput {
   const usage = v2Usage(state.usage);
   const meta: Record<string, unknown> = {};
+  // SEAM D FIRST, the two reducer-owned keys after — so a provider key can never overwrite a
+  // reducer key. `omni/patch` rides in here (the writer is `worker.ts`, the reader is
+  // `turn.ts`'s `reduceTurn`) and this file reads NEITHER: a reducer that knew what a key meant
+  // would be a reducer the next provider has to edit.
+  Object.assign(meta, state.meta ?? {});
   if (state.warnings.length > 0) meta[WARNINGS_META] = state.warnings;
   if (state.vendorPatch !== null) meta[VENDOR_PATCH_META] = state.vendorPatch;
   return {
@@ -237,7 +252,15 @@ export function stepTurnLifecycle(
         // No live turn: there is nothing to settle and nothing truthful to emit.
         return { state, output: output([], state, state.deadline, null) };
       }
-      const withUsage: TurnLifecycleState = { ...state, usage: input.usage ?? state.usage };
+      // SEAM D. Carried on EVERY branch below — the settle-now one, the settling one and the
+      // `rung > 0` one — because `end` runs once, immediately before this input is fed, and a
+      // branch that dropped it would silently produce `TurnResult.patch: null` for a turn that
+      // really did have a patch. A second `prompt_result` with no `meta` keeps the first one's.
+      const withUsage: TurnLifecycleState = {
+        ...state,
+        usage: input.usage ?? state.usage,
+        meta: input.meta ?? state.meta,
+      };
       // A second response for the same turn re-arms the window but never extends the hard cap.
       const hardCutoff =
         state.state === "settling" && state.hardCutoff !== null

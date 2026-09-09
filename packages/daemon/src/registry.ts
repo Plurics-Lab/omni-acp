@@ -1017,9 +1017,13 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     async prompt(id, auth, body): Promise<PromptAccepted> {
       let parsed: PromptRequestBody;
       try {
-        // The M0 content pre-check IS this schema: only `type:"text"` blocks are accepted, so
-        // there is no unchecked path surface to contain (§2.3, review R12). A type outside the
-        // handshake `promptCapabilities` cannot occur while text is the only type allowed.
+        // SHAPE only, since H28: the text-only `.refine` was DELETED, not widened, so this schema
+        // now decides that `content` is a non-empty array of at most 64 objects that each carry a
+        // `type` string — and nothing about which types are allowed. The SEMANTIC gate is
+        // `Worker.prompt`'s `deps.validateContent` (§26.2), which this creation path MUST inject
+        // bound to the token's `cwdRoots` and the worker's `promptCapabilities`: zod holds
+        // neither, and a schema that silently stopped enforcing containment looks exactly like a
+        // schema that got more capable (review R2). M2-B-WP-S owns the injection and its guard.
         parsed = PromptRequestBody.parse(body);
       } catch (e) {
         throw badRequest(e, "invalid prompt");

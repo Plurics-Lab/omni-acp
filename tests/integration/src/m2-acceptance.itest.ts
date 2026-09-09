@@ -19,7 +19,7 @@ describe("M2-WP-J — the join: diff provider, wiring, compat, CLI", () => {
     "boot order is persistence -> worker adopt -> run recover -> delivery requeue -> dispatcher.start -> listen, and stop() is interactions.settleAll -> dispatcher.drain(bounded) -> workers -> socket, both asserted by a recording order test",
   );
   it.todo(
-    'runtime/known.ts gains the session_info_update row (F25) and the `unverified` entries for elicitation.url, elicitation/complete, action:"cancel", multi-question forms, parkTimeoutAction, configOptionIdField and codex\'s cmd-matching rules (F38); the compat suite REFUSES to assert an unverified row, with a printed reason',
+    'runtime/known.ts gains the session_info_update row (F25) and the `unverified` entries for elicitation.url, elicitation/complete, action:"cancel", multi-question forms, parkTimeoutAction and codex\'s cmd-matching rules (F38) — and NO configOptionIdField row, because the entry key is `id` on both agents (review R3); the compat suite REFUSES to assert an unverified row, with a printed reason',
   );
   it.todo(
     "the full compat matrix runs: hermetic agents.ci.yaml green on three OSes with ZERO unsourced skips, and OMNI_COMPAT_REAL=1 green against claude-acp and codex-acp with every skip carrying a source and a >=10-character reason",

@@ -48,6 +48,8 @@ import {
   type InteractionStrategy,
   type MappedElicitationRequest,
   type PatchHandle,
+  type PatchResult,
+  type ConfigOptionView,
   type SetConfigBody,
   type SetConfigResponse,
   type TokenId,
@@ -66,6 +68,7 @@ import {
   type WorkerStatePayload,
 } from "@omni-acp/protocol";
 import { openAcpLink, type AcpLink } from "../acp/link.js";
+import { configOptionsDelta, viewConfigOptions } from "./config-options.js";
 import type { EventLogCore } from "../event-log/log-core.js";
 import type { ReplayCounts } from "./session-open.js";
 import { DEFAULT_V1_PROFILE } from "../runtime/known.js";
@@ -121,6 +124,16 @@ export interface CreateWorkerDeps {
      * `interaction.parkTimeoutMs`'s own default, resolved by the registry.
      */
     parkTimeoutMs?: number;
+    /**
+     * M2, review R14. The bound on `DiffProvider.begin` and `.end` — `diff.timeoutMs`, resolved
+     * by the registry. §25.1 states the bound ("`worker.ts` awaits `provider.end(handle)` bounded
+     * by `diff.timeoutMs`") and without the number here the worker could not honour it: a
+     * provider that hangs would never feed `prompt_result`, so `idle` would never be emitted and
+     * `TurnResult` would never settle — a hung diff would hang the TURN. Absent ⇒
+     * `DEFAULT_DIFF_TIMEOUT_MS` below, which is `DiffConfig.timeoutMs`'s own default restated for
+     * a unit test that has no config.
+     */
+    diffTimeoutMs?: number;
   };
   /**
    * Optional, and the ONLY addition to CONTRACTS.md §5.3's `CreateWorkerDeps`.
@@ -223,6 +236,12 @@ const DEFAULT_MAX_WAKE_FAILURES = 3;
 const DEFAULT_CLOSE_OUT_MS = 10_000;
 
 /**
+ * `limits.diffTimeoutMs`'s fallback: `DiffConfig.timeoutMs`'s own default (`config.ts`), restated
+ * for a `createWorker` caller that passes no budget, exactly as `DEFAULT_MAX_WAKE_FAILURES` is.
+ */
+const DEFAULT_DIFF_TIMEOUT_MS = 15_000;
+
+/**
  * M2, seam D (M2-PLAN §1.3). The one key the diff provider's result rides under, on
  * `TurnInput.prompt_result.meta` → `state_update{idle}._meta` → `TurnResult.patch`.
  *
@@ -261,6 +280,11 @@ function mapElicitationFallback(params: unknown): MappedElicitationRequest {
     message: typeof p["message"] === "string" ? p["message"] : "",
     fields: [],
     unmodelled: Object.keys(properties),
+    // Review R11. The agent's params, BY IDENTITY. This is the whole reason M2-A-WP-I's real
+    // `mapElicitation` is reachable at all: the strategy re-maps from `req.raw` and emits
+    // `payload.raw` verbatim, so neither the map nor the audit depends on this stand-in and
+    // `worker.ts` stays frozen (§7.5, ruling M2-R3).
+    raw: p,
     ...(typeof p["_meta"] === "object" && p["_meta"] !== null
       ? { _meta: p["_meta"] as Record<string, unknown> }
       : {}),
@@ -306,13 +330,19 @@ function defaultSpawnSpec(d: AgentDescriptor, o: { cwd: string }, label: string 
 }
 
 /**
- * M0 accepts `type:"text"` and nothing else (CONTRACTS.md §2.3, review R12).
+ * M0's whitelist: `type:"text"` and nothing else (CONTRACTS.md §2.3, M0 review R12).
  *
- * The check lives here rather than only in the HTTP layer because this is where the handshake's
- * `promptCapabilities` is held: when M2 admits `image` / `audio` / `resource_link`, the
- * per-agent gate is a few lines below this one, and no route has to learn about capabilities.
+ * **This is the FALLBACK, not the gate** (review R2). The M2 containment control is
+ * `@omni-acp/core`'s exported `assertPromptContent` (`worker/prompt-content.ts`, §26.2), injected
+ * as `deps.validateContent` by the daemon's worker-creation path and bound to the token's
+ * `cwdRoots` and this worker's `promptCapabilities`. The two are deliberately spelled
+ * DIFFERENTLY: a same-named local would let an `assert-prompt-content-is-called` guard pass on
+ * the name while the real check was never injected, which is the exact silent-absence failure
+ * §11.9 calls the most dangerous hunk in M2.
+ *
+ * With nothing injected this is M0 verbatim, which is why `core/test/worker/**` passes unedited.
  */
-function assertPromptContent(content: readonly unknown[]): void {
+function assertTextOnlyContent(content: readonly unknown[]): void {
   if (content.length === 0) {
     throw new OmniError("bad_request", "prompt content is empty");
   }
@@ -439,6 +469,19 @@ export class Worker implements WorkerHandle {
 
   /** M2, hunk 7. The watchdog's current deadline, for `WorkerSnapshot.watchdog.armedAt`. */
   #watchdogArmedAt: number | null = null;
+
+  /**
+   * M2, hunk 6. The LIVE config catalogue (§5.8.4), REPLACED WHOLESALE and never merged.
+   *
+   * `null` means "nothing has replaced the handshake catalogue" — read
+   * `capabilities.configOptions` for the historical record. It is seeded from the handshake and
+   * re-seeded on every wake (a resumed session may report a different catalogue, §22.2) through
+   * `viewConfigOptions`, and replaced by `setConfig` from the METHOD's own result. Never from the
+   * event stream: neither real agent emits `config_option_update` for a set (F34, F35), so a
+   * daemon that waited for one would wait forever and one that merged a guess would resurrect the
+   * two entries F34's four→two shrink dropped.
+   */
+  #configOptions: readonly ConfigOptionView[] | null = null;
   /**
    * The last state actually WRITTEN to the log, which is what `previous` means to a reader.
    * It is a separate field because `prompt()` claims "running" before the envelope that
@@ -648,6 +691,11 @@ export class Worker implements WorkerHandle {
       // The invariant §19.5 names is visible right here: `interactions` is the strategy's pending
       // set, and `#park` is the ONLY thing that can make it non-empty — which is also the only
       // thing that can put this worker in `requires_action`.
+      // Present only once something has produced one, for the reason every other M2 row on this
+      // snapshot is optional (M2-PLAN §1.2, Land note S4): an M1 `toEqual` over a snapshot must
+      // not grow a key, and `configOptions: null` and "no view yet" are the same fact to a reader
+      // who still has `capabilities.configOptions`.
+      ...(this.#configOptions === null ? {} : { configOptions: this.#configOptions }),
       interactions: this.#deps.interactions?.pending ?? [],
       // `null` when nothing is injected AND when `watchdog.enabled:false` — the two cases a
       // client cannot tell apart and does not need to: neither will ever cancel a turn. When one
@@ -726,11 +774,14 @@ export class Worker implements WorkerHandle {
     // pin taken after one would leave the window this exists to close.
     this.#leasePin = this.#deps.lease.pinExpiry();
 
-    // HUNK 9 (M2-PLAN §1.2). The content gate is INJECTED; absent it is M0's text-only
-    // whitelist, unchanged and still in this file's `assertPromptContent` below. M2-B-WP-S
-    // replaces it with the containment check DESIGN §5.1 requires — realpath FIRST, then contain
-    // — which needs this worker's `promptCapabilities` and the token's `cwdRoots` and therefore
-    // cannot live in a zod schema (§5.8.6's deleted `.refine`).
+    // HUNK 9 (M2-PLAN §1.2), and the ONE call site of the containment gate (review R2).
+    //
+    // The gate is INJECTED. Absent it is `assertTextOnlyContent` below — M0's whitelist, unchanged
+    // — and the real control is `@omni-acp/core`'s `assertPromptContent` (§26.2), which the
+    // daemon's worker-creation path MUST bind to this worker's `promptCapabilities` and this
+    // token's `cwdRoots` and pass as `deps.validateContent`; zod holds neither, which is why
+    // §5.8.6's `.refine` was deleted rather than widened (H28). The fallback is spelled
+    // differently ON PURPOSE so a name-matching guard cannot pass while the injection is missing.
     //
     // It runs AFTER the check-and-set and BEFORE anything reaches the wire, and that placement is
     // the whole of it. `prompt()` yields exactly one acceptance out of 50 concurrent callers only
@@ -741,7 +792,7 @@ export class Worker implements WorkerHandle {
     // caller still gets its `400` FROM `prompt()` — H8's status, unmoved — and F37/F38's "the
     // fixture agent recorded ZERO `session/prompt` calls" holds by construction.
     try {
-      await (this.#deps.validateContent ?? assertPromptContent)(content);
+      await (this.#deps.validateContent ?? assertTextOnlyContent)(content);
     } catch (e) {
       this.#state = "ready";
       this.#currentTurnId = null;
@@ -798,14 +849,21 @@ export class Worker implements WorkerHandle {
     // ⇒ null" cannot be decided at worker start. It NEVER throws, and a `null` handle is D8's
     // honest "no patch for this turn".
     let patch: PatchHandle | null = null;
-    try {
-      patch =
-        (await this.#deps.diff?.begin({ cwd: this.#deps.cwd, workerId: this.#deps.workerId })) ??
-        null;
-    } catch (e) {
-      // `begin` is contracted NEVER to throw, and a provider that does anyway must not fail the
-      // turn: D8's answer to "we could not diff" is `patch: null`, not a broken prompt.
-      this.#logger.warn("the diff provider failed to open a patch handle", { error: String(e) });
+    const provider = this.#deps.diff;
+    if (provider !== undefined) {
+      try {
+        // BOUNDED by `diff.timeoutMs` (review R14, §25.1). A provider that hangs here would hang
+        // the whole turn — `session/prompt` would never be sent — so the budget is applied to
+        // `begin` exactly as it is to `end`, and expiry is D8's `patch: null` rather than a
+        // failed turn.
+        patch = await this.#withDiffBudget((signal) =>
+          provider.begin({ cwd: this.#deps.cwd, workerId: this.#deps.workerId, signal }),
+        );
+      } catch (e) {
+        // `begin` is contracted NEVER to throw, and a provider that does anyway must not fail the
+        // turn: D8's answer to "we could not diff" is `patch: null`, not a broken prompt.
+        this.#logger.warn("the diff provider failed to open a patch handle", { error: String(e) });
+      }
     }
     try {
       const res = await link.request<unknown>("session/prompt", {
@@ -879,7 +937,7 @@ export class Worker implements WorkerHandle {
     // once every held JSON-RPC promise has resolved — BEFORE `session/cancel` reaches stdin. An
     // agent blocked on our answer may never read the cancel, and a log that ends on a `pending`
     // interaction is a log that lies.
-    this.#settleInteractions("cancel");
+    await this.#settleInteractions("cancel");
 
     try {
       await this.#link.notify("session/cancel", { sessionId: this.#sessionId });
@@ -970,7 +1028,7 @@ export class Worker implements WorkerHandle {
 
   /** §15.2's four steps, in the order that IS the correctness argument. */
   async #doHibernate(reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot> {
-    this.#settleInteractions("hibernate");
+    await this.#settleInteractions("hibernate");
     this.#logger.info("hibernating", { reason });
     this.#tickTimer?.cancel();
     this.#tickTimer = null;
@@ -978,6 +1036,8 @@ export class Worker implements WorkerHandle {
     this.#cancelTimer = null;
     this.#exitGraceTimer?.cancel();
     this.#exitGraceTimer = null;
+    // In the same block as the three timer cancels, and for the same reason (review R15).
+    this.#disposeSeams();
 
     // 1. NO `session/close` — which is why this path does not go through `#doClose`. That call is
     //    the difference between hibernate and close: the pointer is the entire value being
@@ -1094,6 +1154,9 @@ export class Worker implements WorkerHandle {
 
     this.#capabilities = opened.capabilities;
     this.#sessionId = opened.sessionId;
+    // §22.2: a wake RE-SEEDS the live list from `reopen`'s result, because a resumed session may
+    // report a different catalogue than the one the first process offered.
+    this.#seedConfigOptions();
     this.#resume = opened.resume;
     // One more process has handshaken, so this is one more generation of this worker.
     this.#generation += 1;
@@ -1152,6 +1215,11 @@ export class Worker implements WorkerHandle {
       ...(this.#crashed ? { crashed: true } : {}),
     });
     throw error;
+  }
+
+  /** `#state`, UNNARROWED — for a caller reading it back after an `await` (see `setConfig`). */
+  #currentState(): M1State {
+    return this.#state;
   }
 
   /** The resolved quirk table, or the documented zero-quirk fallback (§17.2). */
@@ -1583,7 +1651,7 @@ export class Worker implements WorkerHandle {
    * With no implementation injected this is `agent_error` carrying `-32601`, which is the shape a
    * client already knows how to read for "this agent cannot do that" (D29, the M1 Land precedent).
    */
-  setConfig(_body: SetConfigBody, who: ClientRef): Promise<SetConfigResponse> {
+  async setConfig(body: SetConfigBody, who: ClientRef): Promise<SetConfigResponse> {
     this.#deps.lease.assertHolder(who);
     if (this.#state === "closed") {
       throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
@@ -1591,7 +1659,113 @@ export class Worker implements WorkerHandle {
     if (this.#state === "running" || this.#state === "requires_action") {
       throw new OmniError("worker_busy", `worker ${this.#deps.workerId} is ${this.#state}`);
     }
-    throw new OmniError("internal", "unimplemented: M2-A-WP-C (session/set_config_option)");
+    // Auto-wake, exactly as `prompt()` does (§22.2). `wake()` is idempotent and single-flight and
+    // re-asserts the lease itself; a worker that cannot wake fails here with M1's own `422`
+    // rather than with an invented config error.
+    if (this.#state === "hibernated") await this.wake(who);
+    // Re-read through a method: the wake above is an `await`, so the narrowing the two checks
+    // above produced is no longer a fact about the field, and reading the field directly would
+    // keep TypeScript's stale narrowing instead.
+    const woken = this.#currentState();
+    if (woken === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
+    if (woken !== "ready") {
+      throw new OmniError("worker_busy", `worker ${this.#deps.workerId} is ${woken}`);
+    }
+
+    const link = this.#link;
+    const sessionId = this.#sessionId;
+    if (link === null || sessionId === null) {
+      throw new OmniError("internal", "worker reached ready with no session");
+    }
+
+    // The SPELLING is descriptor DATA and this file names neither `configId` nor `optionId`
+    // (F34: `optionId` answers `-32602` on claude-acp). `mapRequest` picks the first spelling not
+    // already known-unsupported and `noteUnsupported` retires one on a `-32601`, so the loop is
+    // §17.3's preference order and not a fallback chain written here.
+    const params = { sessionId, configId: body.configId, value: body.value };
+    let result: unknown;
+    for (;;) {
+      const call = this.#deps.normalizer.mapRequest("session/set_config_option", params);
+      if (call.spelling === null) {
+        // Every spelling exhausted, or the descriptor advertises none. `-32601` is the shape a
+        // client already knows how to read for "this agent cannot do that" (D29), and it is what
+        // this method answered at the Land step with nothing wired at all.
+        throw new OmniError(
+          "agent_error",
+          `agent ${this.#deps.descriptor.id} does not implement session/set_config_option`,
+          { acp: { code: -32601, message: "session/set_config_option is not supported" } },
+        );
+      }
+      try {
+        result = await link.request<unknown>(call.method, call.params);
+        break;
+      } catch (e) {
+        if (e instanceof AcpRequestError && e.code === -32601) {
+          this.#deps.normalizer.noteUnsupported(call.spelling);
+          continue;
+        }
+        // Everything else is the agent's answer and is reported AS the agent's answer — a bad
+        // value is `502 agent_error` carrying the `-32603` and its `data.details` verbatim (F44),
+        // classified on code plus a data pointer and never on message text.
+        throw OmniError.from(e, "agent_error");
+      }
+    }
+
+    // WHOLESALE, from the METHOD's own body (F34's four→two shrink is real; F35's five all
+    // survive). `viewConfigOptions` is M2-A-WP-C's pure lift; `null` back from it means the
+    // method returned NO list, which is `stale: true` and the previous list KEPT — never merged
+    // with a guess.
+    // `viewConfigOptions` and `configOptionsDelta` are M2-A-WP-C's two PURE halves and they throw
+    // until that package lands — which is the Land step's own convention, and the reason it is
+    // acceptable HERE and not on the handshake path: `setConfig` is a route no M1 test reaches, so
+    // the only observable is the same `unimplemented` this method already answered, one round trip
+    // later. Everything above this line — the gates, the auto-wake, the spelling loop — is real.
+    const previous = this.#configOptions;
+    const next = viewConfigOptions(result, this.#runtime());
+    const stale = next === null;
+    const configOptions = next ?? previous ?? [];
+    if (!stale) this.#configOptions = configOptions;
+
+    const delta = configOptionsDelta(previous, stale ? previous : configOptions);
+
+    // M2-R23: the daemon SYNTHESIZES the notification neither agent sends, so a streaming client
+    // still learns — and stamps `_meta["omni/source"]` so an agent-emitted one stays
+    // distinguishable from ours. It is fed as an `agent_update` on purpose: that is the one path
+    // where the DESCRIPTOR decides whether the kind is mapped, dropped (§14.6's `keep`) or passed
+    // through, and a route that appended an envelope directly would be a second mapper.
+    if (!stale) {
+      this.#feed({
+        type: "agent_update",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: configOptions.map((o) => o.raw),
+          _meta: { "omni/source": "set_config_option" },
+        },
+        at: this.#deps.clock.now(),
+      });
+    }
+
+    return { configOptions, removed: delta.removed, added: delta.added, stale };
+  }
+
+  /**
+   * Seeds `#configOptions` from the handshake catalogue, and re-seeds it on every wake (§22.2).
+   *
+   * `viewConfigOptions` is M2-A-WP-C's and throws until it lands — which is the honest "no view
+   * yet" and leaves the field `null`, i.e. exactly M1. It is caught rather than propagated
+   * because a catalogue is a convenience view and no worker may fail to hand-shake, wake or
+   * report a snapshot because one could not be shaped.
+   */
+  #seedConfigOptions(): void {
+    const raw = this.#capabilities?.configOptions ?? null;
+    if (raw === null) return;
+    try {
+      this.#configOptions = viewConfigOptions({ configOptions: raw }, this.#runtime());
+    } catch (e) {
+      this.#logger.debug("the config catalogue could not be shaped", { error: String(e) });
+    }
   }
 
   /**
@@ -1622,16 +1796,48 @@ export class Worker implements WorkerHandle {
   /**
    * §19.8's settle, as a no-op when nothing is injected. Idempotent by the strategy's own
    * contract, so every teardown path may call it blindly.
+   *
+   * AWAITED (review R1). `settleAll` "returns only once every held JSON-RPC promise has resolved",
+   * and resolving a deferred the ACP link's request handler is holding writes the response bytes
+   * a microtask later — so a synchronous call followed by `session/cancel` would still put the
+   * cancel on stdin FIRST, which is precisely the hang §19.8 exists to prevent. Every caller
+   * awaits; a rejection is logged and never propagated, because a teardown that a strategy can
+   * break is a teardown that leaks a process.
    */
-  #settleInteractions(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): void {
+  async #settleInteractions(
+    reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout",
+  ): Promise<void> {
     const strategy = this.#deps.interactions;
     if (strategy === undefined) return;
     try {
-      strategy.settleAll(reason);
+      await strategy.settleAll(reason);
     } catch (e) {
       this.#logger.error("settling parked interactions failed", { reason, error: String(e) });
     }
     this.#parked.clear();
+  }
+
+  /**
+   * Review R15: the two teardown members of the M2 contracts that nothing else calls.
+   *
+   * `InteractionStrategy.close()` disposes the park deadline and `Watchdog.cancel()` disposes the
+   * idle timer. Both are contracted IDEMPOTENT, so every teardown path calls them blindly, and
+   * both are wrapped for the reason `#settleInteractions` is: commit 7c80f15 is the recording of
+   * what one surviving timer costs — a lease's TTL timer kept the whole process alive — and a
+   * watchdog that outlives a close can fire `onFire -> cancelInternal()` on a dead worker.
+   */
+  #disposeSeams(): void {
+    try {
+      this.#deps.watchdog?.cancel();
+    } catch (e) {
+      this.#logger.error("cancelling the watchdog failed", { error: String(e) });
+    }
+    this.#watchdogArmedAt = null;
+    try {
+      this.#deps.interactions?.close();
+    } catch (e) {
+      this.#logger.error("closing the interaction strategy failed", { error: String(e) });
+    }
   }
 
   /** HUNK 7's one call site shape. Absent watchdog ⇒ disarmed, which is M1. */
@@ -1647,15 +1853,66 @@ export class Worker implements WorkerHandle {
     }
   }
 
-  /** HUNK 8's settle half. NEVER throws: a git failure is `text: null` and not a failed turn. */
+  /**
+   * HUNK 8's settle half. NEVER throws: a git failure is `text: null` and not a failed turn.
+   *
+   * BOUNDED by `diff.timeoutMs` (review R14). §25.1 says "`worker.ts` awaits `provider.end(handle)`
+   * bounded by `diff.timeoutMs`", and the bound is not tidiness: `end` runs immediately before
+   * `prompt_result` is fed, so a provider that never returns means `idle` is never emitted and
+   * `TurnResult` never settles — the turn hangs on the diff.
+   *
+   * On expiry the result is a REAL `PatchResult` (`text: null`, `quality:"unavailable"`) carrying
+   * `TurnWarning{code:"patch_timeout"}`, not a `null` meta: the warning has to reach
+   * `idle._meta` through seam D, which is the only channel a pure fold can read it from.
+   */
   async #endPatch(handle: PatchHandle | null): Promise<Record<string, unknown> | null> {
     const provider = this.#deps.diff;
     if (provider === undefined || handle === null) return null;
     try {
-      return { [PATCH_META]: await provider.end(handle) };
+      return {
+        [PATCH_META]: await this.#withDiffBudget((signal) => provider.end(handle, { signal })),
+      };
     } catch (e) {
+      if (OmniError.is(e, "agent_timeout")) {
+        this.#logger.warn("the diff provider did not answer within diff.timeoutMs");
+        this.#abandonPatch(handle);
+        const timedOut: PatchResult = {
+          text: null,
+          source: null,
+          truncated: false,
+          quality: "unavailable",
+          warnings: [
+            {
+              code: "patch_timeout",
+              message: `the diff provider did not answer within ${String(
+                this.#deps.limits.diffTimeoutMs ?? DEFAULT_DIFF_TIMEOUT_MS,
+              )}ms`,
+              source: "patch",
+            },
+          ],
+        };
+        return { [PATCH_META]: timedOut };
+      }
       this.#logger.warn("the diff provider failed to produce a patch", { error: String(e) });
       return null;
+    }
+  }
+
+  /**
+   * `#withDeadline`, plus the `AbortSignal` the `DiffProvider` contract accepts (review R14).
+   *
+   * The signal is aborted on expiry so a provider that respects it stops its own subprocess pair
+   * instead of leaving a `git write-tree` running past the turn that asked for it; the race is
+   * what makes the bound true for one that does not.
+   */
+  async #withDiffBudget<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const ms = this.#deps.limits.diffTimeoutMs ?? DEFAULT_DIFF_TIMEOUT_MS;
+    const controller = new AbortController();
+    try {
+      return await this.#withDeadline(fn(controller.signal), ms);
+    } catch (e) {
+      if (OmniError.is(e, "agent_timeout")) controller.abort();
+      throw e;
     }
   }
 
@@ -1903,6 +2160,11 @@ export class Worker implements WorkerHandle {
     this.#cancelTimer = null;
     this.#exitGraceTimer?.cancel();
     this.#exitGraceTimer = null;
+    // Review R15/§19.8: this is a teardown path like the other two, and the process it is tearing
+    // down is ALREADY DEAD — leaving an agent's request hanging on a dead pipe is F1's lesson, and
+    // a park timer or a watchdog that outlives it is commit 7c80f15's.
+    await this.#settleInteractions("hibernate");
+    this.#disposeSeams();
     try {
       this.#appendCloseError(error, stderrTail, "agent_crashed");
       this.#currentTurnId = null;
@@ -1948,7 +2210,7 @@ export class Worker implements WorkerHandle {
   }
 
   async #doClose(reason: WorkerCloseReason, extras: CloseExtras): Promise<CloseResult> {
-    this.#settleInteractions("close");
+    await this.#settleInteractions("close");
     const previous = this.#state;
     this.#closeReason = reason;
     // A close is an exit from `running` too, and the ladder below can await for seconds: a pin
@@ -1960,6 +2222,8 @@ export class Worker implements WorkerHandle {
     this.#cancelTimer = null;
     this.#exitGraceTimer?.cancel();
     this.#exitGraceTimer = null;
+    // In the same block as the three timer cancels, and for the same reason (review R15).
+    this.#disposeSeams();
 
     // The error envelope FIRST, so the log reads `omni.error` -> `omni.worker_state{closed}`
     // (§7.3) and a subscriber sees the cause before the consequence.
@@ -2288,6 +2552,7 @@ export class Worker implements WorkerHandle {
             });
       this.#capabilities = capabilities;
       this.#sessionId = sessionId;
+      this.#seedConfigOptions();
       // One process has now handshaken. `generation` is "processes this worker has had", so it
       // is incremented HERE and not at spawn: a spawn that never handshakes produced no
       // generation of this worker, it produced a failed create (§5.1 `WorkerSnapshot`).

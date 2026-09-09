@@ -440,7 +440,16 @@ export const WatchdogConfig = z.object({
    *  on `DaemonConfig`, because a watchdog that closed first would report a fake agent timeout
    *  for a turn that was settling. */
   cancelTimeoutMs: z.number().int().positive().default(60_000),
-  /** "cancel" (default) ⇒ `session/cancel` then M1's existing escalation; "close" skips to it. */
+  /**
+   * "cancel" (default) ⇒ `session/cancel` then M1's existing escalation; "close" skips straight to
+   * the close, WITHOUT waiting out `cancelTimeoutMs`.
+   *
+   * `"close"` still appends `omni.error{agent_timeout}` and `worker_state{reason:"watchdog_idle"}`
+   * FIRST, and closes with **`cancel_timeout`** — M1's existing reason (§21.5). It carries that one
+   * because Land exit criterion 4 forbids adding a `WorkerCloseReason` and every alternative would
+   * be a false statement in a different way; review R7 is the record that the reason was CHOSEN
+   * rather than left open. Nothing in the acceptance script uses it.
+   */
   action: z.enum(["cancel", "close"]).default("cancel"),
 });
 export type ResolvedWatchdogConfig = z.output<typeof WatchdogConfig>;

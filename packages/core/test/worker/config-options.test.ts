@@ -6,7 +6,7 @@ import { describe, it } from "vitest";
  * Owned by M2-A-WP-C.
  */
 
-describe("setConfigOption / viewConfigOptions (H24)", () => {
+describe("viewConfigOptions / configOptionsDelta (H24)", () => {
   it.todo(
     'goes through Normalizer.mapRequest("session/set_config_option", ...), so configId vs optionId is descriptor DATA and this file names neither spelling; a -32602 on the first spelling falls through to the next (F34)',
   );

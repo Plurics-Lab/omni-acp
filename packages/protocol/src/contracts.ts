@@ -541,6 +541,18 @@ export interface MappedPermissionRequest {
   readonly subject: Readonly<Record<string, unknown>> | null;
   readonly options: readonly PermissionOption[];
   readonly toolCallId: string | null;
+  /**
+   * The agent's params, VERBATIM and by identity. Review R11: `worker.ts` is frozen after the
+   * Land step and maps before it hands the request to the strategy (ruling M1-R14), so without
+   * this field the raw bytes `InteractionRequest.raw` is contracted to carry — "NEVER reshaped;
+   * `acp.interaction.raw` audits the agent, not our mapping" (§7.5) — would be dropped at the
+   * seam and could never be recovered. Ruling M2-R3 is exactly "flip `payloadVersion` to 2 with
+   * a mapped `request` AND carry the agent's bytes beside it".
+   *
+   * A second application keeps the FIRST one's `raw`, which is what keeps `map(map(x))` equal to
+   * `map(x)` — the same reason `subject` is passed by identity.
+   */
+  readonly raw: Readonly<Record<string, unknown>>;
   readonly _meta?: Readonly<Record<string, unknown>>;
 }
 
@@ -601,6 +613,15 @@ export interface MappedElicitationRequest {
   /** Properties this parse did not fold into a field — kept so an answer that names one is a
    *  `bad_request` with the name in it rather than a silent drop. */
   readonly unmodelled: readonly string[];
+  /**
+   * The agent's params, VERBATIM and by identity (review R11).
+   *
+   * It carries the `_meta._askUserQuestionCustomAnswer` marker and the FLAT scope (F29, F30) that
+   * a schema parse would strip, and it is what lets M2-A-WP-I's real `mapElicitation` run at all:
+   * `worker.ts` maps with a fallback before the strategy sees the request and is frozen
+   * afterwards, so the strategy RE-MAPS from `raw` and emits `payload.raw` unchanged.
+   */
+  readonly raw: Readonly<Record<string, unknown>>;
   readonly _meta?: Readonly<Record<string, unknown>>;
 }
 
@@ -656,7 +677,11 @@ export interface InteractionContext {
    * watchdog (§21.4) and holds the lease pin for the whole window.
    */
   park(id: InteractionId): () => void;
-  /** `onUnresolved:"fail"` and `parkTimeoutAction:"fail"`: cancel the turn, do not close the worker. */
+  /**
+   * `onUnresolved:"fail"` and `parkTimeoutAction:"fail"`: answer the request, cancel the TURN and
+   * mark any owning run `failed`. **The worker stays open** — ruling M2-R24, which settles the
+   * disagreement between D4's text and DESIGN §3.2's `任意 → closed` row in favour of D4.
+   */
   failTurn(reason: string): void;
 }
 
@@ -691,7 +716,10 @@ export interface InteractionStrategy {
    * on a `pending` interaction is a log that lies, and an agent blocked on our answer may never
    * read the cancel (§19.8). Idempotent.
    */
-  settleAll(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): void;
+  settleAll(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): Promise<void>;
+  /** Disposes the strategy's own timers (the park deadline above all). Called from EVERY teardown
+   *  path — `#doClose` and `#doHibernate` — beside `Watchdog.cancel()`. Idempotent, and it must
+   *  never throw: a close that a dependency can break is a close that leaks a process. */
   close(): void;
 }
 

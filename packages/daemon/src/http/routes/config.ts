@@ -8,7 +8,7 @@ import { readJson, workerId } from "./index.js";
  * H24: `POST /v1/workers/{wid}/config` → `session/set_config_option` (§22).
  *
  * One option per call, mirroring the agent method. The body names `configId` — the REQUEST
- * spelling (F34) — and the descriptor's `configOptionIdField` quirk decides what actually reaches
+ * spelling (F34) — and the descriptor's `configIdField` quirk decides what actually reaches
  * the wire, so neither this file nor the worker names a spelling.
  *
  * Every other answer is an `OmniError` from the registry: `409 worker_busy` while a turn is live,

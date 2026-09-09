@@ -50,9 +50,16 @@ packages/daemon/src/http/routes/{index,workers}.ts
 packages/daemon/src/types.ts                         ← re-export-only
 packages/client/src/worker.ts                        ← three delegating members, then FROZEN
 packages/testkit/src/{index,scripted-agent}.ts       ← +1 generic client-request hook
+packages/testkit/src/stub-daemon.ts                  ← WP-I, WP-C and WP-R all build route tests on it
 tests/compat/src/cases/index.ts                      ← the case registry (the cases/ split, §1.4)
+tests/compat/src/cases/support.ts                    ← CompatCase/CompatContext + the shared assertions
 tests/compat/src/{harness,runner,config}.ts
 ```
+
+The last two rows are the files where six packages could still meet (review R9, R17). The rule is the one
+this plan already applies elsewhere: **a work package that needs a new shared helper puts it in its own case
+or test file, and a widening of `CompatContext` or of `stubDaemon` is a REQUEST to the Land owner.**
+`stubDaemon` already takes `Partial<Daemon>`, so no work package needs to edit it to override a verb.
 
 **Land-written, then TRANSFERRED permanently** (one owner each, and nobody else may edit them):
 
@@ -83,15 +90,15 @@ that the seams are real rather than aspirational.
 
 | # | hunk | default when the dep is absent |
 | - | ---- | ------------------------------ |
-| 1 | `CreateWorkerDeps` gains six optional fields: `interactions?`, `watchdog?`, `diff?`, `validateContent?`, `clientCapabilities?`, `limits.parkTimeoutMs?` | M1 |
+| 1 | `CreateWorkerDeps` gains six optional fields: `interactions?`, `watchdog?`, `diff?`, `validateContent?`, `clientCapabilities?`, `mcpServers?`, plus `limits.parkTimeoutMs?` and `limits.diffTimeoutMs?` (review R14) | M1 |
 | 2 | `#onPermissionRequest` → `this.#interactions.permission(mapped, ctx)`. M1's responder path becomes `baselineInteractions`'s body and moves out of this file **unchanged in behaviour** | M1 (baseline wrapper, byte-identical envelopes) |
 | 3 | `#onElicitation(params)` registered on the link; `mapElicitation` → `this.#interactions.elicitation(...)` | never called — the capability is not declared, and D10 says answer `decline` if it arrives anyway |
 | 4 | `#park(id)` / `#unpark(id)` — refcounted `running ⇄ requires_action`; the lease pin is **held**, the hibernate timer stays paused, and the watchdog is disarmed | never called |
 | 5 | `answerInteraction(reqId, a, who)` — `lease.assertHolder(who)` **first**, exactly as `prompt`/`cancel`/`wake` do (F22's payoff, again) | throws `interaction_not_found` (no strategy, nothing pending) |
-| 6 | `setConfig(body, who)` — lease-gated, `worker_busy` while running, auto-wake, `#configOptions` replaced **wholesale** from the result | `agent_error` (`-32601`) |
+| 6 | `setConfig(body, who)` — lease-gated, `worker_busy` while running, auto-wake, the `mapRequest` spelling loop (`-32601` ⇒ `noteUnsupported` ⇒ next spelling), `#configOptions` replaced **wholesale** from the result, and the synthesized `config_option_update` fed as an `agent_update` so the DESCRIPTOR decides whether it lands | `agent_error` (`-32601`) when every spelling is exhausted |
 | 7 | watchdog feed: `observe()` on every append, at prompt admission, at turn end, at park/unpark; `onFire` → `cancelInternal()` → M1's **existing** `cancel_timeout` escalation | disarmed |
-| 8 | diff: `#diffHandle = await this.#deps.diff?.begin({cwd, workerId})` at admission; `const p = await this.#deps.diff?.end(handle)` **immediately before** `#feed({type:"prompt_result", meta:{"omni/patch": p}})` | `patch: null` |
-| 9 | `await (this.#deps.validateContent ?? assertPromptContent)(content, …)` in `prompt()` | M0's text-only whitelist |
+| 8 | diff: `begin({cwd, workerId, signal})` at admission; `end(handle, {signal})` **immediately before** `#feed({type:"prompt_result", meta:{"omni/patch": p}})`. **Both bounded by `limits.diffTimeoutMs`** with an `AbortController`, and expiry stamps a real `PatchResult{quality:"unavailable"}` carrying `TurnWarning{code:"patch_timeout"}` rather than dropping the key (review R14) | `patch: null` |
+| 9 | `await (this.#deps.validateContent ?? assertTextOnlyContent)(content)` in `prompt()`, immediately after the check-and-set, rolling the admission back on rejection. The fallback is spelled **differently** from the injected `assertPromptContent` so a name-matching guard cannot pass while the injection is missing (review R2) | M0's text-only whitelist |
 
 Hunk 3 depends on a one-line `link.ts` edit, and **the parser it uses is the single most important line in
 this plan**:
@@ -105,6 +112,14 @@ properties the agent will actually read (F30: our accept filled both and it crea
 instead of `notes.md`) — and would strip the **flat** `sessionId`/`toolCallId`, the only scope the request
 carries (F29). `link.ts` already uses `verbatim` for `session/request_permission` (F43), so this is a
 registration and not a mechanism; the `no-elicitation-schema-parse` guard fails the build on any regression.
+
+**Hunk 6 is a BODY, not a stub** (review R12). `setConfig` had no seam any work package could reach: it ran
+the gates and then threw `unimplemented`, `CreateWorkerDeps` had no config hook, and `worker.ts` is frozen
+afterwards — so M2-A-WP-C's acceptance 1-6 and 8 all needed a frozen file. The wire call therefore lives
+here, and `core/src/worker/config-options.ts` keeps only the PURE halves WP-C owns and unit-tests against
+transcripts `15` and `07` with no link at all: `viewConfigOptions` (the entry view, `raw` by identity) and
+`configOptionsDelta` (the `removed`/`added` membership delta). `setConfigOption` is gone from §5.8.9 for the
+same reason: its body is this hunk.
 
 ### 1.3 The four seams
 
@@ -124,7 +139,7 @@ export function baselineInteractions(r: PermissionResponder, clock: Clock): Inte
     },
     async elicitation() { return { action: "decline" }; },     // D10, and never reached
     answer() { throw new OmniError("interaction_not_found", "no interaction is awaiting an answer"); },
-    get pending() { return []; }, settleAll() {}, close() {},
+    get pending() { return []; }, async settleAll() {}, close() {},
   };
 }
 ```
@@ -150,6 +165,21 @@ Its unit tests then need **no git installed at all**.
 `meta?: Record<string, unknown>`, merged into `state_update{idle}._meta` — the channel `omni/vendorPatch`
 and `omni/warnings` already ride (§12.5). The reducer does not know what any key means, which is what lets
 WP-J's git provider land with **zero** edits to `turn-lifecycle.ts` (ruling M2-R9).
+
+Concretely, and the whole of it: `TurnLifecycleState` carries `meta`, the `prompt_result` case sets it from
+`input.meta ?? state.meta` on **all three** branches (settle-now, settling and `rung > 0`), `IDLE` resets it,
+and `idle()` merges it into the local `_meta` record **before** stamping `omni/warnings` and
+`omni/vendorPatch` — so a provider key can never overwrite a reducer key. A turn with no meta emits
+byte-for-byte M0's payload, and `turn-lifecycle.test.ts`'s "seam D" block asserts both halves. Review R10 is
+the record that this hunk was declared and not written the first time; the chain
+`worker.ts → prompt_result.meta → idle._meta → reduceTurn` is dead at any missing link and produces the same
+`patch: null` a working M1 daemon produces, which is why it needs its own test rather than a reader's care.
+
+**A seam is DISPOSED, not only fed.** `InteractionStrategy.close()` and `Watchdog.cancel()` are called from
+every teardown path — `#doClose`, `#doHibernate` and the crash-hibernate — beside the three timer cancels
+that are already there (review R15). `settleAll` returns a promise and every caller awaits it, because the
+whole point of §19.8 is an ordering (`settleAll` **then** `session/cancel`) that a `void` method cannot
+express (review R1).
 
 ### 1.4 The two splits that keep six packages out of one file
 
@@ -206,6 +236,31 @@ return { …, lease,
    unedited** — the proof that M1 behaviour is the default and not a migration.
 9. `@omni-acp/protocol` still imports no other `@omni-acp/*` package; the §3.1 DAG holds.
 
+### 1.6 What the Land step actually produced, where it differs from §1.1–§1.5, and why
+
+The Land step ran, was reviewed adversarially, and the review's eighteen findings were applied. The rows
+below are the deviations from the plan as written above — each one a decision with a reason, recorded here so
+a work-package owner reads the plan and the tree saying the same thing.
+
+| # | deviation | why |
+| - | --------- | --- |
+| 1 | `tests/compat/src/cases/index.ts` is **Land-owned**, and §3's row now gives WP-J only `cases/patch.ts` | §1.1 and §3 disagreed. Resolved in favour of §1.1 and made moot: `index.ts` already imports all eight case files including the seven empty ones, so no work package ever edits the registry to add its cases |
+| 2 | `tests/compat/src/cases/support.ts` is a NEW Land-owned file | the split needed somewhere for `CompatCase`/`CompatContext` and the five shared helpers; putting them in `index.ts` would make every case file import the registry that imports it. Content is verbatim from the old `cases.ts` (review R9, R17) |
+| 3 | the seven per-package compat case factories return `[]` rather than throwing | `runner.ts` enumerates every case at LOAD, so a factory that threw would take M1's thirteen green cases with it. `[]` is the honest "this package has recorded no case yet", and `OMNI_COMPAT_REQUIRE=1` still turns an empty selection into a failure. Each file's header says so |
+| 4 | every M2 row on `WorkerSnapshot` / `WorkerRow` / `AgentCapabilitiesSnapshot.clientCapabilities` is optional; so are `InteractionPayload.{kind,raw,toolCallId,answer.parkedMs}` and `PolicyDecisionPayload.{kind,method,by,ruleSource,parkedMs}`; `CreateWorkerRequest`'s TS type is `z.input`; `PolicySelection` lives in `control-plane.ts` | all four are recorded in CONTRACTS §5.8's preamble with the reason. The load-bearing one is the payload optionality: Land exit criterion 3 requires an **M1** `events.db` to parse under the M2 schema, and an M1-written envelope carries none of those fields |
+| 5 | `Watchdog` gained a fourth member, `readonly config: ResolvedWatchdogConfig` | `WorkerSnapshot.watchdog` must report the resolved budgets and `worker.ts` is frozen; a worker handed the numbers a second time can disagree with its own watchdog. Recorded at the declaration and in CONTRACTS §5.8.8 |
+| 6 | `TurnResult.strandedToolCalls` is declared and **stubbed to `[]`** | computing it at Land would flip `permission-deny` and `tool-call-upsert` from `ok` to `partial` — i.e. implement behaviour, which the Land step must not, and which WP-W acceptance 8 says must not happen. **It stays M2-A-WP-W's to compute**, and M2-R8's full rule is spelled out at the stub so WP-W implements a written rule rather than an inferred one. The precedent is M1's `patch: null`. `pendingInteractions` IS folded, because it is provably `[]` on every M1 golden |
+| 7 | hunk 9 runs immediately **after** `#state = "running"`, not before the check-and-set | the M1 call sat before it, and an `await` there reopens the 50-concurrent-callers race the admission exists to close. The rollback on rejection is the existing `#step`-failure path, so the `400` still comes from `prompt()` (H8 unmoved) and F37/F38's "zero `session/prompt` calls" holds by construction |
+| 8 | `mapElicitation` is a free function on `@omni-acp/core`, not a `Normalizer` member, and `worker.ts` carries a small `mapElicitationFallback` | it is pure, total and holds no descriptor, so there is nothing per-runtime to branch on. The fallback returns the honest unparseable shape (`fields: []`, every property in `unmodelled`) — and since review R11 it also carries `raw`, which is what lets WP-I's real mapper run without reopening a frozen file |
+| 9 | `seqIds().request()`'s prefix is `q_`, not `r_` | `r_` is now `RunId`, and a fake whose opaque request ids look exactly like real run ids is a collision an `assertRunId` test would pass for the wrong reason |
+| 10 | the M1 corpus set is NAMED rather than globbed | `07e1086` added seven M2 transcripts without updating the M1 counts, so `corpus.test.ts` and the event-log acceptance were **already red on `main`** — confirmed by stashing and re-running. `corpus.test.ts` now asserts BOTH numbers, 11 M1 and 18 on disk, so a transcript nobody uses is still visible |
+| 11 | F42 is left UNFIXED in `session-open.ts`'s wake path | WP-I acceptance 2 is a regression test written FIRST; landing the fix would leave it passing on arrival. `handshake.ts` already threads `clientCapabilities` and records it AS SENT |
+| 12 | the seven fixture agents and the eight named guard tests were **not** created | they are behaviour, not signatures: each fixture encodes a recorded wire shape its owning package must get right, and several guards are specified as having to be demonstrated FAILING on a planted violation, which a stub cannot do. §3's "guard tests live with their owner" stands |
+| 13 | `Daemon.runs` / `Daemon.deliveries` are REQUIRED members filled by `unimplementedRuns()` / `unimplementedDeliveries()`; only the two list-shaped reads answer empty | every verb answers `bad_request` naming M2-B-WP-R — D29's honest "not implemented yet", the M1 Land precedent. A `list()` returning `[]` would say there are no runs, which is a different and worse lie |
+| 14 | `AuthContext.assertEnv(undefined)` and `assertMcp(undefined)` answer honestly instead of throwing | a request that asked for no env and no MCP is every M1 request, and refusing it would refuse the whole existing suite. Every non-empty case throws naming M2-B-WP-S. `assertPolicy` always throws — there is no "asked for nothing" reading of a policy question |
+| 15 | `persist/schema.ts` still says `SCHEMA_VERSION = 1`; `agents.{ci,local}.yaml` and `runtime/known.ts`'s new rows are untouched | all three are a work package's, named in §1.1 and §2. The files were transferred, not edited |
+| 16 | four blockers and eleven other findings from the 2026-09-09 review were applied on top of the Land commit | `docs/review/2026-09-09-m2-contract-review.md` carries the per-finding 处理记录. The four blockers were seams that had been declared and not wired: seam D's hunk in `turn-lifecycle.ts`, the raw request on both interaction arms, `Worker.setConfig`'s body, and the testkit's generic client-request hook |
+
 ---
 
 ## 2. Work packages
@@ -237,7 +292,9 @@ packages/core/src/worker/interaction/**          strategy.ts baseline.ts registr
 packages/core/src/worker/session-open.ts         ← Land-written, transferred (F42's wake-path fix)
 packages/core/src/normalizer/map/elicitation.ts
 packages/core/test/worker/interaction/**
-packages/core/test/normalizer/elicitation.test.ts
+packages/core/test/worker/permissions.test.ts             ← transferred by review R4 (M2-R3's payloadVersion flip)
+packages/core/test/normalizer/{elicitation.test.ts,support/emit.ts}
+packages/core/test/normalizer/golden/{03,04,09,10}-*.envelopes.json
 packages/daemon/src/http/routes/interactions.ts
 packages/daemon/test/http/interactions.test.ts
 packages/client/src/interactions.ts
@@ -254,8 +311,15 @@ tests/integration/src/{interaction-park,interaction-timeout,elicitation-gate}.it
 **Acceptance**
 
 1. `runInteractionConformance` passes for **`baselineInteractions` and the real strategy**, and the baseline
-   run's envelopes are **byte-identical to M1's** (asserted with a checked-in golden). `permission-deny` and
-   every M1 permission test run **unedited**.
+   run's envelopes are **identical to M1's modulo `payloadVersion` and the additive fields** — asserted
+   against a checked-in **M2** golden (review R4). Ruling M2-R3 flips `acp.interaction` to `payloadVersion 2`
+   with a mapped `request` beside `raw`, and §19.10 adds `kind`/`toolCallId`/`answer.parkedMs`, so a
+   byte-identical claim was never satisfiable; what IS asserted is that nothing else moved and that no M1
+   assertion is weakened. The files this bullet changes are listed in §3 as this package's:
+   `core/test/normalizer/golden/{03,04,09,10}-*.envelopes.json`, their emitter
+   `core/test/normalizer/support/emit.ts`, and `core/test/worker/permissions.test.ts`. Every M1 test that does
+   not spell the payload out — `permission-responder.test.ts`, compat's `permission-deny` verdict — runs
+   **unedited**, and that is the bullet's real content.
 2. `clientCapabilitiesFor` is `{elicitation:{form:{}}}` **iff** `onUnresolved === "park"`, `{}` otherwise, no
    `url` key ever, and **the same value is used on `reopen` after a wake**. There is a named regression test
    that FAILS against `session-open.ts:251`'s current hard-coded `{}` (F42) — write it first.
@@ -385,7 +449,7 @@ tests/integration/src/config-option.itest.ts
 packages/core/src/policy/**       engine.ts match.ts glob.ts subject.ts ceiling.ts presets.ts
 packages/core/src/worker/permission-responder.ts   ← Land-written, transferred; selectOption extracted
 packages/core/test/policy/**
-packages/core/test/worker/{permission-responder,permissions}.test.ts
+packages/core/test/worker/permission-responder.test.ts
 packages/daemon/src/policy/{resolve,ceiling}.ts
 packages/daemon/test/policy/**
 packages/testkit/src/policy-conformance.ts
@@ -469,7 +533,12 @@ tests/integration/src/{mcp-preset,prompt-content}.itest.ts
 7. `env.persist:false` forces `resume.method: null`; the worker refuses to hibernate under
    `whenNotResumable:"keep"` and the reason says why. A wake whose preset vanished from config closes with
    `acl_revoked`, matching §15.5's 403 row.
-8. `assertPromptContent` rejects, **before the prompt is sent**: a `resource_link` outside `cwdRoots`; a
+8. The `assert-prompt-content-is-called` guard is **structural** (review R2): it asserts that the daemon's
+   worker-creation path passes `deps.validateContent` bound to the token's `cwdRoots` and the worker's
+   `promptCapabilities` — not that some file mentions the name, which `worker.ts`'s deliberately
+   differently-spelled `assertTextOnlyContent` fallback would satisfy while the real check was absent. It is
+   demonstrated failing on a planted violation (the injection removed), beside the integration test below.
+   `assertPromptContent` itself rejects, **before the prompt is sent**: a `resource_link` outside `cwdRoots`; a
    symlink inside `cwd` that realpaths outside; a relative or non-`file://` uri; a `..` traversal; an
    embedded `resource` block failing any of the above; and a block type the worker's `promptCapabilities`
    does not advertise. **In every case the fixture agent recorded ZERO `session/prompt` calls** (F37, F38),
@@ -524,7 +593,10 @@ tests/integration/src/run-webhook.itest.ts
 8. A slow or dead receiver **never blocks a turn**: a run whose webhook hangs for `timeoutMs` reports its
    `TurnResult` at the same time as one with no webhook.
 9. `webhooks.mode:"allowlist"` with an empty `allow` makes a webhook run **`403` at create**, not at delivery;
-   a hostname resolving into `denyCidrs` is `403`. The URL is validated where the operator can see it.
+   a hostname resolving into `denyCidrs` is `403` — with **`169.254.169.254`, not loopback**, because the
+   local receiver every other bullet needs is on loopback and §24.6's CIDR check is absolute (review R16).
+   The test's own daemon config sets `denyCidrs: []` for the same reason. The URL is validated where the
+   operator can see it.
 10. `POST /v1/runs` = create + prompt + settle + close (or `keepWorker`), and `…/events?since=` returns the
     worker's envelopes with M1's exact `?since=` semantics — proven by **reusing `sse-resume.itest.ts`'s
     frame comparison** against a run's stream. A run whose worker parks reports `state:"requires_action"` and
@@ -542,13 +614,13 @@ packages/core/src/diff/**                   git-provider.ts temp-index.ts worktr
 packages/core/test/diff/**
 packages/core/src/runtime/known.ts          ← Land-written, transferred
 packages/daemon/src/{registry,create-daemon,auth,boot-recovery}.ts   ← Land-written, transferred
-packages/daemon/test/**  MINUS http/{lease,interactions,config,runs,webhooks}.test.ts, policy/**, mcp.test.ts
+packages/daemon/test/**  MINUS http/{interactions,config,runs,webhooks}.test.ts, policy/**, mcp.test.ts
 packages/client/src/{server,local,omni-acp,transport}.ts
 packages/client/test/**  MINUS {lease,interactions,config,runs}.test.ts
 packages/cli/{src,test}/**
 packages/testkit/src/git-fixture.ts
 packages/testkit/test/arch/**
-tests/compat/src/cases/{index,patch}.ts · tests/compat/agents.{ci,local}.yaml
+tests/compat/src/cases/patch.ts · tests/compat/agents.{ci,local}.yaml
 tests/integration/src/*.itest.ts   (the M2 files not owned above, incl. m2-acceptance)
 examples/03-interactive.mjs · examples/04-run-webhook.mjs · examples/daemon.example.yaml
 docs/M2-PLAN.md (this file's §5 record)
@@ -583,9 +655,10 @@ package already owns.
    `stop()` is `interactions.settleAll → dispatcher.drain(bounded) → workers → socket`. Both asserted by a
    recording order test.
 8. `runtime/known.ts` gains the `session_info_update` row (F25) and the `unverified` entries for
-   `elicitation.url`, `elicitation/complete`, `action:"cancel"`, multi-question forms, `parkTimeoutAction`,
-   `configOptionIdField` and — for codex — `cmd`-matching rules (F38); the compat suite **refuses to assert
-   an `unverified` row**, with a printed reason.
+   `elicitation.url`, `elicitation/complete`, `action:"cancel"`, multi-question forms, `parkTimeoutAction`
+   and — for codex — `cmd`-matching rules (F38); the compat suite **refuses to assert an `unverified` row**,
+   with a printed reason. There is **no `configOptionIdField` row**: the returned entry's key is `id` on both
+   agents, measured in claude `15` and codex `07`, so it is not a quirk at all (review R3, CONTRACTS §22.1).
 9. The full compat matrix runs: hermetic `agents.ci.yaml` green on three OSes with **zero unsourced skips**,
    and `OMNI_COMPAT_REAL=1` green against **claude-acp and codex-acp** with every skip carrying a source and
    a ≥10-character reason.
@@ -603,14 +676,14 @@ package already owns.
 
 | Path | Owner |
 | ---- | ----- |
-| root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/core/src/worker/handshake.ts`, `packages/core/src/acp/link.ts`, `packages/core/src/normalizer/turn-lifecycle.ts`, `packages/client/src/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `packages/testkit/src/{index,scripted-agent}.ts`, `tests/compat/src/{harness,runner,config}.ts` | **Land (frozen)** |
-| `packages/core/src/worker/interaction/**`, `packages/core/src/worker/session-open.ts`, `packages/core/src/normalizer/map/elicitation.ts`, `packages/core/test/worker/interaction/**`, `packages/core/test/normalizer/elicitation.test.ts`, `packages/daemon/src/http/routes/interactions.ts`, `packages/daemon/test/http/interactions.test.ts`, `packages/client/src/interactions.ts`, `packages/client/test/interactions.test.ts`, `packages/testkit/src/{interaction-conformance.ts, scripts/elicitation.ts}`, `packages/testkit/fixtures/agents/elicit-*.mjs`, `tests/compat/src/cases/elicitation.ts`, `tests/integration/src/{interaction-park,interaction-timeout,elicitation-gate}.itest.ts` | **M2-A-WP-I** |
+| root configs, `.github/**`, all `package.json` / `tsconfig.json` / `vitest.config.ts`, all `src/index.ts`, `packages/protocol/src/**` **except `turn.ts`**, `packages/core/src/worker/worker.ts`, `packages/core/src/worker/handshake.ts`, `packages/core/src/acp/link.ts`, `packages/core/src/normalizer/turn-lifecycle.ts`, `packages/client/src/worker.ts`, `packages/daemon/src/{types.ts, http/routes/index.ts, http/routes/workers.ts}`, `packages/testkit/src/{index,scripted-agent,stub-daemon}.ts`, `tests/compat/src/{harness,runner,config}.ts`, `tests/compat/src/cases/support.ts` | **Land (frozen)** |
+| `packages/core/src/worker/interaction/**`, `packages/core/src/worker/session-open.ts`, `packages/core/src/normalizer/map/elicitation.ts`, `packages/core/test/worker/interaction/**`, `packages/core/test/normalizer/elicitation.test.ts`, `packages/daemon/src/http/routes/interactions.ts`, `packages/daemon/test/http/interactions.test.ts`, `packages/client/src/interactions.ts`, `packages/client/test/interactions.test.ts`, `packages/testkit/src/{interaction-conformance.ts, scripts/elicitation.ts}`, `packages/testkit/fixtures/agents/elicit-*.mjs`, `tests/compat/src/cases/elicitation.ts`, `tests/integration/src/{interaction-park,interaction-timeout,elicitation-gate}.itest.ts`, **and — transferred by review R4, because ruling M2-R3's `payloadVersion` flip is what changes them —** `packages/core/test/normalizer/golden/{03,04,09,10}-*.envelopes.json`, `packages/core/test/normalizer/support/emit.ts`, `packages/core/test/worker/permissions.test.ts` | **M2-A-WP-I** |
 | `packages/core/src/worker/{watchdog,watchdog-state}.ts`, `packages/core/test/worker/{watchdog,watchdog-state}.test.ts`, `packages/protocol/src/turn.ts`, `packages/protocol/test/{turn,turn-golden}.test.ts`, `packages/testkit/src/fake-diff-provider.ts`, `packages/testkit/fixtures/agents/stall-*.mjs`, `tests/compat/src/cases/watchdog.ts`, `tests/integration/src/watchdog.itest.ts` | **M2-A-WP-W** |
 | `packages/core/src/worker/config-options.ts`, `packages/core/test/worker/config-options.test.ts`, `packages/daemon/src/http/routes/config.ts`, `packages/daemon/test/http/config.test.ts`, `packages/client/src/config.ts`, `packages/client/test/config.test.ts`, `tests/compat/src/cases/config-option.ts`, `tests/integration/src/config-option.itest.ts` | **M2-A-WP-C** |
-| `packages/core/src/policy/**`, `packages/core/src/worker/permission-responder.ts`, `packages/core/test/policy/**`, `packages/core/test/worker/{permission-responder,permissions}.test.ts`, `packages/daemon/src/policy/**`, `packages/daemon/test/policy/**`, `packages/testkit/src/{policy-conformance.ts, scripts/permission.ts}`, `packages/testkit/fixtures/agents/permission-allow-always-only.mjs`, `tests/compat/src/cases/permission.ts`, `tests/integration/src/policy-ceiling.itest.ts` | **M2-B-WP-P** |
+| `packages/core/src/policy/**`, `packages/core/src/worker/permission-responder.ts`, `packages/core/test/policy/**`, `packages/core/test/worker/permission-responder.test.ts`, `packages/daemon/src/policy/**`, `packages/daemon/test/policy/**`, `packages/testkit/src/{policy-conformance.ts, scripts/permission.ts}`, `packages/testkit/fixtures/agents/permission-allow-always-only.mjs`, `tests/compat/src/cases/permission.ts`, `tests/integration/src/policy-ceiling.itest.ts` | **M2-B-WP-P** |
 | `packages/core/src/mcp/**`, `packages/core/src/worker/{prompt-content,env}.ts`, `packages/core/test/mcp/**`, `packages/core/test/worker/{prompt-content,env}.test.ts`, `packages/daemon/src/mcp.ts`, `packages/daemon/test/mcp.test.ts`, `packages/testkit/fixtures/mcp/**`, `tests/compat/src/cases/prompt-content.ts`, `tests/integration/src/{mcp-preset,prompt-content}.itest.ts` | **M2-B-WP-S** |
 | `packages/core/src/{run,webhook}/**`, `packages/core/src/persist/**`, `packages/core/test/{run,webhook,persist}/**`, `packages/daemon/src/runs.ts`, `packages/daemon/src/http/routes/{runs,webhooks}.ts`, `packages/daemon/test/http/{runs,webhooks}.test.ts`, `packages/client/src/runs.ts`, `packages/client/test/runs.test.ts`, `packages/testkit/src/webhook-receiver.ts`, `tests/compat/src/cases/webhook-run.ts`, `tests/integration/src/run-webhook.itest.ts` | **M2-B-WP-R** |
-| `packages/core/src/diff/**`, `packages/core/test/diff/**`, `packages/core/src/runtime/known.ts`, `packages/daemon/src/{registry,create-daemon,auth,boot-recovery}.ts`, `packages/daemon/test/**` (minus the rows above), `packages/client/src/{server,local,omni-acp,transport}.ts`, `packages/client/test/**` (minus the rows above), `packages/cli/{src,test}/**`, `packages/testkit/src/git-fixture.ts`, `packages/testkit/test/arch/**`, `tests/compat/src/cases/{index,patch}.ts`, `tests/compat/agents.*.yaml`, `tests/integration/src/*.itest.ts` (minus the rows above), `examples/**` | **M2-WP-J** |
+| `packages/core/src/diff/**`, `packages/core/test/diff/**`, `packages/core/src/runtime/known.ts`, `packages/daemon/src/{registry,create-daemon,auth,boot-recovery}.ts`, `packages/daemon/test/**` (minus the rows above), `packages/client/src/{server,local,omni-acp,transport}.ts`, `packages/client/test/**` (minus the rows above), `packages/cli/{src,test}/**`, `packages/testkit/src/git-fixture.ts`, `packages/testkit/test/arch/**`, `tests/compat/src/cases/patch.ts`, `tests/compat/agents.*.yaml`, `tests/integration/src/*.itest.ts` (minus the rows above), `examples/**` | **M2-WP-J** |
 
 Every path not listed keeps its M1 owner and its M1 content; an M2 work package that needs one edited files a
 request to the Land owner rather than editing it.
@@ -652,7 +725,8 @@ passed, and `OMNI_COMPAT_REQUIRE=1` turns an empty selection into a failure.
 `createDaemon({ listen: {host:"127.0.0.1", port:0}, dataDir: <mkdtemp>, eventLog: {driver:"sqlite"},
 hibernate: {idleMs: 60_000}, watchdog: {silentMs: 300_000, toolMs: 8_000, cancelTimeoutMs: 20_000},
 interaction: {parkTimeoutMs: 0}, diff: {provider:"git"},
-webhooks: {enabled:true, mode:"allowlist", allow:[<the local receiver's origin>], secrets:{ci:<32 bytes>}},
+webhooks: {enabled:true, mode:"allowlist", allow:[<the local receiver's origin>], denyCidrs: [],
+           secrets:{ci:<32 bytes>}},
 policy: {presets: {…}}, tokens: [<admin>, <second user token on the same cwdRoot>],
 agents: [<the YAML entry, resolved for this platform>] })`, `daemon.start()`, then **two** SDK clients on one
 token with distinct client ids: `A` (the controller) and `B` (the observer).
@@ -714,7 +788,12 @@ shows the paired `question_0_custom` property **absent from the wire** (F30's re
 
 **Step 4 — webhook (a local receiver, both agents).**
 
-- `fakeWebhookReceiver()` on loopback, its origin in `webhooks.allow`.
+- `fakeWebhookReceiver()` on loopback, its origin in `webhooks.allow` — **and `denyCidrs: []` in the setup
+  config above, which is the whole reason it is spelled there** (review R16). CONTRACTS §24.6 makes the CIDR
+  check absolute: an `allow` entry does not exempt an address, so the default `denyCidrs` (which contains
+  `127.0.0.0/8`) would `403` every webhook run in this script, in `run-webhook.itest.ts` and in the hermetic
+  CI matrix. WP-R acceptance 9's "resolves into `denyCidrs` ⇒ 403" fixture therefore uses a NON-loopback deny
+  address — `169.254.169.254` — rather than the receiver's own.
 - `A.runs.create({ agent, cwd, prompt: "Reply with exactly the word PONG.", webhook: {url, secret:"ci"} })`.
 - Assert **exactly one** delivery, `Omni-Signature` verifies against the configured secret, the body has
   **exactly eight keys**, and `GET /v1/runs/{rid}` reports `succeeded` with a `TurnResult`.
@@ -752,10 +831,10 @@ and compat `testTimeout: 180_000`, `retry: 1`.
 ## 5. Definition of done for M2
 
 1. `pnpm -r build && pnpm test` green on ubuntu-latest, macos-latest and windows-latest, with **all 2166 M1
-   tests still passing unmodified** — except the handful whose shape the contract requires (the snapshot
-   `toEqual` assertions, the `acp.interaction` payload goldens, the `CreateWorkerRequest.mcp`/`onUnresolved`
-   widening, and the `WhoAmIResponse.policyCeiling` type). **No test is weakened**; each change is listed in
-   the M2 Land commit's message with the section that requires it.
+   tests still passing unmodified** — except the handful whose shape the contract requires. **No test is
+   weakened**; each change is listed in §5.1 below with the section that requires it. (M2 DoD 1 originally
+   said "in the M2 Land commit's message"; review R18 moved the record HERE, because a commit message is not
+   amendable and a table a reviewer can diff against the tree is the artefact this bullet actually wants.)
 2. **M2-A is green and shippable before any M2-B package merges.** With `policy`, `diff`, `webhooks` and
    `runs` absent from `DaemonDeps`, the daemon is M1 plus a park, and the M1 suite proves it (ruling M2-R1).
 3. Every acceptance bullet in §2 passes, and every architecture guard in CONTRACTS §10.2 and §27.4 passes —
@@ -775,6 +854,35 @@ and compat `testTimeout: 180_000`, `retry: 1`.
    rewrote it.
 8. `docs/CONTRACTS.md` §2.3's M2 rows are struck through with the section that replaced each, and §11.8's
    rulings are the only place a proposal disagreement is resolved.
+
+### 5.1 The M1 tests the contract required to change — the complete list
+
+Each row is a SHAPE change the contract requires and each carries an inline comment in the file saying so.
+**None is a weakening**: no assertion was deleted, relaxed or replaced with a looser matcher.
+
+| file(s) | what changed | required by |
+| ------- | ------------ | ----------- |
+| `packages/protocol/test/transcripts/*.expected.json` (12 files) | additive `patchInfo` / `strandedToolCalls` / `pendingInteractions` on every `TurnResult`; `permission-deny.expected.json` also gains the widened `InteractionRecord` fields | §5.8.5 (`TurnResult`, `InteractionRecord`), M2-R3, M2-R8 |
+| `packages/core/test/worker/permissions.test.ts` | the widened `InteractionRecord` rows (`kind`, `method`, `by`, `parkedMs`, `toolCallId`), each with an M1 reading that is a TRUTH about an M1 daemon rather than a guess | §5.8.5, M2-R3 |
+| `packages/client/test/prompt.test.ts` | the same widening, seen through the SDK | §5.8.5 |
+| `packages/core/test/worker/handshake.test.ts` | `clientCapabilities: {}` on `AgentCapabilitiesSnapshot` — recorded AS SENT (F28, F42) | §5.8.4 |
+| `packages/core/test/normalizer/corpus.test.ts`, `packages/core/test/normalizer/support/corpus-facts.ts`, `packages/core/test/event-log/m1-acceptance.test.ts` | the corpus grew 11 → 18 transcripts, so the M1 set is now **NAMED** (`M1_TRANSCRIPTS`, `M1_CORPUS_FILES`) instead of globbed; `corpus.test.ts` asserts BOTH counts so a transcript nobody uses is still visible. This was **pre-existing red on `main`** from `07e1086`, fixed here (Land note S13) | §18, §27.3 |
+| `packages/protocol/test/config.test.ts` | M2 defaults; `CreateWorkerRequest` now ACCEPTS `mcp`/`policy`/`env`/`park` and still refuses a command object; `PromptRequestBody` no longer decides block types | §5.8.6, §5.8.7, H28 |
+| `packages/protocol/test/errors.test.ts` | the two new codes and only two | M2-R2 |
+| `packages/protocol/test/events-schema.test.ts` | the `omni.run` arm, plus two NEW tests: an M1-era envelope still parses, and M2's widened arms parse | §5.8.3, Land exit criterion 3 |
+| `packages/daemon/test/registry.test.ts`, `packages/daemon/test/http/routes.test.ts` | H28 moved the block-TYPE decision out of the schema, so these assert the SHAPE boundary the route still owns and that types are forwarded | H28, §26.2 |
+| `packages/daemon/test/create-daemon.test.ts`, `packages/testkit/test/stub-daemon.test.ts` | `whoami`'s three new fields | §5.8.6 |
+| `packages/daemon/test/arch/http-has-no-logic.test.ts` | the four new route modules, all still covered | §27.4 |
+| `packages/testkit/test/seq-ids.test.ts` | `seqIds().request()`'s prefix `r_` → `q_`, because `r_` is now `RunId` and a fake whose request ids look like run ids is a collision an `assertRunId` test would pass for the wrong reason (Land note S12) | §5.8.1 |
+| `tests/integration/src/exports-are-stable.itest.ts` | records the new runtime AND type surface | WP-J acceptance 12 |
+
+Two further edits belong to the **review** of this Land step rather than to the Land step itself, and are
+listed for the same reason:
+
+| file(s) | what changed | required by |
+| ------- | ------------ | ----------- |
+| `packages/core/test/normalizer/turn-lifecycle.test.ts` | a new `seam D` block: `prompt_result.meta` reaches `idle._meta` verbatim, a turn with no meta emits byte-for-byte M0's payload, a reducer-owned key wins over a provider key of the same name, and one turn's meta never reaches the next | review R10, M2-R9 |
+| `tests/integration/src/exports-are-stable.itest.ts`, `packages/core/test/worker/config-options.test.ts` | `setConfigOption` → `configOptionsDelta` on `@omni-acp/core`'s barrel: the wire call moved into `Worker.setConfig` | review R12, §5.8.9 |
 
 ### Real-agent record
 
