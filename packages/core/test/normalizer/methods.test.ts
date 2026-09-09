@@ -64,12 +64,16 @@ describe("§17.3 — preference order over spellings", () => {
   it("falls to the NEXT spelling once the first is retired, and renames its params (row 25)", () => {
     const out = call(
       "session/set_config_option",
-      { configId: "mode", value: "acceptEdits" },
+      { sessionId: "sess_1", configId: "mode", value: "acceptEdits" },
       new Set(["session/set_config_option"]),
     );
+    // `sessionId` SURVIVES the rename. Corpus `claude-acp/08` sends
+    // `session/set_mode {sessionId, modeId}` and the SDK's agent spec answers `-32602` without
+    // it, so a rule that dropped it would fail on every real agent while this test — whose input
+    // used to carry no `sessionId` at all — stayed green.
     expect(out).toEqual({
       method: "session/set_mode",
-      params: { modeId: "acceptEdits" },
+      params: { sessionId: "sess_1", modeId: "acceptEdits" },
       spelling: "session/set_mode",
       onFailure: "fail",
     });
@@ -78,15 +82,27 @@ describe("§17.3 — preference order over spellings", () => {
   it("row 26: `set_model` is a SPELLING, and its params are renamed when it is the one in force", () => {
     const out = callThree(
       "session/set_config_option",
-      { configId: "model", value: "sonnet" },
+      { sessionId: "sess_1", configId: "model", value: "sonnet" },
       new Set(["session/set_config_option", "session/set_mode"]),
     );
     expect(out).toEqual({
       method: "session/set_model",
-      params: { modelId: "sonnet" },
+      params: { sessionId: "sess_1", modelId: "sonnet" },
       spelling: "session/set_model",
       onFailure: "fail",
     });
+  });
+
+  it("...and a rename that has no `sessionId` to carry OMITS the key rather than sending it undefined", () => {
+    // `toEqual` treats `{sessionId: undefined, modeId: "x"}` and `{modeId: "x"}` as equal, so the
+    // assertion above cannot tell the two apart. `JSON.stringify` can, and it is what reaches the
+    // wire — hence a check on the bytes.
+    const out = call(
+      "session/set_config_option",
+      { configId: "mode", value: "acceptEdits" },
+      new Set(["session/set_config_option"]),
+    );
+    expect(JSON.stringify(out.params)).toBe('{"modeId":"acceptEdits"}');
   });
 
   it("does NOT reach for `set_model` on claude-acp, whose table stops at two (F18)", () => {

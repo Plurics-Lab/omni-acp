@@ -43,6 +43,17 @@ const CAPABILITY_OF: Readonly<Record<string, string>> = {
  * method can be the answer to two different canonical calls on different runtimes. A pair with
  * no entry passes its params through, which is what row 26b's vendor extension needs.
  */
+/**
+ * `sessionId`, carried through a rename, and ABSENT rather than `undefined` when there is none.
+ *
+ * An explicit `sessionId: undefined` survives an object literal and `toEqual`, but not
+ * `JSON.stringify` — so a test asserting the mapped params would pass while the bytes on the wire
+ * were missing the field. Omitting the key makes the two agree.
+ */
+function sessionOf(p: Record<string, unknown>): Record<string, unknown> {
+  return has(p, "sessionId") ? { sessionId: p["sessionId"] } : {};
+}
+
 const PARAM_RULES: Readonly<
   Record<string, (p: Record<string, unknown>) => Record<string, unknown>>
 > = {
@@ -50,13 +61,26 @@ const PARAM_RULES: Readonly<
   // (it "accepts and ignores" it, F18) but it is not in v1's schema, and an agent that
   // validates its params would reject the whole call over a field we invented for it.
   "session/resume session/load": ({ replayFrom: _replayFrom, ...rest }) => rest,
-  // Row 25: `{configId, value}` → `{modeId}`. `session/set_mode` is still live on the same
-  // process that answers `session/set_config_option` (F18), so this is a real fallback and
-  // not a legacy branch.
-  "session/set_config_option session/set_mode": (p) => ({ modeId: p["value"] }),
+  // Row 25: `{sessionId, configId, value}` → `{sessionId, modeId}`. `session/set_mode` is still
+  // live on the same process that answers `session/set_config_option` (F18), so this is a real
+  // fallback and not a legacy branch.
+  //
+  // `sessionId` is CARRIED, not dropped. Both vendor spellings are session-scoped: corpus
+  // `claude-acp/08` sends `session/set_mode {sessionId, modeId}` and `session/set_model
+  // {sessionId, modelId}` on the wire, and the ACP SDK's own agent spec answers `-32602` without
+  // it. Renaming here is about the value's KEY, never about which session it applies to — a rule
+  // that dropped it would make every fallback spelling fail on a real agent while every unit
+  // test whose input happened to carry no `sessionId` stayed green (found by M2-A-WP-C).
+  "session/set_config_option session/set_mode": (p) => ({
+    ...sessionOf(p),
+    modeId: p["value"],
+  }),
   // Row 26: the vendor spelling multica saw on 8 runtimes. `-32601` on claude-acp, which is
   // exactly why it is a SPELLING behind a preference order rather than a method we call.
-  "session/set_config_option session/set_model": (p) => ({ modelId: p["value"] }),
+  "session/set_config_option session/set_model": (p) => ({
+    ...sessionOf(p),
+    modelId: p["value"],
+  }),
 };
 
 export function mapRequest(
