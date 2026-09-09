@@ -570,6 +570,9 @@ const EXPECTED: Record<string, readonly string[]> = {
     "fakeSupervisor",
     "fakeWebhookReceiver",
     "fixtureAgentPath",
+    // M2-WP-J: a compat case cannot use `tempRepo()` — a worker's cwd is ACL-checked against the
+    // token's `cwdRoots`, so the repository has to be made INSIDE the harness workspace.
+    "initGitRepoAt",
     "isAlive",
     "loadTranscript",
     "memoryStreamPair",

@@ -60,7 +60,17 @@ export type FixtureAgentName =
    * M2-B-WP-P's degenerate menu: the ONLY grant offered is an `allow_always`, which D4 rule 3
    * forbids selecting by any path, so an `allow` verdict has to downgrade rather than take it.
    */
-  | "permission-allow-always-only";
+  | "permission-allow-always-only"
+  /**
+   * M2-WP-J's writer: the only fixture that actually WRITES to its own cwd, and the only way to
+   * make a git patch that is not empty. The SDK example agent SIMULATES its edit
+   * (`rawOutput: {success:true}`) and never touches the disk, so it can prove a permission was
+   * allowed and nothing at all about D8.
+   *
+   * `PATCH_INIT_GIT=1` makes it create `.git/` mid-turn, which is F39's observed codex-acp
+   * behaviour and the only deterministic reproduction of it.
+   */
+  | "patch-writer";
 
 /**
  * Absolute path to one of the repository's own fixture agents (`fixtures/agents/*.mjs`).
