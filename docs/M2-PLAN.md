@@ -955,4 +955,199 @@ OMNI_COMPAT_REAL=1 OMNI_COMPAT_CONFIG=agents.local.yaml OMNI_COMPAT_REQUIRE=1 \
   npx vitest run --project compat
 ```
 
-<!-- RESULTS -->
+#### Result: green, twice in a row
+
+| run | at | passed | failed | skipped | wall |
+| --- | -- | ------ | ------ | ------- | ---- |
+| 1 | 10:53:33Z | 46 | 0 | 10 | 318 s |
+| 2 | 11:00:13Z | 46 | 0 | 10 | 344 s |
+
+Per agent: `claude-acp` 26 passed / 4 skipped (168 s, 184 s); `codex-acp` 20 passed / 6 skipped
+(150 s, 160 s). Zero agents skipped at selection, and `OMNI_COMPAT_REQUIRE=1` was set both times, so an
+empty selection would have failed rather than passed quietly.
+
+Per case, run 1 / run 2, in milliseconds:
+
+| case | claude 1 | claude 2 | codex 1 | codex 2 |
+| ---- | -------- | -------- | ------- | ------- |
+| `handshake` | 4890 | 4605 | 6864 | 6316 |
+| `plain-turn` | 3632 | 4269 | 3464 | 2725 |
+| `tool-turn` | 4160 | 19213 | 8888 | 15615 |
+| `stream-resume` | 1846 | 2630 | 2162 | 2692 |
+| `cancel-late-update` | 3011 | 3066 | 7717 | 7670 |
+| `tool-merge` | 4111 | 8262 | 6862 | 8517 |
+| `permission-deny` | 4461 | 6128 | skip | skip |
+| `hibernate-wake` | 12894 | 12066 | 16402 | 16569 |
+| `resume-cwd-mismatch` | 4362 | 4360 | 4004 | 4267 |
+| `lease` | 6658 | 7233 | 10795 | 10787 |
+| `restart-survives` | 604 | 602 | 2371 | 2376 |
+| `unknown-method` | 5 | 3 | 4 | 3 |
+| `idempotent-map` | 156 | 154 | 155 | 156 |
+| `elicitation-gated` | 20314 | 18156 | skip | skip |
+| `elicitation-answer` | 16126 | 13421 | skip | skip |
+| `interaction-park-timeout` | 16388 | 18119 | skip | skip |
+| `permission-hard-rules` | 8120 | 7588 | skip | skip |
+| `permission-allow` | 7022 | 7066 | skip | skip |
+| `config-set` | 3051 | 2842 | 4119 | 4325 |
+| `watchdog-cancel` | 15345 | 13959 | 18858 | 20540 |
+| `watchdog-late-update` | 5781 | 5578 | 8419 | 7531 |
+| `run-webhook` | 5419 | 4876 | 8380 | 9711 |
+| `prompt-content-out-of-cwd-link` | 2564 | 2605 | 4136 | 4312 |
+| `prompt-content-bad-uri` | 2623 | 2753 | 4009 | 4192 |
+| `patch-git` | 7656 | 6990 | 17141 | 16595 |
+| `patch-outside-a-repo` | 7056 | 7215 | 14977 | 14867 |
+
+**Every skip, with its source.** Ten, identical in both runs, and not one of them is a case this suite
+implements and quietly passed:
+
+| agent | case | source | reason |
+| ----- | ---- | ------ | ------ |
+| claude-acp | `plan-update` | config | no todo/plan tool in this build; two deliberate attempts produced no `plan` (corpus 05/05b) |
+| claude-acp | `agent-thought` | config | not emitted at default effort (corpus) |
+| claude-acp | `current-mode-update` | config | `session/set_mode` answers with the v2 `config_option_update` (corpus 08) |
+| claude-acp | `git-patch-from-diff-blocks` | config | v1 diff blocks are widened fragments; a patch from them is a vendor extension (F19). D8's git provider reads the disk instead, and `patch-git` asserts that |
+| codex-acp | `permission-deny` | config | codex-acp 1.8.0 auto-approves file edits in every mode incl. read-only and for paths outside the workspace; no `request_permission` is ever sent |
+| codex-acp | `elicitation-gated` | capability | `"elicitation"` is unverified for this runtime (§17.2) |
+| codex-acp | `elicitation-answer` | capability | `"elicitation"` is unverified for this runtime (§17.2) |
+| codex-acp | `interaction-park-timeout` | capability | `"elicitation"` is unverified for this runtime (§17.2) |
+| codex-acp | `permission-hard-rules` | capability | `"permission"` is unverified for this runtime (§17.2) |
+| codex-acp | `permission-allow` | capability | `"permission"` is unverified for this runtime (§17.2) |
+
+The first four are claude's M1 corpus gaps, reported under their own names because the runner prints a
+declared skip even when this suite implements no case by that name. The other six are M2's whole point:
+**codex-acp asks for nothing**, so every interaction case is a printed `capability` skip sourced from its
+own `unverified` list, and never a pass.
+
+#### Step 0 — the two `ProbeSummary`s
+
+One process each, `cached: true` on the second call.
+
+`claude-acp`, `runtimeId = claude-acp@7c8f2ec1ff53` (unchanged since M1's record):
+
+```json
+{
+  "agentInfo": { "name": "@agentclientprotocol/claude-agent-acp", "title": "Claude Agent", "version": "0.73.0" },
+  "protocolVersion": 1,
+  "resumeMethod": "session/resume",
+  "capabilities": { "loadSession": true, "promptCapabilities": {"image": true, "embeddedContext": true},
+                    "mcpCapabilities": {"http": true, "sse": true},
+                    "sessionCapabilities": {"resume":{}, "list":{}, "close":{}, "delete":{}, "fork":{},
+                                            "additionalDirectories":{}, "subagents":{}},
+                    "_meta": {"claudeCode": {"promptQueueing": true}} },
+  "supportedMethods": ["session/set_mode", "session/set_config_option", "session/list",
+                       "session/resume", "session/load", "session/close"],
+  "unsupportedMethods": ["session/set_model", "session/set_options"],
+  "learnedParams": { "session/set_mode": "modeId", "session/set_config_option": "configId",
+                     "session/resume": "cwd", "session/load": "cwd" },
+  "timings": { "initialize": 1013, "session/new": 880, "total": 2191 }
+}
+```
+
+`codex-acp`, `runtimeId = codex-acp@26239baadfe2` — the descriptor M2-WP-J added, selected by the
+catalog for the first time:
+
+```json
+{
+  "agentInfo": { "name": "@agentclientprotocol/codex-acp", "title": "Codex", "version": "1.8.0" },
+  "protocolVersion": 1,
+  "resumeMethod": "session/resume",
+  "capabilities": { "loadSession": true, "promptCapabilities": {"image": true, "embeddedContext": true},
+                    "mcpCapabilities": {"acp": false, "http": true, "sse": false},
+                    "sessionCapabilities": {"resume":{}, "list":{}, "close":{}, "delete":{}, "fork":{},
+                                            "additionalDirectories":{}, "subagents":{}} },
+  "supportedMethods": ["session/set_model", "session/set_mode", "session/set_config_option",
+                       "session/list", "session/resume", "session/load", "session/close"],
+  "unsupportedMethods": ["session/set_options"],
+  "learnedParams": { "session/set_mode": "modeId", "session/set_config_option": "configId",
+                     "session/resume": "cwd", "session/load": "cwd" },
+  "timings": { "initialize": 1850, "session/new": 179, "total": 2175 }
+}
+```
+
+Two rows in there are new information, and both are recorded rather than smoothed over:
+
+1. **codex-acp implements `session/set_model`**, which claude-acp answers `-32601` (F18). The corpus never
+   probed it for codex. The descriptor's `prefer.setConfig` still lists only `session/set_config_option`,
+   because that is the spelling the corpus shows WORKING (`07`) and §17.2's rule is that a table row is an
+   observation — a probe that shows a method exists is not a recording of it doing the right thing.
+2. **`session/set_options` is `-32601` on BOTH agents**, so the generic v1 profile's `onFailure: "warn"` for
+   it is the right disposition for the two runtimes that exist.
+
+#### §11.9's first risk, answered: what a real agent does with a park nobody answers
+
+`interaction-park-timeout` is the case that exists to DISCOVER this rather than confirm it, and it passed
+in both runs (16.4 s, 18.1 s) with `parkTimeoutMs: 5000`:
+
+* **claude-acp does not time an unanswered `elicitation/create` out on its own** — not within our five
+  seconds, and not before the turn ended. OUR timer fired first, every time.
+* The daemon's `deny` landed on a **live** JSON-RPC id: the agent read it and finished the turn normally
+  (`status:"expired"`, `answer.by:"timeout"`, and the turn's verdict `ok`/`partial`, never `failed`).
+* The agent then says so in prose — *"I asked which filename to use, but the question came back unanswered
+  — so I've paused without creating anything"* — and stops. It does not retry the question and does not
+  proceed without an answer.
+
+So the risk §11.9 named ("nobody knows whether claude-acp times an unanswered `elicitation/create` out on
+its own, or what it does with an answer that arrives late") is settled in the direction that makes our park
+timer meaningful: it is the only clock in the loop. `elicitation_url`, `elicitation/complete`,
+`action:"cancel"`, multi-question forms and `parkTimeoutAction`'s `fail` arm all remain `unverified`, and
+the compat suite still refuses to assert them.
+
+#### What the runs contradicted, and what they added
+
+| what | where it came from | what the run showed |
+| ---- | ------------------ | ------------------- |
+| "a `park` worker declares `elicitation:{form:{}}`, and that is enough" | D10 narrowed corpus `12`'s `{form, url}` to `form` (§19.2), untested | **Confirmed live.** The agent elicits with `form` alone; `url` stays undeclared |
+| "ask for a 30-second shell command and the tool call stays open" | corpus `16` (`python3 -c 'time.sleep(30)'`) | **Only if you say so.** Asked in general terms, claude-acp answers *"I'll run that in the background so it doesn't block"* and the call COMPLETES in ~5 s. §27.2's exact command plus "do NOT run it in the background" reproduces F36 |
+| "one interaction per turn" | never written down; assumed by two cases | **False.** A turn that asks a question and then acts on the answer parks TWICE: the elicitation, then `session/request_permission` for the write. A caller that answers only the first hangs the turn until `parkTimeoutMs` |
+| F39, codex creating `.git/` mid-session | codex `08`'s `workspace_after` | **Not reproduced in these runs** — the two codex `patch-*` cases got `patch_not_a_repo`, which is the same honest answer either way. The behaviour has its own deterministic test (`patch.itest.ts` drives `patch-writer.mjs` with `PATCH_INIT_GIT=1`) rather than waiting for an agent to do it again |
+
+#### Everything §4 asked for, and where it is proven
+
+| §4 step | proven by |
+| ------- | --------- |
+| 1 — park → observer's `423` → answer → file on disk | `m2-acceptance.itest.ts` step 1 (fixture, deterministic) and `elicitation-gated` / `permission-allow` (both agents' half of it, live) |
+| 1b — the elicitation control | `elicitation-gated`'s `deny` worker: no `elicitation/create`, `end_turn` anyway |
+| 2 — watchdog, both budgets | `watchdog-cancel` and `watchdog-late-update`, live on BOTH agents, plus `watchdog.itest.ts`'s fixtures |
+| 3 — config | `config-set`: claude `model` → `haiku`, codex `mode` → `read-only`, both replacing the list wholesale |
+| 4 — webhook | `run-webhook` live on both agents; the restart-mid-delivery half is `run-webhook.itest.ts` |
+| 5 — patch | `patch-git` and `patch-outside-a-repo` live on both, `patch.itest.ts` for `git apply --check` and F39 |
+| 6 — containment | `prompt-content-out-of-cwd-link` and `prompt-content-bad-uri`, live on both |
+| 7 — the M1 bar | M1's thirteen cases, green on both agents in both runs |
+
+The one thing §4 asks for that is NOT in the compat suite is the CI job: the real-agent file stays
+`OMNI_COMPAT_REAL=1` and manual, because neither login exists in a GitHub runner and a `workflow_dispatch`
+job that can only ever fail is worse documentation than this record.
+
+#### What the real runs found, and what changed because of it
+
+Four observations, each of which changed a case or a line of code. None was reachable from a fixture,
+which is the argument for running this suite at all.
+
+1. **A policy that DECIDES leaves nothing to park.** `onUnresolved` governs what happens when the policy
+   could not decide, and the daemon's default preset is `deny-all` — which decides everything, including
+   an `elicitation/create`. Observed on claude-acp: with no policy the request comes back
+   `decision:"deny", by:"policy", rule:"deny-all#default"`, the SDK's `on("interaction")` never fires, and
+   the agent carries on in prose ("I asked which filename to use, but the question came back unanswered").
+   The three elicitation cases now create their worker under `policy: {default: "park"}`; with it, the same
+   request arrives at the handler and settles `by:"human"`.
+
+2. **`elicitation: {form: {}}` alone is enough.** Corpus `12` declared `{form:{}, url:{}}` and D10 narrows
+   that to `form` only (§19.2) — nobody had checked whether claude-acp elicits without `url`. It does:
+   the run's `initialize` carries `{"elicitation":{"form":{}}}` and the agent asks its question anyway.
+   `elicitation.url` therefore stays undeclared and `elicitation_url` stays `unverified` for a reason
+   that is now measured rather than assumed.
+
+3. **claude-acp backgrounds a long shell command by default.** Asked for "a shell command that sleeps for
+   30 seconds", it answers *"I'll run that in the background so it doesn't block"*, the `tool_call`
+   completes in about five seconds, and there is nothing for a tool budget to fire on — the case failed
+   with `stopReason:"end_turn"` at 9.9 s. Naming §27.2's exact command and forbidding the background
+   reproduces F36 exactly: the call opens `pending`, the 8 s tool budget fires
+   (`cancelling the turn on the daemon's own initiative … watchdog_tool`), the turn settles
+   `stopReason:"cancelled"` with one `strandedToolCalls` entry and no terminal update ever arrives.
+
+4. **This machine's own harness blocks `sleep 30 && echo WOKE`** for the nested agent — the outer
+   environment's guardrail reaching the agent under test, which answered *"The command was blocked by the
+   harness, not by me"*. It is recorded because it is the reason the case names `python3 -c 'import time;
+   time.sleep(30)'` rather than the shorter command, and because it is a hazard for anybody re-running
+   this suite inside another agent.
+
