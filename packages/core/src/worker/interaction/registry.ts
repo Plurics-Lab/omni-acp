@@ -291,23 +291,27 @@ export function createPendingInteractions(o: PendingInteractionsOptions): Pendin
         );
       }
 
-      // §19.6's SEMANTICS row, and it runs before anything reaches the wire: a body the stored
-      // request cannot accept is a `400` naming what was wrong, and the agent stays parked.
-      const settlement = o.decideAnswer(e.held, a, who);
-      settle(e, settlement, "human");
-
-      const at = o.cursor();
-      if (at === null) {
-        // No log wired ⇒ no envelope ⇒ no `seq` to report, and inventing one is exactly what
-        // §8.2 forbids. It is a WIRING bug rather than a client one, so it says which wire is
-        // missing: the daemon hands `DaemonDeps.interactions` the worker's own log
-        // (`InteractionStrategyDeps.log`), and every path a client can reach goes through it.
+      // No log wired ⇒ no envelope ⇒ no `seq` to report, and inventing one is exactly what §8.2
+      // forbids. It is a WIRING bug rather than a client one, so it says which wire is missing —
+      // and it is checked BEFORE the settlement, because a half-settled answer (envelopes
+      // appended, agent unblocked, caller told `500`) is the one outcome worse than either.
+      if (o.cursor() === null) {
         throw new OmniError(
           "internal",
           "InteractionAnswerResult.seq needs the worker's EventLog; pass `log` to " +
             "createInteractionStrategy (see InteractionStrategyDeps)",
         );
       }
+
+      // §19.6's SEMANTICS row, and it runs before anything reaches the wire: a body the stored
+      // request cannot accept is a `400` naming what was wrong, and the agent stays parked.
+      const settlement = o.decideAnswer(e.held, a, who);
+      settle(e, settlement, "human");
+
+      // Read AFTER the settlement: the envelope this copies is the one the settlement appended,
+      // which is what makes `?since=seq-1` show a client its own answer landing.
+      const at = o.cursor();
+      if (at === null) throw new OmniError("internal", "the worker log went away mid-settlement");
       return {
         interaction: snapshotOf(e),
         state: o.workerState?.() ?? (live > 0 ? "requires_action" : "running"),

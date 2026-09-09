@@ -784,12 +784,60 @@
     "workerId": "w_00000000000000000000000001",
     "sessionId": "sess-corpus",
     "turnId": "t_00000000000000000000000001",
-    "payloadVersion": 1,
+    "payloadVersion": 2,
     "kind": "acp.interaction",
     "payload": {
       "requestId": "perm_1",
+      "kind": "permission",
       "method": "session/request_permission",
       "request": {
+        "title": "Write hello.txt",
+        "subject": {
+          "type": "tool_call",
+          "toolCall": {
+            "toolCallId": "toolu_015zSJykjeArSWhgHPxF6PUT",
+            "name": "Write",
+            "status": "pending",
+            "rawInput": {
+              "file_path": "/tmp/acp-ws-wa-GWOIjS/hello.txt",
+              "content": "hello"
+            },
+            "title": "Write hello.txt",
+            "kind": "edit",
+            "content": [
+              {
+                "type": "diff",
+                "path": "/tmp/acp-ws-wa-GWOIjS/hello.txt",
+                "oldText": null,
+                "newText": "hello"
+              }
+            ],
+            "locations": [
+              {
+                "path": "/tmp/acp-ws-wa-GWOIjS/hello.txt"
+              }
+            ]
+          }
+        },
+        "options": [
+          {
+            "optionId": "allow-once",
+            "name": "Yes",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "allow-with-updates",
+            "name": "Yes, allow all edits during this session",
+            "kind": "allow_always"
+          },
+          {
+            "optionId": "reject",
+            "name": "No",
+            "kind": "reject_once"
+          }
+        ]
+      },
+      "raw": {
         "toolCall": {
           "toolCallId": "toolu_015zSJykjeArSWhgHPxF6PUT",
           "name": "Write",
@@ -840,9 +888,11 @@
         "sessionId": "327a09b5-474a-4bf1-adf3-dadc93690aac"
       },
       "status": "answered",
+      "toolCallId": "toolu_015zSJykjeArSWhgHPxF6PUT",
       "answer": {
         "optionId": "allow-once",
-        "by": "baseline"
+        "by": "baseline",
+        "parkedMs": 0
       }
     }
   },
@@ -857,9 +907,14 @@
     "kind": "omni.policy_decision",
     "payload": {
       "requestId": "perm_1",
+      "kind": "permission",
+      "method": "session/request_permission",
       "title": "Write hello.txt",
       "decision": "allow",
+      "by": "baseline",
       "rule": "m0:auto-allow",
+      "ruleSource": "baseline",
+      "parkedMs": 0,
       "optionId": "allow-once",
       "offered": [
         {
@@ -1089,12 +1144,61 @@
     "workerId": "w_00000000000000000000000001",
     "sessionId": "sess-corpus",
     "turnId": "t_00000000000000000000000001",
-    "payloadVersion": 1,
+    "payloadVersion": 2,
     "kind": "acp.interaction",
     "payload": {
       "requestId": "perm_2",
+      "kind": "permission",
       "method": "session/request_permission",
       "request": {
+        "title": "Create hello.txt containing \"hello\" and print it",
+        "subject": {
+          "type": "tool_call",
+          "toolCall": {
+            "toolCallId": "toolu_014kKXnFQnMYyYwz6jqiPTCY",
+            "name": "Bash",
+            "status": "pending",
+            "rawInput": {
+              "command": "printf 'hello' > /tmp/acp-ws-wa-GWOIjS/hello.txt && cat /tmp/acp-ws-wa-GWOIjS/hello.txt",
+              "description": "Create hello.txt containing \"hello\" and print it"
+            },
+            "title": "Create hello.txt containing \"hello\" and print it",
+            "kind": "execute",
+            "content": [
+              {
+                "type": "content",
+                "content": {
+                  "type": "text",
+                  "text": "Create hello.txt containing \"hello\" and print it"
+                }
+              }
+            ],
+            "locations": [
+              {
+                "path": "/tmp/acp-ws-wa-GWOIjS/hello.txt"
+              }
+            ]
+          }
+        },
+        "options": [
+          {
+            "optionId": "allow-once",
+            "name": "Yes",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "allow-with-updates",
+            "name": "Yes, and allow access to acp-ws-wa-GWOIjS/ and similar commands",
+            "kind": "allow_always"
+          },
+          {
+            "optionId": "reject",
+            "name": "No",
+            "kind": "reject_once"
+          }
+        ]
+      },
+      "raw": {
         "toolCall": {
           "toolCallId": "toolu_014kKXnFQnMYyYwz6jqiPTCY",
           "name": "Bash",
@@ -1146,9 +1250,11 @@
         "sessionId": "327a09b5-474a-4bf1-adf3-dadc93690aac"
       },
       "status": "answered",
+      "toolCallId": "toolu_014kKXnFQnMYyYwz6jqiPTCY",
       "answer": {
         "optionId": "allow-once",
-        "by": "baseline"
+        "by": "baseline",
+        "parkedMs": 0
       }
     }
   },
@@ -1163,9 +1269,14 @@
     "kind": "omni.policy_decision",
     "payload": {
       "requestId": "perm_2",
+      "kind": "permission",
+      "method": "session/request_permission",
       "title": "Create hello.txt containing \"hello\" and print it",
       "decision": "allow",
+      "by": "baseline",
       "rule": "m0:auto-allow",
+      "ruleSource": "baseline",
+      "parkedMs": 0,
       "optionId": "allow-once",
       "offered": [
         {

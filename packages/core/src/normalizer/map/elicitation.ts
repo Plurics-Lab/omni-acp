@@ -20,10 +20,14 @@ import type { ElicitationField, MappedElicitationRequest } from "@omni-acp/proto
  * makes `answer` impossible and `deny`/`cancel` still possible — instead of a form that lies
  * about itself.
  *
- * NOTE for the `no-elicitation-schema-parse` guard (§19.3, §27.4): there is no schema library and
- * no `.parse(` anywhere on this path, and there must never be one. A schema parse would strip
+ * NOTE for the `no-elicitation-schema-parse` guard (§19.3, §27.4): no schema library and no
+ * validator call reaches this path, and none ever may. Validating the params would strip
  * `_meta._askUserQuestionCustomAnswer` — the single field that decides which of two properties
  * the agent actually reads — and the flat scope with it. Everything below is hand-narrowed.
+ *
+ * The guard is BYTE-WISE, comments included, for the reason ruling M2-R16 gives its sibling: a
+ * check that skipped comments would let the next author write the forbidden call as prose and
+ * then implement it. That is why this paragraph names none of the words it is about.
  *
  * Owned by M2-A-WP-I.
  */

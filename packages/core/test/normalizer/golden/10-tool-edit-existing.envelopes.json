@@ -965,12 +965,62 @@
     "workerId": "w_00000000000000000000000001",
     "sessionId": "sess-corpus",
     "turnId": "t_00000000000000000000000001",
-    "payloadVersion": 1,
+    "payloadVersion": 2,
     "kind": "acp.interaction",
     "payload": {
       "requestId": "perm_1",
+      "kind": "permission",
       "method": "session/request_permission",
       "request": {
+        "title": "Edit config.txt",
+        "subject": {
+          "type": "tool_call",
+          "toolCall": {
+            "toolCallId": "toolu_01HbWvZ8DahZP6xX5Zzj555e",
+            "name": "Edit",
+            "status": "pending",
+            "rawInput": {
+              "file_path": "/tmp/acp-ws-edit-96xAuv/config.txt",
+              "old_string": "mode = slow",
+              "new_string": "mode = fast",
+              "replace_all": false
+            },
+            "title": "Edit config.txt",
+            "kind": "edit",
+            "content": [
+              {
+                "type": "diff",
+                "path": "/tmp/acp-ws-edit-96xAuv/config.txt",
+                "oldText": "mode = slow",
+                "newText": "mode = fast"
+              }
+            ],
+            "locations": [
+              {
+                "path": "/tmp/acp-ws-edit-96xAuv/config.txt"
+              }
+            ]
+          }
+        },
+        "options": [
+          {
+            "optionId": "allow-once",
+            "name": "Yes",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "allow-with-updates",
+            "name": "Yes, allow all edits during this session",
+            "kind": "allow_always"
+          },
+          {
+            "optionId": "reject",
+            "name": "No",
+            "kind": "reject_once"
+          }
+        ]
+      },
+      "raw": {
         "toolCall": {
           "toolCallId": "toolu_01HbWvZ8DahZP6xX5Zzj555e",
           "name": "Edit",
@@ -1023,9 +1073,11 @@
         "sessionId": "fa83dab6-68eb-45b1-a5e2-a39c59cea3fb"
       },
       "status": "answered",
+      "toolCallId": "toolu_01HbWvZ8DahZP6xX5Zzj555e",
       "answer": {
         "optionId": "allow-once",
-        "by": "baseline"
+        "by": "baseline",
+        "parkedMs": 0
       }
     }
   },
@@ -1040,9 +1092,14 @@
     "kind": "omni.policy_decision",
     "payload": {
       "requestId": "perm_1",
+      "kind": "permission",
+      "method": "session/request_permission",
       "title": "Edit config.txt",
       "decision": "allow",
+      "by": "baseline",
       "rule": "m0:auto-allow",
+      "ruleSource": "baseline",
+      "parkedMs": 0,
       "optionId": "allow-once",
       "offered": [
         {
@@ -1102,7 +1159,11 @@
                 "oldLines": 2,
                 "newStart": 1,
                 "newLines": 2,
-                "lines": ["-mode = slow", "+mode = fast", " retries = 3"]
+                "lines": [
+                  "-mode = slow",
+                  "+mode = fast",
+                  " retries = 3"
+                ]
               }
             ],
             "userModified": false,
