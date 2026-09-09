@@ -14,7 +14,9 @@ import {
   type TokenId,
   type WorkerSnapshot,
 } from "@omni-acp/protocol";
+import { resolveMcpPresets, resolveWorkerEnv } from "@omni-acp/core";
 import { resolvePath } from "./ids-file.js";
+import { resolvePolicyForRequest } from "./policy/resolve.js";
 import type { AuthContext } from "./types.js";
 
 export interface TokenStore {
@@ -124,6 +126,7 @@ function createAuthContext(
   entry: TokenEntry,
   clientId: ClientId | null,
   leaseEpoch: number | null,
+  config: ResolvedDaemonConfig,
 ): AuthContext {
   const context: AuthContext = {
     tokenId: entry.tokenId,
@@ -183,32 +186,41 @@ function createAuthContext(
       return entry.role === "admin" || w.ownerTokenId === entry.tokenId;
     },
 
-    // ── M2-B (§5.8.8). Land-written stubs; M2-B-WP-P/WP-S land the bodies here. ───
+    // ── M2-B (§5.8.8) ────────────────────────────────────────────────────────
     //
-    // Each one is the ONE place its rule is enforced, and each one FAILS CLOSED at the Land step
-    // rather than admitting a request it cannot check. `assertEnv` and `assertMcp` are the
-    // exception a caller actually meets today: a request that asks for NOTHING gets the empty
-    // answer, because refusing that would be refusing every M1 request.
+    // Each one is the ONE place its rule is enforced, and each one FAILS CLOSED: an unknown
+    // preset is a `400` naming it, a disallowed one a `403`, a blacklisted env key a `400` naming
+    // the KEY and never the value, and a selection over the token's ceiling a `403` carrying
+    // both. A request that asks for NOTHING still gets the empty answer, because refusing that
+    // would be refusing every M1 request.
+    //
+    // All three delegate to the same functions the worker-creation path uses — `policy/resolve`,
+    // `resolveWorkerEnv`, `resolveMcpPresets` — so an in-process caller and an HTTP one cannot be
+    // admitted under two different readings of one rule.
 
     policyCeiling: entry.policyCeiling,
 
     /**
      * D4. Throws `policy_exceeds_ceiling` (403) carrying `{ceiling, offending}` (§20.5).
      *
-     * ONE unconditional throw, and no `assertEnv`-shaped carve-out for "no selection, no ceiling"
-     * (review follow-up 10): an absent `env` map or preset list is a request that asked for
-     * nothing and resolves to nothing, but an absent policy selection still has to resolve to an
-     * ENGINE — the baseline the daemon will consult on every permission request — and that engine
-     * is precisely what M2-B-WP-P has yet to write. A branch that threw the byte-identical error
-     * would read as intent while changing no outcome.
+     * ONE unconditional path, and no `assertEnv`-shaped carve-out for "no selection" (review
+     * follow-up 10): an absent `env` map or preset list is a request that asked for nothing and
+     * resolves to nothing, but an absent policy selection still has to resolve to an ENGINE — the
+     * baseline the daemon consults on every permission request — so it resolves to
+     * `policy.default` and is checked against the ceiling exactly like a named one.
      */
-    assertPolicy(_sel) {
-      throw new OmniError("internal", "unimplemented: M2-B-WP-P (policy engine)");
+    assertPolicy(sel) {
+      return resolvePolicyForRequest(config, context, sel);
     },
 
     /**
      * DESIGN §8's hard blacklist ⊕ `envDeny` ⊕ this token's `envAllow`. Throws `bad_request`
      * NAMING the key — never a silent drop (ruling M2-R12).
+     *
+     * `base` and `descriptor` are empty on purpose: this answers "which of the CLIENT's keys are
+     * admissible", and the composition with the catalog's complete environment happens in
+     * `registry.ts`, which is the only place that holds a `SpawnSpec`. Composing here would make
+     * the token's own environment part of an ACL answer.
      */
     assertEnv(env) {
       // An absent map is not an empty map with a policy question: it is a request that asked for
@@ -216,13 +228,23 @@ function createAuthContext(
       if (env === undefined || Object.keys(env).length === 0) {
         return { env: {}, keys: [], persist: true };
       }
-      throw new OmniError("internal", "unimplemented: M2-B-WP-S (per-worker env)");
+      return resolveWorkerEnv({
+        base: {},
+        descriptor: {},
+        request: env,
+        extraDeny: config.envDeny,
+        allow: entry.envAllow,
+        platform: process.platform,
+      });
     },
 
     /** Preset NAMES → resolved server objects. `400` for unknown, `403` for disallowed. */
     assertMcp(names) {
       if (names === undefined || names.length === 0) return [];
-      throw new OmniError("internal", "unimplemented: M2-B-WP-S (mcp presets)");
+      // The CAPABILITY filter is not applied here and must not be: a preset the AGENT cannot host
+      // is a report on the worker's snapshot, not a request the client got wrong (§23.2), and
+      // this context holds no agent.
+      return resolveMcpPresets(names, config, entry.mcpPresets);
     },
 
     asClientRef(): ClientRef {
@@ -306,7 +328,7 @@ export function createTokenStore(config: ResolvedDaemonConfig): TokenStore {
       // but the ordering is the contract's, and the 400 is now only reachable by a caller who
       // already holds a valid secret.
       const clientId = readClientId(headers);
-      return createAuthContext(matched, clientId, readLeaseEpoch(headers));
+      return createAuthContext(matched, clientId, readLeaseEpoch(headers), config);
     },
 
     contextFor(tokenId: TokenId, clientId?: string | null): AuthContext {
@@ -314,7 +336,7 @@ export function createTokenStore(config: ResolvedDaemonConfig): TokenStore {
       if (entry === undefined) throw unauthorized(`unknown token id "${tokenId}"`);
       // The in-process half has no headers, so it carries no fence: `createDaemon({listen:null})`
       // callers are not racing a stolen lease with a cached epoch.
-      return createAuthContext(entry, clientId ?? null, null);
+      return createAuthContext(entry, clientId ?? null, null, config);
     },
 
     has(tokenId: TokenId): boolean {

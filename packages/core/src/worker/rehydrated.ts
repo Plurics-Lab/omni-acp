@@ -54,6 +54,22 @@ export interface RehydrateDeps {
    * value, not a placeholder: nobody is holding this worker across a restart.
    */
   readonly owner?: ClientRef;
+
+  // ── M2's seams, forwarded (M2-WP-J) ────────────────────────────────────────
+  //
+  // A WOKEN worker must be the same worker it was before it hibernated, and `WorkerRow`'s M2
+  // rows exist "BECAUSE OF THE WAKE PATH" (§5.8.8): a `park` worker that woke without its
+  // strategy would stop declaring `clientCapabilities.elicitation`, which F28 says makes the
+  // agent silently degrade to prose — the park never happens again and nothing reports it.
+  //
+  // Every one is OPTIONAL and absent means M1, exactly as on `CreateWorkerDeps`: this file's M1
+  // callers compile and behave unchanged.
+  readonly interactions?: CreateWorkerDeps["interactions"];
+  readonly watchdog?: CreateWorkerDeps["watchdog"];
+  readonly diff?: CreateWorkerDeps["diff"];
+  readonly validateContent?: CreateWorkerDeps["validateContent"];
+  readonly clientCapabilities?: CreateWorkerDeps["clientCapabilities"];
+  readonly mcpServers?: CreateWorkerDeps["mcpServers"];
 }
 
 /**
@@ -122,6 +138,16 @@ export function createRehydratedWorker(
     ...(deps.runtime === undefined ? {} : { runtime: deps.runtime }),
     ...(deps.runtimeId === undefined ? {} : { runtimeId: deps.runtimeId }),
     ...(deps.toSpawnSpec === undefined ? {} : { toSpawnSpec: deps.toSpawnSpec }),
+    // M2's seams, forwarded verbatim. A `?? {}` spread rather than an assignment, because
+    // `CreateWorkerDeps` distinguishes "absent" from "present and undefined" nowhere else either.
+    ...(deps.interactions === undefined ? {} : { interactions: deps.interactions }),
+    ...(deps.watchdog === undefined ? {} : { watchdog: deps.watchdog }),
+    ...(deps.diff === undefined ? {} : { diff: deps.diff }),
+    ...(deps.validateContent === undefined ? {} : { validateContent: deps.validateContent }),
+    ...(deps.clientCapabilities === undefined
+      ? {}
+      : { clientCapabilities: deps.clientCapabilities }),
+    ...(deps.mcpServers === undefined ? {} : { mcpServers: deps.mcpServers }),
   };
 
   // No `start()`: there is no process to open and no handshake to run. `restore` seeds the state

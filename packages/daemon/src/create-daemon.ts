@@ -8,6 +8,7 @@ import {
   type ClientId,
   type DaemonId,
   type DeliveryStore,
+  type DiffProvider,
   type RunRegistry,
   type DaemonInfo,
   type EventEnvelope,
@@ -20,9 +21,13 @@ import {
 import {
   DEFAULT_V1_PROFILE,
   createBaselineResponder,
+  createGitDiffProvider,
+  createInteractionStrategy,
   createLease,
   createSessionStrategy,
   createSupervisor,
+  createWatchdog,
+  runUtility,
 } from "@omni-acp/core";
 import type { AddressInfo } from "node:net";
 import type { Hono } from "hono";
@@ -35,6 +40,8 @@ import { loadOrCreateDaemonId, resolvePath } from "./ids-file.js";
 import { createLogger } from "./logger.js";
 import { createProbeCache } from "./probe-cache.js";
 import { createProbeService } from "./probe-service.js";
+import { resolvePolicyForRequest } from "./policy/resolve.js";
+import { createRunSubsystem } from "./runs.js";
 import { createWorkerRegistry } from "./registry.js";
 import type { BootRecoveryResult } from "./boot-recovery.js";
 import type { AuthContext, Daemon, DaemonDeps, DaemonEvent } from "./types.js";
@@ -158,6 +165,52 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     }
   };
 
+  /**
+   * ── M2's six defaults, flipped HERE and nowhere else (M2-WP-J acceptance 7) ──────────────────
+   *
+   * Each is `deps?.x ?? <the real one>`, so an injected double still wins and the seam stays the
+   * seam. With every one of them absent from `CreateWorkerDeps` — which is what `createWorker`
+   * sees in a unit test — `worker.ts` is M1 exactly: no strategy, no watchdog, no provider, M0's
+   * text-only content whitelist and `TurnResult.patch: null`. That is ruling M2-R1, and the M1
+   * suite passing unedited against this file is its proof.
+   *
+   * The GIT provider is the one that is conditional on config rather than on `deps`, because
+   * `diff.provider` defaults to `"none"`: a daemon that ran `git` on every turn without being
+   * asked would be a daemon that touches the operator's repository because it could.
+   */
+  const interactions = deps?.interactions ?? ((d) => createInteractionStrategy(d));
+  const watchdog = deps?.watchdog ?? ((d) => createWatchdog(d));
+  const diff: DiffProvider | undefined =
+    deps?.diff ??
+    (resolved.diff.provider === "git"
+      ? createGitDiffProvider({
+          // The ONE spawn seam (§6.1): git is reached through the same `RunUtility`
+          // `fingerprint.ts` uses for `ps`, which is what `no-direct-spawn` asserts and what lets
+          // the provider's own tests run with no git installed.
+          run: runUtility,
+          cfg: resolved.diff,
+          clock,
+          ids,
+          logger: logger.child({ mod: "diff" }),
+        })
+      : undefined);
+  /**
+   * D4's engine, per REQUEST: the ceiling is per token and the selection is per worker, and the
+   * `403 policy_exceeds_ceiling` it raises belongs at CREATE — before a process exists (§20.5).
+   *
+   * An injected `deps.policy` is handed `(selection, ceiling)` exactly as §5.8.8 declares it; the
+   * default path goes through `resolvePolicyForRequest`, which is the one place the preset ACL,
+   * the `extends` resolution and the ceiling clamp live.
+   */
+  const policyFor: NonNullable<Parameters<typeof createWorkerRegistry>[0]["policyFor"]> = (
+    sel,
+    auth,
+    onUnresolved,
+  ) =>
+    deps?.policy === undefined
+      ? resolvePolicyForRequest(resolved, auth, sel, { onUnresolved })
+      : deps.policy(sel ?? null, auth.policyCeiling);
+
   /** Boot adoption's full result, captured from the ONE pass `workers.adopt()` runs below. */
   let adoption: BootRecoveryResult = {
     found: 0,
@@ -250,6 +303,12 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
         logger: logger.child({ mod: "session" }),
       }),
     persistence,
+    // M2's four per-worker seams. The registry composes one strategy and one watchdog per worker
+    // from the REQUEST's own disposition and budgets, and hands every worker the same provider.
+    interactions,
+    watchdog,
+    ...(diff === undefined ? {} : { diff }),
+    policyFor,
     onBootAdoption: (r) => {
       adoption = r;
     },
@@ -262,6 +321,42 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   // previous boot abandoned converges on `hibernated` or `closed`, with the orphan recorded
   // whether or not it could be reaped. It is a no-op on a second run and for the memory driver.
   await workers.adopt();
+
+  /**
+   * ── §24.4's boot order, and every arrow in it is load-bearing ────────────────────────────────
+   *
+   *     persistence → worker adopt → run recover → delivery requeue → dispatcher.start → listen
+   *
+   * Recovering runs BEFORE workers were adopted would abandon runs whose workers were about to be
+   * rehydrated; starting the dispatcher BEFORE the requeue would let it claim rows a previous
+   * boot still owns. `createRunSubsystem` builds the pieces and starts nothing — this file is the
+   * only one that knows where `workers.adopt()` sits relative to them.
+   *
+   * A run under the memory driver is ALLOWED (ruling M2-R14): it says so in
+   * `RunSnapshot.persistence` rather than pretending to survive a restart, which is why the
+   * subsystem is wired unconditionally and only the DISPATCHER is gated on `webhooks.enabled`.
+   */
+  const runSubsystem = createRunSubsystem({
+    config: resolved,
+    // The V2 handle, or none. `openPersistence` returns the run and delivery stores alongside the
+    // event store from M2 on, but `DaemonDeps.persistence` is a `PersistenceHandle` — the M1
+    // shape — and a test double built to that contract carries neither. Handing one to the run
+    // subsystem would make it read `undefined.transaction` at construction, so the guard asks the
+    // object rather than the type, and a handle without the stores gets the in-memory ones (a run
+    // under the memory driver is ALLOWED and says so in `RunSnapshot.persistence`, M2-R14).
+    persistence: hasRunStores(persistence) ? persistence : null,
+    workers,
+    clock,
+    ids,
+    logger,
+    daemonId,
+  });
+  const recovered = runSubsystem.recover();
+  if (recovered.abandoned > 0 || recovered.requeued > 0) {
+    logger.info("recovered runs and deliveries from a previous boot", recovered);
+  }
+  const dispatcher = deps?.webhooks ?? runSubsystem.dispatcher;
+  dispatcher?.start();
 
   // The retention sweep, armed last so it cannot race adoption for the same rows (§14.5).
   const retention = armRetention({ persistence, config: resolved, clock, logger });
@@ -375,8 +470,11 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     // the shape §5.8.6 spends a comment forbidding for `policyCeiling` — and every verb answers
     // `bad_request` naming its work package until `deps.runs` / `deps.webhooks` are wired. That
     // is D29's honest "not implemented yet", and it is the M1 Land precedent S8 exactly.
-    runs: deps?.runs ?? unimplementedRuns(),
-    deliveries: unimplementedDeliveries(),
+    // M2-B (D9), wired. `deps.runs` still wins — that is the seam a test injects a recorder into
+    // — and `unimplementedRuns()` remains as the honest answer for a `Daemon` assembled without
+    // the subsystem at all (D29's "not implemented yet", the M1 Land precedent S8).
+    runs: deps?.runs ?? runSubsystem.runs,
+    deliveries: runSubsystem.deliveries,
 
     authContextFor(tokenId: TokenId, clientId?: ClientId | null): AuthContext {
       return tokens.contextFor(tokenId, clientId ?? null);
@@ -439,6 +537,24 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
       stopping ??= (async () => {
         const graceful = opts?.graceful ?? true;
         const timeoutMs = opts?.timeoutMs;
+        /**
+         * §24.4's mirror of the boot order, and the FIRST step is §19.8's:
+         *
+         *     interactions.settleAll → dispatcher.drain(bounded) → workers → socket
+         *
+         * `settleAll` first because an agent BLOCKED on our answer may never read the shutdown —
+         * a log that ends on a `pending` interaction is a log that lies, and a JSON-RPC promise
+         * nobody resolved is a process that will not exit. It runs through `closeAll` below (each
+         * `Worker.close` settles its own strategy), so the explicit step here is the DISPATCHER's:
+         * a bounded drain, never an unbounded one, because a slow receiver must not hold a
+         * shutdown open.
+         */
+        await dispatcher?.drain({ timeoutMs: DISPATCHER_DRAIN_MS }).catch((e: unknown) => {
+          logger.warn("draining webhook deliveries failed", { error: String(e) });
+        });
+        await dispatcher?.stop().catch((e: unknown) => {
+          logger.warn("stopping the webhook dispatcher failed", { error: String(e) });
+        });
         await workers.closeAll(
           "daemon_shutdown",
           timeoutMs === undefined ? undefined : { timeoutMs },
@@ -534,6 +650,34 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
 
   return daemon;
 }
+
+/**
+ * Does this handle carry M2's v2 stores, or is it an M1-shaped double?
+ *
+ * A property test rather than a `instanceof` or a version field, because that is exactly what the
+ * caller needs to know: `createRunSubsystem` reads `handle.runs`, `handle.deliveries` and
+ * `handle.transaction`, and those three are the question.
+ */
+function hasRunStores(handle: unknown): boolean {
+  if (typeof handle !== "object" || handle === null) return false;
+  const h = handle as Record<string, unknown>;
+  return (
+    typeof h["runs"] === "object" &&
+    h["runs"] !== null &&
+    typeof h["deliveries"] === "object" &&
+    h["deliveries"] !== null &&
+    typeof h["transaction"] === "function"
+  );
+}
+
+/**
+ * How long `stop()` waits for in-flight deliveries before it stops caring (§24.4).
+ *
+ * BOUNDED, and deliberately short: a delivery that does not make it is `pending` on disk and the
+ * next boot's requeue picks it up with the SAME `deliveryId`, so the cost of giving up is a
+ * retry — while the cost of an unbounded drain is a daemon a slow receiver can keep alive.
+ */
+const DISPATCHER_DRAIN_MS = 2_000;
 
 /** zod is the source of truth for the shape; these are the two things it cannot express. */
 function parseConfig(config: DaemonConfig): ResolvedDaemonConfig {

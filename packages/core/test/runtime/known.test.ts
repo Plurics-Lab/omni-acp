@@ -5,16 +5,24 @@ import { claudeAcpDescriptor } from "../normalizer/support/claude-acp.js";
 import {
   BUILTIN_RUNTIMES,
   CLAUDE_ACP_UNVERIFIED,
+  CODEX_ACP_UNVERIFIED,
   DEFAULT_V1_PROFILE,
 } from "../../src/runtime/known.js";
 
 const CLAUDE = BUILTIN_RUNTIMES[0]!.descriptor;
+const CODEX = BUILTIN_RUNTIMES[1]!.descriptor;
 
-describe("BUILTIN_RUNTIMES — exactly one non-default entry (§17.2)", () => {
-  it("ships ONE builtin, and it is claude-acp", () => {
-    expect(BUILTIN_RUNTIMES).toHaveLength(1);
+describe("BUILTIN_RUNTIMES — one entry per REAL agent (§17.2, M2-WP-J)", () => {
+  it("ships TWO builtins, and they are the two agents that exist on this machine", () => {
+    // M1 shipped one, because one real agent existed. M2 runs `codex-acp` as well
+    // (`docs/research/transcripts/codex-acp-1.8.0/`, eight recorded processes), and a second
+    // agent whose behaviour DISAGREES with the first is the whole value of the compat matrix —
+    // it never asks permission, which has to be a descriptor row rather than an agent-id branch.
+    expect(BUILTIN_RUNTIMES).toHaveLength(2);
     expect(CLAUDE.id).toBe("claude-acp");
     expect(CLAUDE.source).toBe("builtin");
+    expect(CODEX.id).toBe("codex-acp");
+    expect(CODEX.source).toBe("builtin");
   });
 
   it("matches the agent by config id, by package specifier, and by the agentInfo name", () => {
@@ -92,6 +100,10 @@ describe("the claude-acp descriptor — every field is a corpus observation (§1
   it("digests `available_commands_update` — streamed in full, stored once (§14.6, M1-R3)", () => {
     expect(CLAUDE.updates).toEqual({
       available_commands_update: { map: null, stream: true, store: true, digest: true },
+      // F25, M2: a kind with no row in DESIGN §6.1, present in 7 of 7 M2 runs and in none of the
+      // 11 M1 runs. `map: null` is passthrough at `payloadVersion: 1` — the same thing the
+      // normalizer already did for an unknown kind, written down so it is intentional.
+      session_info_update: { map: null, stream: true, store: true, digest: false },
     });
     // Never the forbidden third shape.
     expect(CLAUDE.updates["available_commands_update"]?.stream).toBe(true);
@@ -123,7 +135,7 @@ describe("the claude-acp descriptor — every field is a corpus observation (§1
 });
 
 describe("`unverified` is the SINGLE SOURCE OF TRUTH for claude-acp's corpus gaps (review R8)", () => {
-  it("is the seven rows §17.2 enumerates, in order", () => {
+  it("is §17.2's seven rows plus M2's five, in order", () => {
     expect(CLAUDE.unverified).toEqual([
       "plan",
       "agent_thought_chunk",
@@ -132,6 +144,15 @@ describe("`unverified` is the SINGLE SOURCE OF TRUTH for claude-acp's corpus gap
       "image_content",
       "authenticate",
       "tool_failure_on_merits",
+      // M2-WP-J acceptance 8. Each is a thing the M2 corpus could not show us: D10 declares only
+      // `elicitation.form`, `elicitation/complete` was never observed, neither recorded
+      // elicitation was cancelled or carried two questions, and both were answered in ~1 ms — so
+      // what a real agent does with an EXPIRED park is §11.9's first open risk, not a fact.
+      "elicitation_url",
+      "elicitation_complete",
+      "interaction_cancel",
+      "elicitation_multi_question",
+      "park_timeout_action",
     ]);
   });
 
@@ -141,6 +162,54 @@ describe("`unverified` is the SINGLE SOURCE OF TRUTH for claude-acp's corpus gap
 
   it("the DEFAULT profile claims nothing, because it describes no agent", () => {
     expect(DEFAULT_V1_PROFILE.unverified).toEqual([]);
+  });
+});
+
+describe("the codex-acp descriptor — every field is a corpus observation (M2-WP-J)", () => {
+  it("names PERMISSION first among its gaps, which is the fact the compat matrix turns on", () => {
+    // Eight recorded processes, no `session/request_permission` in any of them — not in `agent`
+    // mode, not under `set_config_option{mode:"read-only"}`, not with `INITIAL_AGENT_MODE`, and
+    // not for a path outside the workspace. Every interaction case is a printed `capability`
+    // skip for this agent rather than a silent pass (§18.3, §27.2).
+    expect(CODEX.unverified[0]).toBe("permission");
+    expect(CODEX.unverified).toContain("elicitation");
+    expect(CODEX.unverified).toEqual([...CODEX_ACP_UNVERIFIED]);
+  });
+
+  it("carries `cmd_rules` as a gap, because F38 leaves a command rule nothing to match on", () => {
+    // codex's two-file read arrived as ONE call classified `kind:"read"`, with `locations[]`
+    // naming only the inside file and no `rawInput` at all (codex `09`). §20.3 rejects a `cmd`
+    // clause on a `tool_call` subject at compile (M2-R18); this row is why the suite will not
+    // assert one against this runtime either.
+    expect(CODEX.unverified).toContain("cmd_rules");
+  });
+
+  it("has ONE config spelling, and it notifies nothing (F35, codex 07)", () => {
+    expect(CODEX.prefer["setConfig"]?.spellings).toEqual(["session/set_config_option"]);
+    expect(CODEX.quirks.configIdField).toBe("configId");
+  });
+
+  it("tolerates a `messageId`-less chunk, which claude never sends (F41)", () => {
+    expect(CODEX.quirks.messageIdPresent).toBe(false);
+    expect(CLAUDE.quirks.messageIdPresent).toBe(true);
+  });
+
+  it("budgets a COLD npx that once took over ninety seconds (README)", () => {
+    expect(CODEX.budgets.initializeMs).toBeGreaterThanOrEqual(120_000);
+  });
+
+  it("passes `session_info_update` through — its `threadStatus:idle` is this agent's liveness", () => {
+    expect(CODEX.updates["session_info_update"]).toEqual({
+      map: null,
+      stream: true,
+      store: true,
+      digest: false,
+    });
+  });
+
+  it("matches by config id and by the scoped package specifier in its argv", () => {
+    expect(BUILTIN_RUNTIMES[1]!.matches).toContain("codex-acp");
+    expect(BUILTIN_RUNTIMES[1]!.matches).toContain("@agentclientprotocol/codex-acp");
   });
 });
 

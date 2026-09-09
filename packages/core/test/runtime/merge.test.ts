@@ -168,7 +168,13 @@ describe("resolveDescriptor — builtin ⊕ config ⊕ probe (§17.2)", () => {
       }),
       null,
     );
-    expect(Object.keys(d.updates).sort()).toEqual(["available_commands_update", "plan"]);
+    // `session_info_update` is the builtin's own M2 row (F25); the overlay adds `plan` beside it
+    // rather than replacing the block, which is what "merge per key" means.
+    expect(Object.keys(d.updates).sort()).toEqual([
+      "available_commands_update",
+      "plan",
+      "session_info_update",
+    ]);
     expect(d.updates["plan"]).toEqual({ map: "plan", stream: true, store: true, digest: false });
     expect(Object.keys(d.extensions).sort()).toEqual(["patch", "quota", "rateLimit"]);
     expect(d.inboundAliases).toEqual({ "session/notification": "session/update" });

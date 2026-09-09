@@ -23,6 +23,31 @@ export type ParsedArgs =
       deep?: boolean;
       force?: boolean;
     }
+  /**
+   * M2's four (CONTRACTS.md §5.8.10). Same shape as M1's three and for the same reason (D15):
+   * each is `parse → ONE call → print`, so the CLI never orchestrates and never holds state.
+   */
+  | { cmd: "interactions"; workerId: string; url?: string; token?: string; json?: boolean }
+  | {
+      cmd: "interactions-answer";
+      workerId: string;
+      reqId: string;
+      answer: { action: "allow" | "deny" } | { action: "answer"; content: Record<string, string> };
+      url?: string;
+      token?: string;
+      json?: boolean;
+    }
+  | {
+      cmd: "config";
+      workerId: string;
+      configId: string;
+      value: string;
+      url?: string;
+      token?: string;
+      json?: boolean;
+    }
+  | { cmd: "runs"; url?: string; token?: string; json?: boolean }
+  | { cmd: "deliveries"; redeliver?: string; url?: string; token?: string; json?: boolean }
   | { cmd: "version" }
   | { cmd: "help" }
   | { cmd: "error"; message: string };
@@ -53,6 +78,19 @@ const REMOTE_FLAGS = {
 
 const WORKERS_FLAGS = { ...REMOTE_FLAGS, "--include-closed": "boolean" } as const;
 const PROBE_FLAGS = { ...REMOTE_FLAGS, "--deep": "boolean", "--force": "boolean" } as const;
+/**
+ * `--allow` / `--deny` / `--value q=v` — D4's three answers, and the CLI may express only the two
+ * a HUMAN can give plus the elicitation form. There is deliberately no `--allow-always`: rule 3
+ * makes that a `400` unless the operator set `interaction.allowAlways:"human"`, and a flag for a
+ * value the daemon refuses by default is a flag that teaches the wrong habit (F26).
+ */
+const ANSWER_FLAGS = {
+  ...REMOTE_FLAGS,
+  "--allow": "boolean",
+  "--deny": "boolean",
+  "--value": "value",
+} as const;
+const DELIVERIES_FLAGS = { ...REMOTE_FLAGS, "--redeliver": "value" } as const;
 
 type FlagTable = Readonly<Record<string, "value" | "boolean">>;
 
@@ -147,6 +185,10 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if (head === "agents") return parseAgents(args);
   if (head === "workers") return parseWorkers(args);
   if (head === "probe") return parseProbe(args);
+  if (head === "interactions") return parseInteractions(args);
+  if (head === "config") return parseConfig(args);
+  if (head === "runs") return parseRuns(args);
+  if (head === "deliveries") return parseDeliveries(args);
   return error(`unknown command "${head}"`);
 }
 
@@ -214,6 +256,92 @@ function parseProbe(args: readonly string[]): ParsedArgs {
   };
 }
 
+/**
+ * `omni-acp interactions <wid>` and `omni-acp interactions answer <wid> <reqId> …`.
+ *
+ * The sub-verb is a POSITIONAL rather than a flag, because the two forms take different
+ * arguments and a `--answer` flag would make `interactions --answer` (with no ids) parse.
+ */
+function parseInteractions(args: readonly string[]): ParsedArgs {
+  const isAnswer = args[1] === "answer";
+  const scanned = scan(args, isAnswer ? 2 : 1, isAnswer ? ANSWER_FLAGS : REMOTE_FLAGS);
+  if ("done" in scanned) return scanned.done;
+  const { flags, positional } = scanned;
+
+  if (!isAnswer) {
+    const [workerId, extra] = positional;
+    if (workerId === undefined) return error("interactions needs a worker id");
+    if (extra !== undefined) return error(`unexpected argument "${extra}"`);
+    return { cmd: "interactions", workerId, ...remoteOf(flags) };
+  }
+
+  const [workerId, reqId, extra] = positional;
+  if (workerId === undefined || reqId === undefined) {
+    return error("interactions answer needs a worker id and a request id");
+  }
+  if (extra !== undefined) return error(`unexpected argument "${extra}"`);
+
+  const allow = flags["--allow"] === true;
+  const deny = flags["--deny"] === true;
+  const value = flags["--value"];
+  const given = [allow, deny, typeof value === "string"].filter(Boolean).length;
+  if (given === 0) return error("interactions answer needs --allow, --deny or --value q=v");
+  if (given > 1) return error("interactions answer takes exactly one of --allow, --deny, --value");
+
+  if (typeof value === "string") {
+    const at = value.indexOf("=");
+    // `q=v`, and the FIRST `=` splits: a value may legitimately contain one, a question id may not.
+    if (at <= 0) return error(`--value must be written question=value, got "${value}"`);
+    return {
+      cmd: "interactions-answer",
+      workerId,
+      reqId,
+      answer: { action: "answer", content: { [value.slice(0, at)]: value.slice(at + 1) } },
+      ...remoteOf(flags),
+    };
+  }
+  return {
+    cmd: "interactions-answer",
+    workerId,
+    reqId,
+    answer: { action: allow ? "allow" : "deny" },
+    ...remoteOf(flags),
+  };
+}
+
+/** `omni-acp config <wid> <configId> <value>` (H24). */
+function parseConfig(args: readonly string[]): ParsedArgs {
+  const scanned = scan(args, 1, REMOTE_FLAGS);
+  if ("done" in scanned) return scanned.done;
+  const [workerId, configId, value, extra] = scanned.positional;
+  if (workerId === undefined || configId === undefined || value === undefined) {
+    return error("config needs a worker id, a config id and a value");
+  }
+  if (extra !== undefined) return error(`unexpected argument "${extra}"`);
+  return { cmd: "config", workerId, configId, value, ...remoteOf(scanned.flags) };
+}
+
+function parseRuns(args: readonly string[]): ParsedArgs {
+  const scanned = scan(args, 1, REMOTE_FLAGS);
+  if ("done" in scanned) return scanned.done;
+  const first = scanned.positional[0];
+  if (first !== undefined) return error(`unexpected argument "${first}"`);
+  return { cmd: "runs", ...remoteOf(scanned.flags) };
+}
+
+function parseDeliveries(args: readonly string[]): ParsedArgs {
+  const scanned = scan(args, 1, DELIVERIES_FLAGS);
+  if ("done" in scanned) return scanned.done;
+  const first = scanned.positional[0];
+  if (first !== undefined) return error(`unexpected argument "${first}"`);
+  const redeliver = scanned.flags["--redeliver"];
+  return {
+    cmd: "deliveries",
+    ...(typeof redeliver === "string" ? { redeliver } : {}),
+    ...remoteOf(scanned.flags),
+  };
+}
+
 export const USAGE = `omni-acp — run an ACP worker daemon
 
 Usage:
@@ -221,6 +349,11 @@ Usage:
   omni-acp agents [options]
   omni-acp workers [options]
   omni-acp probe <agent> [options]
+  omni-acp interactions <worker> [options]
+  omni-acp interactions answer <worker> <reqId> --allow|--deny|--value q=v
+  omni-acp config <worker> <configId> <value> [options]
+  omni-acp runs [options]
+  omni-acp deliveries [--redeliver <deliveryId>] [options]
   omni-acp --version
   omni-acp --help
 
@@ -243,4 +376,9 @@ Options for agents, workers and probe (they talk to a running daemon):
   workers --include-closed   also list workers that have already closed
   probe   --deep             run the full method battery
   probe   --force            ignore the cached probe and spawn a fresh process
+
+  interactions answer --allow          take the offered allow-once option
+  interactions answer --deny           take the offered reject-once option
+  interactions answer --value q=v      answer an elicitation question
+  deliveries --redeliver <id>          re-send one delivery from the dead-letter queue
 `;

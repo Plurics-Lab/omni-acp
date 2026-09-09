@@ -92,6 +92,58 @@ export const CLAUDE_ACP_UNVERIFIED = [
   "image_content",
   "authenticate",
   "tool_failure_on_merits",
+  // ── M2's five (M2-WP-J acceptance 8) ────────────────────────────────────────
+  //
+  // Each is a thing the M2 corpus could NOT show us, and the rule is unchanged: the absence of an
+  // observation is not an observation of absence, so the suite refuses to assert them rather than
+  // passing them quietly.
+  /** D10 declares `elicitation.form` only. No `url` mode was ever offered or exercised (§19.2). */
+  "elicitation_url",
+  /** The completion callback for a `url` elicitation. Never observed on either agent. */
+  "elicitation_complete",
+  /** `InteractionAnswer{action:"cancel"}`. Both corpus elicitations were accepted or declined
+   *  (claude `12` / `13`); nothing ever cancelled one. */
+  "interaction_cancel",
+  /** A form with TWO questions. Both recorded elicitations carried exactly one (F29, F30), and
+   *  `elicit-multi.mjs` is a FIXTURE — evidence about our mapper, not about this agent. */
+  "elicitation_multi_question",
+  /** `parkTimeoutAction`. The corpus answered both elicitations in ~1 ms, so what a real agent
+   *  does with a park that EXPIRES is §11.9's first open risk and not a recorded fact. */
+  "park_timeout_action",
+] as const;
+
+/**
+ * **THE SINGLE SOURCE OF TRUTH for codex-acp's corpus gaps**, on the same terms as claude's.
+ *
+ * `permission` heads the list and it is the one that matters: across eight recorded processes
+ * codex-acp never sent `session/request_permission` — not in `agent` mode, not after
+ * `set_config_option{mode:"read-only"}`, not with `INITIAL_AGENT_MODE`, and not for a path outside
+ * the workspace (README, files 02–05, extended to reads by `09`). Every interaction case is
+ * therefore a printed `capability` skip for this agent rather than a silent pass.
+ */
+export const CODEX_ACP_UNVERIFIED = [
+  /** Never sent, in any mode, for any path (codex `02`–`05`, `09`). */
+  "permission",
+  /** No `elicitation/create` in any recorded process; the adapter never asks for input. */
+  "elicitation",
+  "elicitation_url",
+  "elicitation_complete",
+  "interaction_cancel",
+  "elicitation_multi_question",
+  "park_timeout_action",
+  /**
+   * F38, and it is a POLICY row rather than a wire row: codex's two-file read arrived as one call
+   * classified `kind:"read"`, with `locations[]` naming only the inside file and **no `rawInput`
+   * whatsoever** — so a `cmd` clause has nothing to match on for a call this agent makes. §20.3
+   * rejects such a rule at compile (M2-R18); this row is why the compat suite will not assert one
+   * against this runtime either.
+   */
+  "cmd_rules",
+  /** `mcpServers` was `[]` in every recorded process; `mcpCapabilities` advertises http only. */
+  "mcp",
+  "image_content",
+  /** The ChatGPT login is picked up without any `authenticate` call, so the method is unexercised. */
+  "authenticate",
 ] as const;
 
 /**
@@ -181,6 +233,18 @@ const CLAUDE_ACP: RuntimeDescriptor = {
      * `assertDescriptorLegal` rejects that shape.
      */
     available_commands_update: { map: null, stream: true, store: true, digest: true },
+    /**
+     * F25, M2's one new update kind and the reason it is written down rather than tolerated.
+     *
+     * `session_info_update` has no row in DESIGN §6.1 and appears in 7 of 7 M2 claude runs and in
+     * NONE of the 11 M1 runs — the wire moved without a version bump (§11.9). `map: null` is
+     * passthrough at `payloadVersion: 1`, which is exactly what the normalizer already did for a
+     * kind with no row; writing the row makes that INTENTIONAL, and it is the line a reader
+     * checks when asking whether the watchdog is allowed to count it as liveness. It is: it lands
+     * 5-22 ms after `session/prompt` resolves, and the silent budget is anchored on the last
+     * update precisely so that a post-response frame re-arms it rather than tripping it (§21.2).
+     */
+    session_info_update: { map: null, stream: true, store: true, digest: false },
     // Every other kind: the §12.3 default, which is "no row" and therefore M1-WP-B's map.
   },
   errorRules: [
@@ -227,6 +291,117 @@ const CLAUDE_ACP: RuntimeDescriptor = {
 };
 
 /**
+ * `codex-acp` — M2's second builtin, and every row is an observation from
+ * `docs/research/transcripts/codex-acp-1.8.0/` with the file named on the line.
+ *
+ * It exists because M2 is the milestone that runs a SECOND real agent, and because two of its
+ * observed behaviours are decisions the daemon has to make per runtime rather than per agent id:
+ * it never asks permission (so every interaction case must be a printed `capability` skip, not a
+ * failure), and its `mcpCapabilities` block declares `http` while it happily takes stdio servers
+ * (§23.2's "stdio is never filtered"). A quirk we did NOT observe is `false` here, on the same
+ * terms as claude's profile: the absence of an observation is not an observation of absence.
+ *
+ * Owned by M2-WP-J.
+ */
+const CODEX_ACP: RuntimeDescriptor = {
+  id: "codex-acp",
+  fingerprint: "unresolved",
+  /** README: `initialize` answers `protocolVersion: 1`, with v2-ish blocks in `session/new`. */
+  protocolVersion: 1,
+  source: "builtin",
+  prefer: {
+    /** `sessionCapabilities {resume, list, close, delete, fork, …}` (README). */
+    resume: { spellings: ["session/resume", "session/load"], onFailure: "fail" },
+    /**
+     * `session/set_config_option` is the ONLY config surface, it works, and it notifies nothing
+     * (codex `07`, F35). `session/set_mode` is deliberately absent: nothing in the corpus shows
+     * it answering, and a spelling we never saw work does not belong in a table whose rule is
+     * "every field is an observation".
+     */
+    setConfig: { spellings: ["session/set_config_option"], onFailure: "fail" },
+    setOptions: { spellings: ["session/set_options"], onFailure: "warn" },
+    list: { spellings: ["session/list"], onFailure: "fail" },
+    close: { spellings: ["session/close"], onFailure: "fail" },
+  },
+  inboundAliases: {},
+  quirks: {
+    resumeSilentlyCreates: false,
+    /** Not observed either way for this agent; `false` is the claim we can support. */
+    resumeRequiresSameCwd: false,
+    loadReturnsBody: false,
+    /**
+     * F41: a host BANNER arrives as a `messageId`-less `agent_message_chunk`, unlike every real
+     * answer chunk. So `messageIdPresent` is false HERE where it is true for claude — grouping
+     * keyed on `messageId` must tolerate absence for this runtime.
+     */
+    messageIdPresent: false,
+    /** codex `02`/`08`: `tool_call` then a single terminal `tool_call_update`, never a patch series. */
+    toolCallUpdateIsSparse: false,
+    /** No v1 `diff` block was observed at all, so nothing claims its fragments are widened. */
+    diffIsFragment: false,
+    permissionRequestShape: "v1_tool_call",
+    /** It never asks, so it offers no grant kind to remember (README, files 02-05). */
+    sessionGrantKind: "none",
+    /** README: `usage_update {used, size}`, no `cost`, on a v1 handshake. */
+    emitsUsageUpdateOnV1: true,
+    /** No `state_update` in any recorded process; `session_info_update` is its liveness frame. */
+    emitsStateUpdate: false,
+    /** codex `07`: the request parameter is `configId`, exactly as claude spells it (review R3). */
+    configIdField: "configId",
+    /**
+     * `mcpCapabilities {acp:false, http:true, sse:false}` IS declared, so the omission rule never
+     * applies to this agent — and stdio is never filtered anyway (§23.2).
+     */
+    toleratesOmittedMcpCapabilities: false,
+    unknownMethodErrorCode: -32601,
+  },
+  extensions: {},
+  updates: {
+    /** README: once per session, `commands[]._meta.commandAction`. Same handling as claude's. */
+    available_commands_update: { map: null, stream: true, store: true, digest: true },
+    /**
+     * codex `08`: `session_info_update` carries `_meta.codex.threadStatus:{type:"idle"}` and
+     * arrives BEFORE the prompt response — the other half of F25's anchor argument. Passthrough,
+     * and it counts as liveness for the silent budget exactly as claude's does.
+     */
+    session_info_update: { map: null, stream: true, store: true, digest: false },
+  },
+  errorRules: [
+    {
+      /**
+       * codex `06`: `session/new` fails `-32603 "approval_policy = \"untrusted\" is no longer
+       * supported"` for a `CODEX_CONFIG` the operator set. That is the operator's configuration
+       * being wrong, which is a `bad_request` and not an agent that broke.
+       */
+      id: "unsupported-config",
+      code: -32603,
+      dataPointer: "/details",
+      dataMatches: "is no longer supported",
+      classify: "bad_request",
+    },
+    {
+      id: "unknown-method",
+      code: -32601,
+      dataPointer: "/method",
+      classify: "unsupported_method",
+    },
+  ],
+  clientHost: { fs: false, terminal: false },
+  budgets: {
+    /**
+     * README: warm `initialize` ~1.6 s, `session/new` ~0.4 s more, an edit turn 8-10 s — and a
+     * COLD `npx -y` that downloads the bundled `@openai/codex` binary took **>90 s once**, which
+     * is why this budget is twice claude's rather than the same number.
+     */
+    initializeMs: 120_000,
+    sessionNewMs: 60_000,
+    resumeMs: 90_000,
+    turnMs: 600_000,
+  },
+  unverified: [...CODEX_ACP_UNVERIFIED],
+};
+
+/**
  * Descriptors shipped in the repository — EXACTLY ONE non-default entry today (§17.2).
  *
  * `matches` is the set of tokens a caller may present to claim this profile: the config
@@ -249,6 +424,12 @@ export const BUILTIN_RUNTIMES: readonly BuiltinRuntime[] = [
       "@zed-industries/claude-code-acp",
     ],
     descriptor: CLAUDE_ACP,
+  },
+  {
+    // The adapter answers `agentInfo.name: "codex-acp"`, and the compat entry's id is the same
+    // word; the scoped specifier appears in the argv `npx -y @agentclientprotocol/codex-acp@1.8.0`.
+    matches: ["codex-acp", "@agentclientprotocol/codex-acp"],
+    descriptor: CODEX_ACP,
   },
 ];
 

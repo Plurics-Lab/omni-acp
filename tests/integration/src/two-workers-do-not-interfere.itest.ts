@@ -129,7 +129,14 @@ describe("two workers do not interfere", () => {
       expect(run.result.interactions).toHaveLength(1);
       expect(run.result.interactions[0]).toMatchObject({
         decision: "deny",
-        rule: "m0:auto-deny",
+        // M2-WP-J, and the ONE assertion in this file the join changed: `create-daemon.ts` now
+        // resolves a real `PolicyEngine` for every worker, so the DECISION and the `optionId` are
+        // M1's exactly and the audit string names the preset that made it (`policy.default`
+        // defaults to `deny-all`) instead of M0's hard-coded responder. Nothing branches on the
+        // string; the engine has to run even for a request that names no policy, because
+        // `PolicyCeiling.park:false` is enforced in the same call (§20.5) and a worker admitted
+        // without it would be a ceiling nobody checked.
+        rule: "deny-all#default",
         optionId: "reject",
       });
       expect(run.result.interactions[0]?.title).toBe("Modifying critical configuration file");

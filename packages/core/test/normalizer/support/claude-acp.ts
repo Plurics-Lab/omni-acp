@@ -76,6 +76,9 @@ export function claudeAcpDescriptor(): RuntimeDescriptor {
     updates: {
       // F13, §14.6: 87.8 % of update bytes, 23 notifications, 2 distinct payloads.
       available_commands_update: { map: null, stream: true, store: true, digest: true },
+      // F25 (M2): present in 7 of 7 M2 runs, in none of the 11 M1 ones. Passthrough at
+      // `payloadVersion: 1`, which is what the normalizer already did for a kind with no row.
+      session_info_update: { map: null, stream: true, store: true, digest: false },
     },
     errorRules: [
       {
@@ -100,6 +103,13 @@ export function claudeAcpDescriptor(): RuntimeDescriptor {
       "image_content",
       "authenticate",
       "tool_failure_on_merits",
+      // M2's five (M2-WP-J acceptance 8), transcribed from `known.ts` — `known.test.ts` asserts
+      // the two lists ARE one list rather than two transcriptions that happen to agree.
+      "elicitation_url",
+      "elicitation_complete",
+      "interaction_cancel",
+      "elicitation_multi_question",
+      "park_timeout_action",
     ],
   });
 }

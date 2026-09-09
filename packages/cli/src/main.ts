@@ -4,12 +4,22 @@ import { createDaemon } from "@omni-acp/daemon";
 import { OmniError, type DaemonConfig } from "@omni-acp/protocol";
 import { USAGE, parseArgs, type ParsedArgs } from "./args.js";
 import {
+  answerInteraction,
   listAgents,
+  listDeliveries,
+  listInteractions,
+  listRuns,
   listWorkers,
   probeAgentAt,
+  redeliver,
   renderAgents,
+  renderConfig,
+  renderDeliveries,
+  renderInteractions,
   renderProbe,
+  renderRuns,
   renderWorkers,
+  setWorkerConfig,
   targetOf,
 } from "./remote.js";
 import { declaresEventLogDriver, yamlToDaemonConfig } from "./yaml-config.js";
@@ -96,13 +106,29 @@ function overridesFor(args: Extract<ParsedArgs, { cmd: "start" }>): Partial<Daem
  * a person. Failures come back as the daemon's own sentence and exit 1 — never as a stack, and
  * never as "HTTP 403" when the daemon already wrote a better message (§9).
  */
-async function remote(
-  args: Extract<ParsedArgs, { cmd: "agents" | "workers" | "probe" }>,
-  env: NodeJS.ProcessEnv,
-  out: CliIo,
-): Promise<number> {
+type RemoteCommand = Extract<
+  ParsedArgs,
+  {
+    cmd:
+      | "agents"
+      | "workers"
+      | "probe"
+      | "interactions"
+      | "interactions-answer"
+      | "config"
+      | "runs"
+      | "deliveries";
+  }
+>;
+
+async function remote(args: RemoteCommand, env: NodeJS.ProcessEnv, out: CliIo): Promise<number> {
   try {
     const target = targetOf(args, env, `omni-acp ${args.cmd}`);
+    /** `--json` prints the daemon's answer verbatim; without it, columns for a person. */
+    const print = (body: unknown, rendered: () => string): number => {
+      write(out.stdout, `${args.json === true ? JSON.stringify(body, null, 2) : rendered()}\n`);
+      return EXIT_OK;
+    };
 
     if (args.cmd === "agents") {
       const body = await listAgents(target);
@@ -128,15 +154,46 @@ async function remote(
       return EXIT_OK;
     }
 
+    // ── M2's four (§5.8.10). Each is parse -> ONE call -> print (D15). ──────
+    if (args.cmd === "interactions") {
+      const body = await listInteractions(target, args.workerId);
+      return print(body, () => renderInteractions(body));
+    }
+    if (args.cmd === "interactions-answer") {
+      // The daemon re-checks D4's rules on what it receives — an `optionId` that was not
+      // OFFERED, or an `allow_always` under `allowAlways:"never"` — so this sends the operator's
+      // intent and never a pre-selected option (§19.7).
+      const body = await answerInteraction(target, args.workerId, args.reqId, args.answer);
+      return print(
+        body,
+        () =>
+          `${body.interaction.requestId} ${body.interaction.status}` +
+          `${body.interaction.answer === null ? "" : ` by ${body.interaction.answer.by}`}` +
+          `, worker ${body.state}, seq ${String(body.seq)}`,
+      );
+    }
+    if (args.cmd === "config") {
+      const body = await setWorkerConfig(target, args.workerId, args.configId, args.value);
+      return print(body, () => renderConfig(body));
+    }
+    if (args.cmd === "runs") {
+      const body = await listRuns(target);
+      return print(body, () => renderRuns(body));
+    }
+    if (args.cmd === "deliveries") {
+      if (args.redeliver !== undefined) {
+        const one = await redeliver(target, args.redeliver);
+        return print(one, () => renderDeliveries({ deliveries: [one], cursor: null }));
+      }
+      const body = await listDeliveries(target);
+      return print(body, () => renderDeliveries(body));
+    }
+
     const body = await probeAgentAt(target, args.agent, {
       ...(args.deep === true ? { deep: true } : {}),
       ...(args.force === true ? { force: true } : {}),
     });
-    write(
-      out.stdout,
-      `${args.json === true ? JSON.stringify(body, null, 2) : renderProbe(body)}\n`,
-    );
-    return EXIT_OK;
+    return print(body, () => renderProbe(body));
   } catch (e) {
     write(out.stderr, `omni-acp: ${messageOf(e)}\n`);
     return EXIT_FAILURE;
@@ -174,7 +231,16 @@ export async function main(
     write(out.stderr, `omni-acp: ${args.message}\n\n${USAGE}`);
     return EXIT_USAGE;
   }
-  if (args.cmd === "agents" || args.cmd === "workers" || args.cmd === "probe") {
+  if (
+    args.cmd === "agents" ||
+    args.cmd === "workers" ||
+    args.cmd === "probe" ||
+    args.cmd === "interactions" ||
+    args.cmd === "interactions-answer" ||
+    args.cmd === "config" ||
+    args.cmd === "runs" ||
+    args.cmd === "deliveries"
+  ) {
     return remote(args, env, out);
   }
 

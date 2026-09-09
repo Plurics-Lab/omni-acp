@@ -43,6 +43,27 @@ function auth(agents: readonly string[] | "*" = "*"): AuthContext {
     assertCwd: (cwd: string) => Promise.resolve(cwd),
     canSee: () => true,
     asClientRef: () => ({ tokenId: "t", clientId: null }),
+    // ── M2-B (§5.8.7), completed at the join ───────────────────────────────
+    //
+    // The registry's creation path calls all three on EVERY create, so a double that omitted them
+    // would only ever prove that the `as AuthContext` cast still compiles. Each answers exactly
+    // what the real one answers for a request that asked for nothing — which is every request in
+    // this file — and THROWS otherwise, so a future test that starts asking for an env, a preset
+    // or a policy here gets a red rather than a silently ungated worker.
+    policyCeiling: null,
+    assertPolicy: () => {
+      throw new Error("this double resolves no policy; use the real AuthContext to select one");
+    },
+    assertEnv: (env?: Readonly<Record<string, string>>) => {
+      if (env === undefined || Object.keys(env).length === 0) {
+        return { env: {}, keys: [], persist: true };
+      }
+      throw new Error("this double resolves no env; use the real AuthContext to set one");
+    },
+    assertMcp: (names?: readonly string[]) => {
+      if (names === undefined || names.length === 0) return [];
+      throw new Error("this double resolves no MCP preset; use the real AuthContext for one");
+    },
   } as AuthContext;
 }
 

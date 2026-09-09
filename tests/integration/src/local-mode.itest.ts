@@ -57,7 +57,9 @@ describe("OmniACP.local()", () => {
     const result = await worker.prompt("who are you?");
     expect(result.stopReason).toBe("end_turn");
     expect(result.text).toContain("I'll skip the configuration update");
-    expect(result.interactions[0]).toMatchObject({ decision: "deny", rule: "m0:auto-deny" });
+    // `rule` is the PRESET that decided, since M2-WP-J wired the engine into `createDaemon`
+    // (`policy.default` defaults to `deny-all`). The decision is M1's, unchanged.
+    expect(result.interactions[0]).toMatchObject({ decision: "deny", rule: "deny-all#default" });
 
     const closed = await worker.close();
     expect(closed.leaderExited).toBe(true);

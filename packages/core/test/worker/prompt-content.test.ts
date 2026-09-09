@@ -462,29 +462,18 @@ describe("guard: assert-prompt-content-is-called (§26.2, review R2)", () => {
   });
 
   /**
-   * BLOCKED, not weakened. `packages/daemon/src/registry.ts` is M2-WP-J's file and frozen for
-   * this work package, so M2-B-WP-S cannot land the three-line injection its own guard demands.
-   * The checker above is complete and the planted-violation demonstration below proves it fires;
-   * only the assertion against the LIVE registry waits on the hunk, which M2-B-WP-S reports
-   * verbatim in its hand-off notes for the merge step to apply.
+   * UNBLOCKED at the join (M2-WP-J). `packages/daemon/src/registry.ts` was M2-WP-J's file and
+   * frozen for M2-B-WP-S, which is why this assertion shipped `.skip`'d beside a checker that was
+   * already complete and already demonstrated failing. The wiring landed with the join, so the
+   * assertion runs — and the honesty test that stood guard over the skip (it asserted the live
+   * registry did NOT inject, so the skip could not rot into a lie) is GONE rather than inverted:
+   * a test that asserts the feature is absent has no meaning once it is present, and this one
+   * below says the same thing the right way round.
    */
-  it.skip("the daemon's worker-creation path passes deps.validateContent bound to cwdRoots and promptCapabilities — BLOCKED: registry.ts is M2-WP-J-owned; the hunk is in M2-B-WP-S's notes", () => {
+  it("the daemon's worker-creation path passes deps.validateContent bound to cwdRoots and promptCapabilities", () => {
     expect(report.creationPathInjects).toBe(true);
     expect(report.boundToCwdRoots).toBe(true);
     expect(report.boundToPromptCapabilities).toBe(true);
-  });
-
-  it("records the live registry's state HONESTLY, so the skip above cannot rot into a lie", () => {
-    // If somebody wires the injection and forgets to unskip, this flips and says so.
-    expect({
-      creationPathInjects: report.creationPathInjects,
-      boundToCwdRoots: report.boundToCwdRoots,
-      boundToPromptCapabilities: report.boundToPromptCapabilities,
-    }).toStrictEqual({
-      creationPathInjects: false,
-      boundToCwdRoots: false,
-      boundToPromptCapabilities: false,
-    });
   });
 
   it("is demonstrated FAILING on each planted violation", () => {

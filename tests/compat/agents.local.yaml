@@ -1,8 +1,14 @@
 # REAL agents on THIS machine. Runs only under `OMNI_COMPAT_REAL=1`.
 #
-# One entry today, and that is a statement of evidence rather than of ambition: claude-acp is the
-# only real ACP agent available on this machine, and the M1 corpus
-# (`docs/research/transcripts/claude-acp-0.73.0/`) is its ground truth.
+# TWO entries, and that is a statement of evidence rather than of ambition: `claude-acp` and
+# `codex-acp` are the only real ACP agents on this machine, and their corpora
+# (`docs/research/transcripts/claude-acp-0.73.0/`, `docs/research/transcripts/codex-acp-1.8.0/`)
+# are the ground truth for every row below.
+#
+# THE TWO AGENTS DISAGREE ABOUT ALMOST EVERYTHING M2 IS ABOUT — claude asks permission and
+# elicits, codex does neither — and that disagreement is the value: every case carries a
+# `requires` list, and codex's interaction cases are printed `capability` skips sourced from its
+# own recordings rather than silent passes (§27.1).
 #
 # ADDING AN AGENT IS AN EDIT TO THIS FILE AND NOTHING ELSE. No `.ts` file may contain a real
 # agent's launch argv — the suite asserts it. An agent listed here but not usable on this machine
@@ -30,7 +36,15 @@ agents:
     # second opinion about a fact we measure. The three below cannot be probed for — no method
     # battery can tell you whether an agent will reach for a tool when you ask it something —
     # and all three are recorded in the corpus (02 reads, 04 permission, 14 cancel).
-    provides: [tools, permission, cancel]
+    #
+    # M2 adds five, each of them a claim about what this RUNTIME will exercise: it elicits
+    # (claude 12/13), it answers `session/set_config_option` (15), and — since M2-WP-J wired the
+    # daemon — every worker gets a policy engine, an idle watchdog, a git patch and a Run API.
+    # The last four are daemon capabilities rather than agent ones, and they are listed per agent
+    # because that is where `requires` is answered; an agent that could not exercise one (a
+    # fixture with no tools, say) simply does not list it.
+    provides:
+      [tools, permission, cancel, elicitation, configOptions, policy, watchdog, patch, runs]
     # Observed on this machine, 2026-09-04: initialize ~7 s cold / ~1.5 s warm, `loadSession: true`,
     # sessionCapabilities list/resume/close/delete/fork.
     budgets:
@@ -75,6 +89,14 @@ agents:
       - image_content
       - authenticate
       - tool_failure_on_merits
+      # M2's five (M2-WP-J acceptance 8). Restated from `CLAUDE_ACP_UNVERIFIED`, never shortened:
+      # `yaml-only.ctest.ts` asserts the two lists are the same set, because SHORTENING one is how
+      # a gap becomes a silent pass.
+      - elicitation_url
+      - elicitation_complete
+      - interaction_cancel
+      - elicitation_multi_question
+      - park_timeout_action
   - id: codex-acp
     source: command
     enabled: true
@@ -91,7 +113,11 @@ agents:
     # mode, not after set_config_option{mode:"read-only"} / set_mode, not with INITIAL_AGENT_MODE, and
     # not for a path outside the workspace. It only asks when its own sandbox refuses a command, which
     # a compat case cannot provoke deterministically.
-    provides: [tools, cancel]
+    #
+    # `permission` and `elicitation` are deliberately ABSENT and `configOptions` is present: codex
+    # answers `session/set_config_option` (codex 07, F35) and asks for nothing, ever. The four
+    # daemon-side capabilities are listed for the same reason they are on claude.
+    provides: [tools, cancel, configOptions, watchdog, patch, runs]
     budgets:
       initializeMs: 60000
       resumeMs: 60000
@@ -100,11 +126,27 @@ agents:
       protocolVersion: 1
       capabilities: { loadSession: true }
       resumeMethod: session/resume
+      # F35: `reasoning_effort` is not observable at all — the following turn still reports
+      # `usage.thoughtTokens: 0` — so the config case asserts REPLACEMENT and never an effect.
+      # A data row, not a code branch (§27.2).
+      configEffectObservable: false
     skip:
       - {
           case: permission-deny,
           reason: "codex-acp 1.8.0 auto-approves file edits in every mode incl. read-only and for paths outside the workspace; no request_permission is ever sent (2026-09-04 probes)",
         }
+    # Corpus gaps, restated from `CODEX_ACP_UNVERIFIED` in `packages/core/src/runtime/known.ts`,
+    # which §17.2 makes the single source of truth. Never a shorter list.
     unverified:
       - permission
+      - elicitation
+      - elicitation_url
+      - elicitation_complete
+      - interaction_cancel
+      - elicitation_multi_question
+      - park_timeout_action
+      - cmd_rules
+      - mcp
+      - image_content
+      - authenticate
   # add the next runtime here. Zero code changes.

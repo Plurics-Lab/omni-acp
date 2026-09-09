@@ -6,12 +6,14 @@ import {
   type CreateWorkerRequest,
   type DaemonId,
   type DaemonInfo,
+  type PolicySelection,
   type ProbeRequestBody,
   type ProbeResponse,
   type WhoAmIResponse,
   type WorkerListResponse,
   type WorkerSnapshot,
 } from "@omni-acp/protocol";
+import { createRunsChannel, type RunsChannel } from "./runs.js";
 import { createTransport, type Transport, type TransportOptions } from "./transport.js";
 import { createWorkerHandle, disposeWorker, type Worker } from "./worker.js";
 
@@ -19,8 +21,37 @@ export interface CreateAgentOptions {
   readonly cwd: string;
   readonly label?: string;
   readonly timeoutMs?: number;
-  /** M0: only the empty tuple type-checks. MCP presets are M2. */
-  readonly mcp?: readonly [];
+  /**
+   * MCP preset NAMES, resolved against `DaemonConfig.mcpServers` (§23.1).
+   *
+   * `string[]` at the type level is DESIGN §8's 🔴 row enforced by the TYPE rather than by a
+   * validator somebody could move: a client can never put a `command` on this wire at all, and
+   * `client-never-sends-a-command` guards it. An unknown name is a `400` naming it; a name outside
+   * the token's `mcpPresets` is a `403`. Never a silent drop.
+   */
+  readonly mcp?: readonly string[];
+  /**
+   * D4's policy for this worker: a preset name, a list of them, or an inline document.
+   *
+   * Merged preset ⊕ inline, then checked against the token's `policyCeiling` — exceeding it is
+   * `403 policy_exceeds_ceiling` at CREATE, before a process exists (§20.5).
+   */
+  readonly policy?: PolicySelection;
+  /** Per-worker environment. A blacklisted key is REJECTED by name, never dropped (§23.3). */
+  readonly env?: Readonly<Record<string, string>>;
+  /** Per-worker override of the daemon-wide idle watchdog, field by field (§21). */
+  readonly watchdog?: {
+    readonly silentMs?: number;
+    readonly toolMs?: number;
+    readonly cancelTimeoutMs?: number;
+    readonly enabled?: boolean;
+  };
+  /** Per-worker `diff.mode` (D8). `"off"` opts this worker out of the patch entirely. */
+  readonly patch?: "off" | "on_write" | "always";
+  /** How long a parked interaction may wait for a human. `0` ⇒ it never expires (§19.1). */
+  readonly parkTimeoutMs?: number;
+  /** What an EXPIRED park does. `"allow"` is deliberately not a value (ruling M2-R7). */
+  readonly parkTimeoutAction?: "deny" | "fail";
   /**
    * D10's three dispositions, widened from M0's `"deny"`-only literal.
    *
@@ -73,6 +104,13 @@ export interface Server {
   /** Snapshots, not live handles — a listing must not open N SSE streams (D31). */
   workers(): Promise<readonly WorkerSnapshot[]>;
   attach(workerId: string): Promise<Worker>;
+  /**
+   * DESIGN §9.3's fire-and-forget half: create + prompt + settle + close, with an optional
+   * webhook. `runs.events(id)` is the SAME resumable tail `worker.events()` is, pointed at the
+   * run's own route, so a dropped connection is recovered by `?since=` rather than by a second
+   * implementation of the same idea.
+   */
+  readonly runs: RunsChannel;
   /** Closes local streams. For local(), also stops the embedded daemon. Remote workers survive. */
   close(): Promise<void>;
 }
@@ -103,6 +141,7 @@ export function createServer(
   // Handles this Server minted. `close()` stops their local streams — it does NOT close the
   // remote workers, which outlive the client by design (that is what `attach()` is for).
   const handles = new Set<Worker>();
+  const runs = createRunsChannel(transport);
   let closed = false;
 
   const assertOpen = (): void => {
@@ -119,6 +158,7 @@ export function createServer(
     url,
     daemonId: me.daemonId,
     me,
+    runs,
 
     async info(): Promise<DaemonInfo> {
       assertOpen();
@@ -148,6 +188,15 @@ export function createServer(
         ...(opts.onUnresolved === undefined ? {} : { onUnresolved: opts.onUnresolved }),
         ...(opts.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: opts.idleTimeoutMs }),
         ...(opts.lease === undefined ? {} : { lease: opts.lease }),
+        // ── M2 (§5.8.7) ────────────────────────────────────────────────────
+        ...(opts.policy === undefined ? {} : { policy: opts.policy }),
+        ...(opts.env === undefined ? {} : { env: { ...opts.env } }),
+        ...(opts.watchdog === undefined ? {} : { watchdog: { ...opts.watchdog } }),
+        ...(opts.patch === undefined ? {} : { patch: opts.patch }),
+        ...(opts.parkTimeoutMs === undefined ? {} : { parkTimeoutMs: opts.parkTimeoutMs }),
+        ...(opts.parkTimeoutAction === undefined
+          ? {}
+          : { parkTimeoutAction: opts.parkTimeoutAction }),
       };
 
       // H5 is synchronously ready: the 201 already carries `state:"ready"` and the real

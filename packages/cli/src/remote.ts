@@ -1,5 +1,14 @@
 import { OmniError, type AgentListResponse, type ProbeResponse } from "@omni-acp/protocol";
-import type { WorkerListResponse, WorkerSnapshot } from "@omni-acp/protocol";
+import type {
+  DeliveryListResponse,
+  DeliveryRecord,
+  InteractionAnswerResult,
+  InteractionListResponse,
+  RunListResponse,
+  SetConfigResponse,
+  WorkerListResponse,
+  WorkerSnapshot,
+} from "@omni-acp/protocol";
 
 /**
  * The three READ-ONLY commands M1 adds: `omni-acp agents`, `omni-acp workers`, `omni-acp probe`
@@ -164,16 +173,20 @@ export function renderWorkers(
     return o.includeClosed === true ? "no workers" : "no live workers (use --include-closed)";
   }
   return renderTable(
-    ["ID", "AGENT", "STATE", "PID", "GEN", "LEASE", "CWD"],
+    ["ID", "AGENT", "STATE", "PID", "GEN", "LEASE", "PENDING", "CWD"],
     shown.map((w) => [
       w.workerId,
       w.agentId,
+      // M2: `requires_action` is a real state now that a park has somewhere to park (§19.5), and
+      // it is the one an operator has to ACT on — so the pending count sits beside it. The
+      // invariant is visible in the two columns: non-empty pending ⟺ `requires_action`.
       w.state,
       // A hibernated worker owns no process, and saying "-" is the honest rendering of the `null`
       // §15.2 puts there — never a stale pid from before the tree was reclaimed.
       w.process === null ? "-" : String(w.process.pid),
       String(w.generation),
       w.lease.holder === null ? "-" : (w.lease.holder.clientId ?? w.lease.holder.tokenId),
+      String((w.interactions ?? []).length),
       w.cwd,
     ]),
   );
@@ -219,4 +232,149 @@ export function renderProbe(body: ProbeResponse): string {
     );
   }
   return lines.join("\n");
+}
+
+// ── M2's four commands (CONTRACTS.md §5.8.10) ────────────────────────────────
+//
+// Same three moves as M1's: resolve the target, make ONE call, print. Nothing here orchestrates
+// — `interactions answer` is one POST and not a get-then-decide, because the daemon re-checks
+// D4's rules on the answer it receives and a CLI that pre-selected an option would be a second
+// place those rules live (§19.7).
+
+export function listInteractions(
+  target: RemoteTarget,
+  workerId: string,
+): Promise<InteractionListResponse> {
+  return call<InteractionListResponse>(
+    target,
+    "GET",
+    `/v1/workers/${encodeURIComponent(workerId)}/interactions`,
+  );
+}
+
+export function answerInteraction(
+  target: RemoteTarget,
+  workerId: string,
+  reqId: string,
+  body: unknown,
+): Promise<InteractionAnswerResult> {
+  return call<InteractionAnswerResult>(
+    target,
+    "POST",
+    `/v1/workers/${encodeURIComponent(workerId)}/interactions/${encodeURIComponent(reqId)}`,
+    body,
+  );
+}
+
+export function setWorkerConfig(
+  target: RemoteTarget,
+  workerId: string,
+  configId: string,
+  value: string,
+): Promise<SetConfigResponse> {
+  return call<SetConfigResponse>(
+    target,
+    "POST",
+    `/v1/workers/${encodeURIComponent(workerId)}/config`,
+    // The VALUE is sent as the operator typed it. `SetConfigBody` accepts a string, a number or a
+    // boolean, and a CLI that guessed which one a config option wanted would be inventing a type
+    // the agent never asked for — `true` is a legal string value for a text option.
+    { configId, value },
+  );
+}
+
+export function listRuns(target: RemoteTarget): Promise<RunListResponse> {
+  return call<RunListResponse>(target, "GET", "/v1/runs");
+}
+
+export function listDeliveries(target: RemoteTarget): Promise<DeliveryListResponse> {
+  return call<DeliveryListResponse>(target, "GET", "/v1/webhooks/deliveries");
+}
+
+export function redeliver(target: RemoteTarget, deliveryId: string): Promise<DeliveryRecord> {
+  return call<DeliveryRecord>(
+    target,
+    "POST",
+    `/v1/webhooks/deliveries/${encodeURIComponent(deliveryId)}/redeliver`,
+  );
+}
+
+/**
+ * The pending set, as a person reads it.
+ *
+ * `kind` and `method` come first because they are what decides which answer is legal: a
+ * permission takes `--allow` / `--deny`, an elicitation takes `--value q=v`. The OPTIONS column
+ * prints `optionId(kind)` pairs — never the option's `name`, which F27 recorded arriving under
+ * three different spellings for one id, once with a path embedded in it.
+ */
+export function renderInteractions(body: InteractionListResponse): string {
+  if (body.interactions.length === 0) return "no pending interactions";
+  return renderTable(
+    ["REQ", "KIND", "METHOD", "STATUS", "EXPIRES", "TITLE", "OPTIONS/FIELDS"],
+    body.interactions.map((i) => [
+      i.requestId,
+      i.kind,
+      i.method,
+      i.status,
+      i.expiresAt ?? "-",
+      i.title,
+      i.kind === "permission"
+        ? i.options.map((o) => `${o.optionId}(${o.kind})`).join(" ")
+        : i.fields.map((f) => f.id).join(" "),
+    ]),
+  );
+}
+
+export function renderConfig(body: SetConfigResponse): string {
+  const lines = [
+    renderTable(
+      ["ID", "CURRENT", "NAME"],
+      body.configOptions.map((o) => [
+        o.id,
+        String(o.currentValue ?? "-"),
+        // `raw` is the agent's own entry BY IDENTITY (§7.5): a display name if it offered one,
+        // and never a name this CLI invented for it.
+        typeof o.raw["name"] === "string" ? o.raw["name"] : "-",
+      ]),
+    ),
+  ];
+  // F34's shrink is REAL, not a bug: a set can remove entries. Printing the delta is how an
+  // operator sees that the control they were about to use is gone.
+  if (body.removed.length > 0) lines.push(`removed: ${body.removed.join(", ")}`);
+  if (body.added.length > 0) lines.push(`added: ${body.added.join(", ")}`);
+  if (body.stale) lines.push("the agent returned no list; the previous one was KEPT");
+  return lines.join("\n");
+}
+
+export function renderRuns(body: RunListResponse): string {
+  if (body.runs.length === 0) return "no runs";
+  return renderTable(
+    ["ID", "STATE", "AGENT", "WORKER", "PERSIST", "WEBHOOK", "UPDATED"],
+    body.runs.map((r) => [
+      r.runId,
+      r.state,
+      r.agentId,
+      r.workerId ?? "-",
+      r.persistence,
+      r.webhook === null ? "-" : `${String(r.webhook.deliveries)} to ${r.webhook.url}`,
+      r.updatedAt,
+    ]),
+  );
+}
+
+export function renderDeliveries(body: DeliveryListResponse): string {
+  if (body.deliveries.length === 0) return "no deliveries";
+  return renderTable(
+    ["ID", "RUN", "EVENT", "STATE", "ATTEMPT", "NEXT", "STATUS", "ERROR"],
+    body.deliveries.map((d) => [
+      d.deliveryId,
+      d.runId,
+      d.event,
+      d.state,
+      String(d.attempt),
+      d.nextAttemptAt ?? "-",
+      d.lastStatus === null ? "-" : String(d.lastStatus),
+      d.lastError ?? "-",
+    ]),
+  );
 }

@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import {
   CreateWorkerRequest,
   InteractionAnswerBody,
@@ -10,19 +11,28 @@ import {
   type ClientRef,
   type CloseResult,
   type DaemonId,
+  type DiffProvider,
   type EventLog,
   type HibernateTimer,
   type IdGen,
   type InteractionAnswerResult,
+  type InteractionDeps,
   type InteractionListResponse,
+  type InteractionRequest,
+  type InteractionStrategy,
   type Lease,
   type LeaseSnapshot,
   type Logger,
   type OrphanRecord,
+  type McpResolution,
   type PermissionResponder,
   type PersistenceHandle,
+  type PolicyEngine,
+  type PolicySelection,
+  type PolicySubject,
   type PromptAccepted,
   type ResolvedDaemonConfig,
+  type ResolvedWatchdogConfig,
   type Seq,
   type SessionStrategy,
   type SetConfigResponse,
@@ -37,17 +47,23 @@ import {
   type WorkerRow,
   type WorkerSnapshot,
   type WorkerState,
+  type Watchdog,
+  type WatchdogDeps,
 } from "@omni-acp/protocol";
 import {
   alwaysGrantedLease,
+  assertPromptContent,
   createHibernateTimer,
   createMemoryEventLog,
   createNormalizer,
   createPersistedEventLog,
   createRehydratedWorker,
   createWorker,
+  resolveWorkerEnv,
+  toPolicySubject,
 } from "@omni-acp/core";
 import { recoverFromPreviousBoot, type BootRecoveryResult } from "./boot-recovery.js";
+import { resolveMcpForWorker } from "./mcp.js";
 import type { AuthContext, Catalog, WorkerRegistry } from "./types.js";
 
 export interface WorkerRegistryOptions {
@@ -104,6 +120,45 @@ export interface WorkerRegistryOptions {
    * without widening a frozen contract type.
    */
   readonly onBootAdoption?: (r: BootRecoveryResult) => void;
+
+  // ── M2's seams, one per feature, ALL optional (M2-PLAN §1.2, §1.3) ──────────
+  //
+  // With every one of them absent this registry builds exactly the M1 worker: no strategy (so
+  // `worker.ts`'s inline baseline responder answers, byte for byte), no watchdog (disarmed), no
+  // provider (`TurnResult.patch` stays null), no engine (the strategy, if any, falls back to the
+  // request's own `onUnresolved`), and M0's text-only whitelist as the content gate. That is
+  // ruling M2-R1 made mechanical, and it is what lets the whole M1 suite run against this file
+  // unedited. `create-daemon.ts` is the ONE place the six defaults are flipped.
+
+  /**
+   * SEAM A. One strategy per worker, built from the request's own disposition.
+   *
+   * The parameter is WIDER than `DaemonDeps.interactions`'s `InteractionDeps` by the three
+   * members `createInteractionStrategy` also accepts (`log`, `workerState`, `toSubject`) — a
+   * function written against the narrower shape is still assignable, so an injected factory keeps
+   * working and simply ignores what it does not read.
+   */
+  readonly interactions?: (
+    d: InteractionDeps & {
+      readonly log?: Pick<EventLog, "head" | "read">;
+      readonly workerState?: () => WorkerState;
+      readonly toSubject?: (req: InteractionRequest) => PolicySubject | Promise<PolicySubject>;
+    },
+  ) => InteractionStrategy;
+  /** SEAM B. Built only when the RESOLVED budgets say `enabled`. */
+  readonly watchdog?: (d: WatchdogDeps) => Watchdog;
+  /** SEAM C (D8). ONE provider per daemon; `CreateWorkerRequest.patch:"off"` opts a worker out. */
+  readonly diff?: DiffProvider;
+  /**
+   * D4's engine, resolved per REQUEST because the ceiling is per TOKEN and the selection is per
+   * worker. It throws `403 policy_exceeds_ceiling` at CREATE — before a process exists, which is
+   * the whole point of §20.5 — so it is called before the slot is reserved.
+   */
+  readonly policyFor?: (
+    sel: ParsedCreateWorkerRequest["policy"],
+    auth: AuthContext,
+    onUnresolved: "park" | "deny" | "fail",
+  ) => PolicyEngine;
 }
 
 interface Entry {
@@ -130,7 +185,58 @@ interface Entry {
   readonly hibernateIdleMs: number | null;
   /** §15.2's `ready -> hibernated` driver. Armed by `watchEntry`, cancelled with the worker. */
   idleTimer: HibernateTimer | null;
+  /**
+   * The M2 rows of `WorkerSnapshot` this REGISTRY owns, and `worker.ts` cannot (§5.8.4).
+   *
+   * They are facts about the REQUEST — the disposition it asked for, the presets it named, the
+   * env keys it set, the policy it resolved to — and `worker.ts` is frozen after the Land step,
+   * so the worker has nowhere to hold them. The registry does, it is the thing that resolved
+   * them, and `viewOf` stamps them onto every snapshot that leaves this file (including the
+   * `201` body, which is why `create()` hands back a decorated handle rather than the raw one).
+   */
+  readonly m2: WorkerViewRows;
 }
+
+/** The registry-owned half of a `WorkerSnapshot`, exactly the §5.8.4 rows `worker.ts` cannot fill. */
+interface WorkerViewRows {
+  readonly onUnresolved: "park" | "deny" | "fail";
+  readonly parkTimeoutMs: number | null;
+  readonly parkTimeoutAction: "deny" | "fail";
+  readonly policy: WorkerSnapshot["policy"];
+  /** `PolicyEngine.id` — the ENGINE's identity, for `WorkerRow.policyRef`'s audit trail. */
+  readonly policyId: string | null;
+  readonly mcp: WorkerSnapshot["mcp"];
+  readonly envKeys: readonly string[];
+  readonly patchMode: "off" | "on_write" | "always";
+  /** The RESOLVED budgets, for `WorkerRow.watchdog` — the snapshot's copy is the worker's own. */
+  readonly watchdog: { silentMs: number; toolMs: number; cancelTimeoutMs: number } | null;
+  /** `null` ⇒ `env.persist:false` was asked for, and the row must not carry the map (§23.3). */
+  readonly env: Readonly<Record<string, string>> | null;
+  readonly mcpNames: readonly string[];
+}
+
+/** M1's rows for a worker created before any of this existed, and for a rehydrated one. */
+const M1_VIEW: WorkerViewRows = Object.freeze({
+  onUnresolved: "deny",
+  parkTimeoutMs: null,
+  parkTimeoutAction: "deny",
+  policy: null,
+  policyId: null,
+  mcp: { requested: [], applied: [], dropped: [] },
+  envKeys: [],
+  patchMode: "on_write",
+  watchdog: null,
+  env: null,
+  mcpNames: [],
+});
+
+/**
+ * The PARSED request — `CreateWorkerRequest`'s exported alias is the `z.input` shape (§5.8.7,
+ * Land note S4), so on it `onUnresolved` still reads optional even though `parse` always fills it
+ * with `"deny"`. Every default this file depends on is a default `parse` applied, so it reads the
+ * output type and the fallbacks stay where the schema put them.
+ */
+type ParsedCreateWorkerRequest = ReturnType<typeof CreateWorkerRequest.parse>;
 
 /** The states that occupy a `maxWorkers` slot: a worker with a process, or on its way to one. */
 const OCCUPIES_A_SLOT: readonly WorkerState[] = ["starting", "ready", "running", "requires_action"];
@@ -284,7 +390,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
    * snapshot does not carry because it is not client-facing (§5.1 `WorkerRow`).
    */
   const rowOf = (entry: Entry, previous?: WorkerRow | null): WorkerRow => {
-    const snapshot = entry.handle.snapshot();
+    // The DECORATED snapshot: a row is what `?since=` and a restart read back, and a persisted
+    // snapshot missing the rows a live one carries would make a rehydrated worker look like a
+    // different worker (§5.8.4).
+    const snapshot = snapshotOf(entry);
     const closeResult = previous?.closeResult ?? null;
     return {
       snapshot,
@@ -298,6 +407,22 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // wins over the persisted one: `CreateWorkerRequest.idleTimeoutMs` is a per-worker
       // override, and a row written before it was read would pin the daemon-wide value forever.
       hibernateIdleMs: entry.hibernateIdleMs ?? previous?.hibernateIdleMs ?? null,
+
+      // ── M2 (§5.8.8), persisted BECAUSE OF THE WAKE PATH ─────────────────────
+      //
+      // A `park` worker that hibernated and woke must RE-DECLARE
+      // `clientCapabilities.elicitation` or F28 says the agent silently degrades to prose and the
+      // park never happens again; `env` / `mcpNames` / `policyRef` are what stop a woken worker
+      // from being a different worker wearing the same id. Interactions are deliberately NOT
+      // persisted (ruling M2-R10).
+      onUnresolved: entry.m2.onUnresolved,
+      parkTimeoutMs: entry.m2.parkTimeoutMs,
+      parkTimeoutAction: entry.m2.parkTimeoutAction,
+      mcpNames: entry.m2.mcpNames,
+      policyRef: entry.m2.policyId,
+      env: entry.m2.env,
+      ...(entry.m2.watchdog === null ? {} : { watchdog: entry.m2.watchdog }),
+      patchMode: entry.m2.patchMode,
     };
   };
 
@@ -389,6 +514,11 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
 
     const log = logFor(workerId, store.events.headOf(workerId));
     const owner: ClientRef = { tokenId: row.snapshot.ownerTokenId, clientId: null };
+    // The ROW's M2 rows, not this boot's defaults: a worker created under `park` must WAKE under
+    // `park`, or F28 says the agent silently degrades to prose and the park never happens again
+    // (§5.8.8's "persisted BECAUSE OF THE WAKE PATH").
+    const rows = viewRowsOf(row);
+    const ref: { current: WorkerHandle | null } = { current: null };
     let handle: WorkerHandle;
     try {
       // From the CURRENT config, never from the row (M1-WP-C's `RehydrateDeps` header): a
@@ -436,12 +566,75 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           gracefulMs: o.config.supervisor.gracefulMs,
           wakeTimeoutMs: o.config.hibernate.wakeTimeoutMs,
           maxWakeFailures: o.config.hibernate.maxWakeFailures,
+          ...(rows.parkTimeoutMs === null ? {} : { parkTimeoutMs: rows.parkTimeoutMs }),
+          diffTimeoutMs: o.config.diff.timeoutMs,
         },
         runtime,
         ...(runtimeId === undefined ? {} : { runtimeId }),
         toSpawnSpec: (d, spawnOpts) => o.catalog.toSpawnSpec(d, spawnOpts),
         owner,
+        // ── M2's seams, rebuilt from the ROW (M2-WP-J) ───────────────────────
+        ...(() => {
+          const strategy = o.interactions?.({
+            workerId,
+            clock: o.clock,
+            ids: o.ids,
+            logger: o.logger.child({ workerId, agent: row.agentId, rehydrated: true }),
+            config: o.config.interaction,
+            onUnresolved: rows.onUnresolved,
+            parkTimeoutMs: rows.parkTimeoutMs,
+            parkTimeoutAction: rows.parkTimeoutAction,
+            responder: o.responder,
+            log,
+            workerState: () => ref.current?.snapshot().state ?? "hibernated",
+            toSubject: (r) =>
+              toPolicySubject(r, {
+                cwd: row.snapshot.cwd,
+                agentId: row.agentId,
+                realpath,
+              }),
+          });
+          const budgets = rows.watchdog === null ? null : watchdogBudgets(o.config, rows.watchdog);
+          const watchdog =
+            o.watchdog === undefined || budgets === null || !budgets.enabled
+              ? undefined
+              : o.watchdog({
+                  workerId,
+                  clock: o.clock,
+                  config: budgets,
+                  onFire: (budget) => {
+                    fireWatchdog({
+                      budget,
+                      log,
+                      config: budgets,
+                      handle: ref.current,
+                      openToolCalls: 0,
+                      logger: o.logger.child({ workerId }),
+                    });
+                  },
+                });
+          return {
+            ...(strategy === undefined
+              ? {}
+              : { interactions: strategy, clientCapabilities: strategy.clientCapabilities }),
+            ...(watchdog === undefined ? {} : { watchdog }),
+            ...(rows.patchMode === "off" || o.diff === undefined ? {} : { diff: o.diff }),
+            // §26.2's gate, on the wake path too: a woken worker takes prompts, and a prompt is
+            // exactly where an out-of-root `resource_link` would arrive.
+            validateContent: async (content: readonly unknown[]) => {
+              await assertPromptContent({
+                content,
+                cwd: row.snapshot.cwd,
+                cwdRoots: cwdRootsOf(o.config, row.snapshot.ownerTokenId),
+                promptCapabilities:
+                  ref.current?.snapshot().capabilities?.promptCapabilities ?? null,
+                realpath,
+              });
+            },
+          };
+        })(),
       });
+      ref.current = handle;
     } catch (e) {
       // A row we cannot reconstruct is not a 500 on `GET /v1/workers`: the row is still visible
       // through `list()` (which reads the store directly and needs no handle), and the honest
@@ -468,6 +661,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // The budget the row was created with, so a per-worker `idleTimeoutMs` survives a restart.
       // A row from a boot that never recorded one falls back to this boot's daemon-wide value.
       hibernateIdleMs: row.hibernateIdleMs ?? idleBudget(undefined),
+      // From the ROW, so a worker that hibernated under `park` wakes under `park` (F28/F42). A
+      // row written by an M1 boot carries none of them and reads as M1, which is the honest
+      // answer for a worker that was created before any of this existed.
+      m2: rows,
       idleTimer: null,
     };
     if (OCCUPIES_A_SLOT.includes(row.snapshot.state)) reacquire(entry);
@@ -619,10 +816,29 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
    * exactly as invisible to a foreign token as a live one — and answers the same
    * `worker_not_found`, never a `403` that would confirm the id exists (D13).
    */
+  /**
+   * The snapshot as everything OUTSIDE this file sees it: the worker's own rows, plus the M2 rows
+   * only the registry knows (§5.8.4).
+   */
+  const snapshotOf = (entry: Entry): WorkerSnapshot => decorate(entry.handle.snapshot(), entry.m2);
+
+  /**
+   * ONE decorated handle per entry, memoised — so `create()` and `get()` hand back the same
+   * object and an identity comparison between them still holds.
+   */
+  const views = new Map<WorkerId, WorkerHandle>();
+  const viewOf = (entry: Entry): WorkerHandle => {
+    const existing = views.get(entry.id);
+    if (existing !== undefined) return existing;
+    const view = decorateHandle(entry.handle, () => snapshotOf(entry));
+    views.set(entry.id, view);
+    return view;
+  };
+
   const get = (id: WorkerId, auth: AuthContext): WorkerHandle => {
     const entry = lookup(id, auth);
     if (entry === null) return notFound(id);
-    return entry.handle;
+    return viewOf(entry);
   };
 
   const lookup = (id: WorkerId, auth: AuthContext): Entry | null => {
@@ -746,7 +962,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     },
 
     async create(request, auth, signal): Promise<WorkerHandle> {
-      let req: CreateWorkerRequest;
+      let req: ParsedCreateWorkerRequest;
       try {
         req = CreateWorkerRequest.parse(request);
       } catch (e) {
@@ -760,6 +976,34 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const descriptor = o.catalog.get(req.agent);
       const cwd = await auth.assertCwd(req.cwd);
 
+      // The RESOLVED quirk table (§17.2) and the descriptor identity that goes on every envelope.
+      // `runtimeId` is taken from the catalog ENTRY rather than recomputed, so the value in the
+      // log is the same string `GET /v1/agents` publishes — two computations of one identity is
+      // how a log and a catalog come to disagree about which quirk table ran.
+      const runtime = o.catalog.descriptor(req.agent);
+      const catalogEntry = o.catalog.list().find((e) => e.id === req.agent);
+      const runtimeId = catalogEntry?.runtimeId;
+
+      // ── M2's per-request resolution, ALL of it BEFORE a slot or a process ────
+      //
+      // Every line here can refuse the request, and each refusal is cheaper than the spawn it
+      // precedes: a `403 policy_exceeds_ceiling` raised after `npx` has started is a ceiling
+      // enforced after the agent was already running in the user's repository (§20.5). The same
+      // argument is why the env gate rejects a blacklisted key by NAME rather than dropping it
+      // (§23.3, ruling M2-R12), and why an unknown MCP preset is a `400` naming it (§23.1).
+      const engine = o.policyFor?.(req.policy, auth, req.onUnresolved) ?? null;
+      const env = auth.assertEnv(req.env);
+      const mcp: McpResolution = resolveMcpForWorker({
+        names: req.mcp,
+        config: o.config,
+        allow: o.config.tokens.find((t) => t.id === auth.tokenId)?.mcpPresets ?? [],
+        descriptor: runtime,
+        // The CACHED probe's capabilities when this agent has been probed, and `null` otherwise —
+        // which is "we have not handshaken yet" and is a different fact from an agent that
+        // declared an empty block. Only the descriptor decides what to do about it (§23.2).
+        caps: catalogEntry?.probed?.capabilities ?? null,
+      });
+
       reserve(auth);
       const workerId = o.ids.worker();
       const logger = o.logger.child({ workerId, agent: req.agent });
@@ -771,12 +1015,6 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const subscription = subscribeFanOut(workerId, log);
 
       const spec = o.catalog.toSpawnSpec(descriptor, { cwd });
-      // The RESOLVED quirk table (§17.2) and the descriptor identity that goes on every envelope.
-      // `runtimeId` is taken from the catalog ENTRY rather than recomputed, so the value in the
-      // log is the same string `GET /v1/agents` publishes — two computations of one identity is
-      // how a log and a catalog come to disagree about which quirk table ran.
-      const runtime = o.catalog.descriptor(req.agent);
-      const runtimeId = o.catalog.list().find((e) => e.id === req.agent)?.runtimeId;
 
       /**
        * The handshake's `modes` catalogue, read LAZILY (M1-WP-B's `NormalizerOptions.modes`).
@@ -792,6 +1030,88 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const modesOf = (): Readonly<Record<string, unknown>> | null =>
         built?.snapshot().capabilities?.modes ?? null;
 
+      // ── the four worker seams, composed from what the request asked for ──────
+      const parkTimeoutMs = req.parkTimeoutMs ?? o.config.interaction.parkTimeoutMs;
+      const parkTimeoutAction = req.parkTimeoutAction ?? o.config.interaction.parkTimeoutAction;
+      const strategy = o.interactions?.({
+        workerId,
+        clock: o.clock,
+        ids: o.ids,
+        logger,
+        config: o.config.interaction,
+        onUnresolved: req.onUnresolved,
+        parkTimeoutMs,
+        parkTimeoutAction,
+        responder: o.responder,
+        // SEAM A's one difference from the baseline (M2-PLAN §1.3): with no engine the strategy
+        // falls back to the request's own `onUnresolved`, which is M2-A shipping without M2-B.
+        ...(engine === null ? {} : { decide: (subject: PolicySubject) => engine.decide(subject) }),
+        log,
+        workerState: () => built?.snapshot().state ?? "starting",
+        // The subject is built HERE because it needs the worker's cwd and a realpath — §20.3's
+        // "realpath FIRST, then match", so a rule for `src/**` cannot be evaded by a symlink.
+        toSubject: (r) => toPolicySubject(r, { cwd, agentId: req.agent, realpath }),
+      });
+
+      // A holder, because §21.5's ladder has to read the watchdog's own verdict from INSIDE the
+      // callback the watchdog is constructed with.
+      const watchdogRef: { current: Watchdog | null } = { current: null };
+      const budgets = watchdogBudgets(o.config, req.watchdog);
+      // Built only when the RESOLVED budgets say so: `WorkerSnapshot.watchdog` is `null` both for
+      // "nothing injected" and for "disabled", which is the one thing a client cannot tell apart
+      // and does not need to — neither will ever cancel a turn (§5.8.4).
+      const watchdog =
+        o.watchdog === undefined || !budgets.enabled
+          ? undefined
+          : o.watchdog({
+              workerId,
+              clock: o.clock,
+              config: budgets,
+              // §21.5's ladder, and its ORDER is the contract: `omni.error{agent_timeout}` first,
+              // because that is what makes `reduceTurn`'s verdict `failed` and what a `?since=`
+              // reader sees; then the state envelope; and only then is the agent touched.
+              onFire: (budget) => {
+                fireWatchdog({
+                  budget,
+                  log,
+                  config: budgets,
+                  handle: built,
+                  openToolCalls: watchdogRef.current?.verdict.openToolCalls.length ?? 0,
+                  logger,
+                });
+              },
+            });
+      // A holder, because the ladder above has to read the watchdog's own verdict from inside the
+      // callback the watchdog was constructed with.
+      watchdogRef.current = watchdog ?? null;
+
+      // D8: ONE provider per daemon, and `patch:"off"` is a worker opting out of it entirely —
+      // expressed by not injecting it, which is the same code path as a daemon with no provider.
+      const patchMode = req.patch ?? o.config.diff.mode;
+      const diff = patchMode === "off" ? undefined : o.diff;
+
+      const view: WorkerViewRows = {
+        onUnresolved: req.onUnresolved,
+        parkTimeoutMs: parkTimeoutMs === 0 ? null : parkTimeoutMs,
+        parkTimeoutAction,
+        policy: engine?.snapshot ?? null,
+        policyId: engine?.id ?? null,
+        mcp: { requested: req.mcp ?? [], applied: mcp.applied, dropped: mcp.dropped },
+        envKeys: env.keys,
+        patchMode,
+        watchdog: budgets.enabled
+          ? {
+              silentMs: budgets.silentMs,
+              toolMs: budgets.toolMs,
+              cancelTimeoutMs: budgets.cancelTimeoutMs,
+            }
+          : null,
+        // §23.3: `persist:false` trades hibernation for the exposure, and the way it does that is
+        // by NOT writing the map — a woken worker must never inherit an environment silently.
+        env: env.persist ? env.env : null,
+        mcpNames: req.mcp ?? [],
+      };
+
       try {
         const handle = await createWorker(
           {
@@ -800,7 +1120,11 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
             // The COMPLETE environment, composed by the catalog — the one producer of a
             // `SpawnSpec` (§5.4). It rides on the descriptor because `CreateWorkerDeps` has no
             // `spawnSpec` field; see the note in `docs/M0-PLAN.md` WP-5's hand-off.
-            descriptor: { ...descriptor, env: { ...spec.env } },
+            //
+            // `env` is the RESOLVED per-worker environment (§23.3): the catalog's complete
+            // composition, with the request's own keys applied over it — every one of which
+            // survived the hard blacklist, `envDeny` and this token's `envAllow`.
+            descriptor: { ...descriptor, env: { ...spec.env, ...env.env } },
             cwd,
             label: req.label ?? null,
             owner: auth.asClientRef(),
@@ -838,6 +1162,36 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               // worker because the counter and the budget are its private state (review R13).
               wakeTimeoutMs: o.config.hibernate.wakeTimeoutMs,
               maxWakeFailures: o.config.hibernate.maxWakeFailures,
+              // M2: the park deadline and the bound on BOTH halves of the diff provider. Without
+              // the second one a provider that hangs would hang the TURN — `end` runs immediately
+              // before `prompt_result` is fed (§25.1, review R14).
+              parkTimeoutMs,
+              diffTimeoutMs: o.config.diff.timeoutMs,
+            },
+            // ── M2's six seams (M2-PLAN §1.2) ────────────────────────────────
+            ...(strategy === undefined
+              ? {}
+              : {
+                  interactions: strategy,
+                  // D10's gate, computed ONCE by the strategy and threaded to BOTH `open` and
+                  // `reopen` — F42 is what happens when two files hard-code `{}` instead.
+                  clientCapabilities: strategy.clientCapabilities,
+                }),
+            ...(watchdog === undefined ? {} : { watchdog }),
+            ...(diff === undefined ? {} : { diff }),
+            ...(mcp.servers.length === 0 ? {} : { mcpServers: mcp.servers }),
+            // §26.2, and the reason the guard is STRUCTURAL: this creation path MUST pass it,
+            // bound to the token's `cwdRoots` and to the worker's own `promptCapabilities`. zod
+            // holds neither, which is why the schema's text-only refine was deleted rather than
+            // widened, and why `worker.ts`'s fallback is spelled differently on purpose.
+            validateContent: async (content) => {
+              await assertPromptContent({
+                content,
+                cwd,
+                cwdRoots: auth.cwdRoots,
+                promptCapabilities: built?.snapshot().capabilities?.promptCapabilities ?? null,
+                realpath,
+              });
             },
           },
           signal,
@@ -857,6 +1211,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           // and `0` in either place means "never hibernate this one" (H5, §15.2).
           hibernateIdleMs: idleBudget(req.idleTimeoutMs),
           idleTimer: null,
+          m2: view,
         };
         entries.set(workerId, entry);
         watchEntry(entry);
@@ -879,7 +1234,9 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         };
         void handle.closed.then(onClosed, onClosed);
 
-        return handle;
+        // The DECORATED handle, so the `201` body carries the same M2 rows `GET /v1/workers/{wid}`
+        // does: `http/routes/workers.ts` is frozen and serializes `handle.snapshot()` directly.
+        return viewOf(entry);
       } catch (e) {
         // The worker reclaimed its own process tree before rejecting (§5.3); the registry's job
         // is to give the slot back and to stop feeding a log nobody can reach any more.
@@ -908,7 +1265,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       const live = new Set<WorkerId>();
       for (const entry of entries.values()) {
         live.add(entry.id);
-        const snapshot = entry.handle.snapshot();
+        const snapshot = snapshotOf(entry);
         if (auth.canSee(snapshot)) out.push(snapshot);
       }
       if (store !== null && store !== undefined) {
@@ -1245,4 +1602,209 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       return { hibernated: result.hibernated, closed: result.closed, orphans: result.orphans };
     },
   };
+}
+
+// ── M2's registry-owned rows, and the ladder they arm ─────────────────────────
+
+/**
+ * The worker's snapshot plus the rows only the registry can fill (§5.8.4).
+ *
+ * `worker.ts` is frozen after the Land step and holds none of these: they are facts about the
+ * REQUEST — the disposition it asked for, the presets it named, the env keys it set, the policy
+ * it resolved to — and the registry is what resolved them. Everything that leaves this file goes
+ * through here, including the `201` body (`create()` returns a decorated handle) and the
+ * persisted row, so a client cannot see two different answers depending on which route it asked.
+ */
+function decorate(snapshot: WorkerSnapshot, rows: WorkerViewRows): WorkerSnapshot {
+  return {
+    ...snapshot,
+    onUnresolved: rows.onUnresolved,
+    parkTimeoutMs: rows.parkTimeoutMs,
+    parkTimeoutAction: rows.parkTimeoutAction,
+    policy: rows.policy,
+    mcp: rows.mcp,
+    envKeys: rows.envKeys,
+    patchMode: rows.patchMode,
+  };
+}
+
+/**
+ * A `WorkerHandle` whose `snapshot()` (and `hibernate()` / `wake()`, which both return one) is
+ * decorated, and which delegates everything else verbatim.
+ *
+ * Written out member by member rather than through a `Proxy`: a `Proxy` would silently forward a
+ * member added to `WorkerHandle` in a later milestone, and "silently forwarded" is exactly how a
+ * snapshot would come back undecorated from a verb nobody thought about.
+ */
+function decorateHandle(handle: WorkerHandle, snapshot: () => WorkerSnapshot): WorkerHandle {
+  return {
+    get id() {
+      return handle.id;
+    },
+    get log() {
+      return handle.log;
+    },
+    get lease() {
+      return handle.lease;
+    },
+    get generation() {
+      return handle.generation;
+    },
+    get closed() {
+      return handle.closed;
+    },
+    get interactions() {
+      return handle.interactions;
+    },
+    snapshot,
+    prompt: (content, who) => handle.prompt(content, who),
+    cancel: (who) => handle.cancel(who),
+    close: (reason) => handle.close(reason),
+    turn: (turnId) => handle.turn(turnId),
+    onStateChange: (cb) => handle.onStateChange(cb),
+    hibernate: async (reason) => {
+      await handle.hibernate(reason);
+      return snapshot();
+    },
+    wake: async (who, opts) => {
+      await handle.wake(who, opts);
+      return snapshot();
+    },
+    answerInteraction: (id, a, who) => handle.answerInteraction(id, a, who),
+    setConfig: (body, who) => handle.setConfig(body, who),
+    cancelInternal: (reason) => handle.cancelInternal(reason),
+  };
+}
+
+/**
+ * A persisted row's M2 rows, read back for a REHYDRATED worker.
+ *
+ * A row written by an M1 boot carries none of them, and every fallback here is that boot's own
+ * behaviour rather than this boot's config — a worker created under `deny` must not wake under a
+ * `park` default somebody set afterwards.
+ */
+function viewRowsOf(row: WorkerRow): WorkerViewRows {
+  return {
+    onUnresolved: row.onUnresolved ?? M1_VIEW.onUnresolved,
+    parkTimeoutMs: row.parkTimeoutMs ?? null,
+    parkTimeoutAction: row.parkTimeoutAction ?? M1_VIEW.parkTimeoutAction,
+    policy: row.snapshot.policy ?? null,
+    policyId: row.policyRef ?? null,
+    mcp: row.snapshot.mcp ?? { requested: row.mcpNames ?? [], applied: [], dropped: [] },
+    envKeys: row.snapshot.envKeys ?? Object.keys(row.env ?? {}),
+    patchMode: row.patchMode ?? M1_VIEW.patchMode,
+    watchdog: row.watchdog ?? null,
+    env: row.env ?? null,
+    mcpNames: row.mcpNames ?? [],
+  };
+}
+
+/**
+ * The daemon-wide budgets with the request's own overrides applied, field by field.
+ *
+ * `WatchdogOverride` is a `strictObject` of optionals rather than a `.partial()` for exactly this
+ * merge: `{}` must mean "change nothing", and a schema whose inner defaults still fired would
+ * have `{}` silently beat the operator's configuration on every field the caller never wrote.
+ *
+ * `cancelTimeoutMs > turn.cancelGraceMs` is a config LOAD error daemon-wide (§21.5), so a
+ * per-worker override that broke it would be the one way to reach the state the load check
+ * exists to forbid: a watchdog that closes the worker before the turn it cancelled can settle.
+ */
+function watchdogBudgets(
+  config: ResolvedDaemonConfig,
+  override: WorkerViewOverride,
+): ResolvedWatchdogConfig {
+  const resolved: ResolvedWatchdogConfig = { ...config.watchdog, ...(override ?? {}) };
+  if (resolved.cancelTimeoutMs <= config.turn.cancelGraceMs) {
+    throw new OmniError(
+      "bad_request",
+      `watchdog.cancelTimeoutMs (${String(resolved.cancelTimeoutMs)}ms) must exceed ` +
+        `turn.cancelGraceMs (${String(config.turn.cancelGraceMs)}ms)`,
+      { detail: { field: "watchdog.cancelTimeoutMs" } },
+    );
+  }
+  return resolved;
+}
+
+type WorkerViewOverride =
+  | {
+      silentMs?: number;
+      toolMs?: number;
+      cancelTimeoutMs?: number;
+      enabled?: boolean;
+    }
+  | undefined;
+
+/**
+ * §21.5's ladder, in the ORDER that is the contract.
+ *
+ * `omni.error{agent_timeout}` FIRST, because that is what makes `reduceTurn`'s verdict `failed`
+ * and what a `?since=` reader sees; then `worker_state{reason:"watchdog_idle"}`; and only then is
+ * the agent touched. `action:"close"` skips straight to M1's existing `cancel_timeout` close
+ * WITHOUT waiting out `cancelTimeoutMs`; `"cancel"` goes through `cancelInternal`, which is not
+ * lease-gated — the lease governs CLIENTS and the idle watchdog is not one.
+ *
+ * It never throws: a watchdog that fails must not take the worker with it.
+ */
+function fireWatchdog(o: {
+  budget: "silent" | "tool";
+  log: EventLog;
+  config: ResolvedWatchdogConfig;
+  handle: WorkerHandle | null;
+  openToolCalls: number;
+  logger: Logger;
+}): void {
+  const idleMs = o.budget === "tool" ? o.config.toolMs : o.config.silentMs;
+  const turnId = o.handle?.snapshot().currentTurnId ?? null;
+  try {
+    o.log.appendAll([
+      {
+        kind: "omni.error",
+        payloadVersion: 2,
+        turnId,
+        payload: {
+          code: "agent_timeout",
+          message:
+            `idle watchdog: no activity for ${String(idleMs)}ms ` +
+            `(budget ${String(idleMs)}ms, ${String(o.openToolCalls)} tool call(s) open)`,
+        },
+      },
+      {
+        kind: "omni.worker_state",
+        payloadVersion: 2,
+        turnId,
+        payload: {
+          state: "running",
+          previous: "running",
+          reason: "watchdog_idle",
+          watchdog: { budget: o.budget, idleMs, openToolCalls: o.openToolCalls },
+        },
+      },
+    ]);
+  } catch (e) {
+    // A log that cannot take the two envelopes is still a stall we have to act on.
+    o.logger.warn("appending the watchdog envelopes failed", { error: String(e) });
+  }
+
+  const handle = o.handle;
+  if (handle === null) return;
+  const done =
+    o.config.action === "close"
+      ? handle.close("cancel_timeout")
+      : handle.cancelInternal(o.budget === "tool" ? "watchdog_tool" : "watchdog_silent");
+  void done.catch((e: unknown) => {
+    o.logger.warn("the watchdog's escalation failed", { error: String(e) });
+  });
+}
+
+/**
+ * The token's `cwdRoots` as the CURRENT config declares them.
+ *
+ * A rehydrated worker has no `AuthContext` — nobody is holding it across a restart (ruling
+ * M1-R8) — and §26.2 binds the content gate to the token's roots, so they are read from the
+ * config the same way `whoami`'s reporting fields are. A token the operator has since removed
+ * resolves to `[]`, which refuses every `resource_link` and is the fail-closed answer.
+ */
+function cwdRootsOf(config: ResolvedDaemonConfig, tokenId: TokenId): readonly string[] {
+  return config.tokens.find((t) => t.id === tokenId)?.cwdRoots ?? [];
 }
