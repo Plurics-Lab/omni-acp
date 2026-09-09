@@ -362,7 +362,13 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
     if (req.kind === "elicitation") {
       return {
         wire: { kind: "resolve", value: { action: "decline" } },
-        record: { ...base, status: over.status, decision: "deny", optionId: null, action: "decline" },
+        record: {
+          ...base,
+          status: over.status,
+          decision: "deny",
+          optionId: null,
+          action: "decline",
+        },
       };
     }
     const choice = chooseOption("deny", req.options, { allowSessionGrants: true });

@@ -2,11 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type {
-  EventEnvelope,
-  InteractionPayload,
-  PolicyDecisionPayload,
-} from "@omni-acp/protocol";
+import type { EventEnvelope, InteractionPayload, PolicyDecisionPayload } from "@omni-acp/protocol";
 
 /**
  * WP-I acceptance 1's real content: the baseline's envelopes are M1's **modulo `payloadVersion`
@@ -27,13 +23,7 @@ import type {
  * Owned by M2-A-WP-I.
  */
 
-const DIR = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "normalizer",
-  "golden",
-);
+const DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "normalizer", "golden");
 
 /** The four goldens that carry a permission (M2-PLAN §3 lists them as this package's). */
 const NAMES = [
@@ -174,7 +164,12 @@ describe("the M2 goldens are M1 modulo payloadVersion and the additive fields (M
 
   it("the four goldens are the complete list this bullet touches (M2-PLAN §3)", () => {
     // A fifth golden growing a permission would be a file this package does not own.
-    for (const name of ["01-plain-answer", "02-tool-read", "06-cancel-mid-turn", "07-session-load"]) {
+    for (const name of [
+      "01-plain-answer",
+      "02-tool-read",
+      "06-cancel-mid-turn",
+      "07-session-load",
+    ]) {
       expect(envelopes(name).filter((e) => e.kind === "acp.interaction")).toEqual([]);
     }
   });

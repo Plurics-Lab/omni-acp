@@ -88,7 +88,13 @@ function schemaParses(text: string): string[] {
 const IDENTITY_FIELDS = new Set(["requestId", "interactionId"]);
 
 function transportIdReads(fileName: string, text: string): { line: number; code: string }[] {
-  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const source = ts.createSourceFile(
+    fileName,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
   const hits: { line: number; code: string }[] = [];
 
   const reads = (e: ts.Expression): boolean => {

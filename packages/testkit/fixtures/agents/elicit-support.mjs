@@ -46,25 +46,45 @@ export function elicitAgent({ name, questions, message, neverResolves = false, o
   const stream = acp.ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
   let sessions = 0;
   let asked = 0;
+  /** What the CLIENT declared on the most recent `initialize`. Echoed into the turn below. */
+  let declared = null;
+  /**
+   * `OMNI_FIXTURE_RESUMABLE=1` advertises a resume spelling, so the worker may be hibernated and
+   * woken (M1-R15) — which is the only way to observe F42's wake-path declaration end to end.
+   */
+  const resumable = process.env.OMNI_FIXTURE_RESUMABLE === "1";
 
-  acp
+  const app = acp
     .agent({ name })
     .onRequest("initialize", (ctx) => {
-      // RECORDED on stdout so a test can assert D10's gate on OUR OWN outbound bytes (F28): with
-      // `clientCapabilities: {}` this fixture still asks, which is what makes the gate testable
-      // from the daemon's side rather than from the agent's good manners.
-      process.stderr.write(
-        `omni-fixture initialize ${JSON.stringify(ctx.params?.clientCapabilities ?? null)}\n`,
-      );
+      // RECORDED, because F28's whole finding is that the AGENT branches on these bytes and
+      // `initialize`'s `agentCapabilities` says nothing about elicitation either way — so our own
+      // declaration is the only record of why an agent asked in prose. A real claude-acp honours
+      // the gate; this fixture deliberately does NOT, so that ruling M2-R15's "asks anyway ⇒
+      // decline" arm is reachable at all.
+      declared = ctx.params?.clientCapabilities ?? null;
+      process.stderr.write(`omni-fixture initialize ${JSON.stringify(declared)}\n`);
       return {
         protocolVersion: acp.PROTOCOL_VERSION,
-        agentCapabilities: { loadSession: false },
+        agentCapabilities: resumable
+          ? { loadSession: true, sessionCapabilities: { resume: {}, close: {} } }
+          : { loadSession: false },
       };
     })
     .onRequest("session/new", () => ({ sessionId: `${name}-${++sessions}` }))
     .onRequest("session/prompt", async (ctx) => {
       const sessionId = ctx.params.sessionId;
       const toolCallId = `toolu_ask_${++asked}`;
+
+      // The declaration, echoed into the LOG, so a test asserts D10's gate on our own outbound
+      // bytes rather than on the fixture's good manners or on a stderr tail.
+      await ctx.client.notify("session/update", {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `omni-declared:${JSON.stringify(declared)}` },
+        },
+      });
 
       // F32: the mirror, first and always.
       await ctx.client.notify("session/update", {
@@ -121,6 +141,12 @@ export function elicitAgent({ name, questions, message, neverResolves = false, o
     .onNotification("session/cancel", () => {
       // Deliberately inert: the escalation ladder is only reachable if nobody answers, and
       // §19.8's ordering claim is observed by the CLIENT sending the cancel.
-    })
-    .connect(stream);
+    });
+
+  if (resumable) {
+    app.onRequest("session/resume", (ctx) => ({ sessionId: ctx.params?.sessionId ?? "resumed" }));
+    app.onRequest("session/close", () => ({}));
+  }
+
+  app.connect(stream);
 }

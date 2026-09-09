@@ -1159,11 +1159,7 @@
                 "oldLines": 2,
                 "newStart": 1,
                 "newLines": 2,
-                "lines": [
-                  "-mode = slow",
-                  "+mode = fast",
-                  " retries = 3"
-                ]
+                "lines": ["-mode = slow", "+mode = fast", " retries = 3"]
               }
             ],
             "userModified": false,

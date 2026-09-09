@@ -250,7 +250,9 @@ function mapForTest(req: unknown): Omit<MappedPermissionRequest, "raw"> {
     sessionId: typeof r["sessionId"] === "string" ? r["sessionId"] : "",
     title: toolCall !== null && typeof toolCall["title"] === "string" ? toolCall["title"] : "",
     subject: toolCall === null ? null : { type: "tool_call", toolCall },
-    options: Array.isArray(r["options"]) ? (r["options"] as MappedPermissionRequest["options"]) : [],
+    options: Array.isArray(r["options"])
+      ? (r["options"] as MappedPermissionRequest["options"])
+      : [],
     toolCallId:
       toolCall !== null && typeof toolCall["toolCallId"] === "string"
         ? toolCall["toolCallId"]

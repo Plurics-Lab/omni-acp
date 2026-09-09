@@ -170,7 +170,9 @@ describe("bullet 5 — envelope sequences (§19.10, ruling M2-R4)", () => {
     // `acp.interaction` for ONE requestId appeared TWICE, which is why an SSE consumer keys on
     // `requestId` and never counts frames; `omni.policy_decision` appeared EXACTLY ONCE.
     expect(r.interactions()).toHaveLength(2);
-    expect(new Set(r.interactions().map((e) => (e.payload as { requestId: string }).requestId)).size).toBe(1);
+    expect(
+      new Set(r.interactions().map((e) => (e.payload as { requestId: string }).requestId)).size,
+    ).toBe(1);
     expect(r.decisions()).toHaveLength(1);
     expect(r.interactions().every((e) => e.turnId === turnId)).toBe(true);
 
@@ -351,7 +353,9 @@ describe("bullet 7 — parkTimeoutMs under fakeClock (ruling M2-R7)", () => {
     r.h.clock.advance(1);
     await flush();
 
-    expect(await pending).toEqual({ result: { outcome: { outcome: "selected", optionId: "reject" } } });
+    expect(await pending).toEqual({
+      result: { outcome: { outcome: "selected", optionId: "reject" } },
+    });
     expect(r.ip(1)).toMatchObject({
       status: "expired",
       answer: { by: "timeout", optionId: "reject", parkedMs: 5_000 },
@@ -681,7 +685,11 @@ describe("bullet 8 — §19.6's SEMANTICS rows, decided before anything reaches 
     const r = await parkedRig();
     const missing = await failed(
       Promise.resolve().then(() =>
-        r.worker.answerInteraction("x_00000000000000000000000099" as InteractionId, { action: "deny" }, WHO),
+        r.worker.answerInteraction(
+          "x_00000000000000000000000099" as InteractionId,
+          { action: "deny" },
+          WHO,
+        ),
       ),
     );
     expect(missing.code).toBe("interaction_not_found");
@@ -710,7 +718,11 @@ describe("bullet 8 — §19.6's SEMANTICS rows, decided before anything reaches 
         ),
       );
       // The requestId is a ULID and differs per worker; everything else must not.
-      bodies.push({ code: e.code, status: e.status, message: e.message.replace(/x_[0-9A-Z]+/, "") });
+      bodies.push({
+        code: e.code,
+        status: e.status,
+        message: e.message.replace(/x_[0-9A-Z]+/, ""),
+      });
       await r.worker.close("client_request");
     }
     expect(bodies[0]).toEqual(bodies[1]);

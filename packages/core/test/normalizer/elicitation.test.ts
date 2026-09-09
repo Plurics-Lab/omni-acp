@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { OmniError, type ElicitationField } from "@omni-acp/protocol";
 import { loadTranscript } from "@omni-acp/testkit";
-import {
-  buildElicitationContent,
-  mapElicitation,
-} from "../../src/normalizer/map/elicitation.js";
+import { buildElicitationContent, mapElicitation } from "../../src/normalizer/map/elicitation.js";
 
 /**
  * `mapElicitation` / `buildElicitationContent` against transcripts `12` and `13` — the two
@@ -56,7 +53,12 @@ describe("mapElicitation (§5.8.9, F29/F30)", () => {
     // claude-acp sends `oneOf`, NOT `enum`. A reader that knows only `enum` sees this as
     // unconstrained free text and routes every answer to the custom slot — F30 from the other
     // side.
-    expect(q0.options.map((o) => o.value)).toEqual(["notes.md", "README.md", "main.py", "index.js"]);
+    expect(q0.options.map((o) => o.value)).toEqual([
+      "notes.md",
+      "README.md",
+      "main.py",
+      "index.js",
+    ]);
     expect(q0.options[0]).toEqual({
       value: "notes.md",
       title: "notes.md",

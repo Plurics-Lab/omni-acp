@@ -41,12 +41,11 @@ export interface ElicitationScriptOptions {
 /**
  * `params.requestedSchema`, byte for byte in transcript `12`'s shape.
  *
- * Exported because the compat suite and the golden tests both need to compare against the SAME
- * bytes the fixture puts on the wire, and a second hand-written copy is a second opinion.
+ * Module-private: §5.8.10 pins `@omni-acp/testkit`'s surface to `elicitationScript` alone, and
+ * `exports-are-stable` fails the build on a name that leaked. A consumer that needs these bytes
+ * gets them by reading what `elicitationScript` actually sent.
  */
-export function elicitationSchema(
-  questions: readonly ElicitationQuestion[],
-): Record<string, unknown> {
+function elicitationSchema(questions: readonly ElicitationQuestion[]): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
   for (const q of questions) {
     properties[q.id] = {
@@ -75,8 +74,11 @@ export function elicitationSchema(
   return { type: "object", properties };
 }
 
-/** `params`, flat (F29) — the whole object the agent puts on the wire. */
-export function elicitationParams(o: ElicitationScriptOptions, sessionId: string): Record<string, unknown> {
+/** `params`, flat (F29) — the whole object the agent puts on the wire. Module-private, as above. */
+function elicitationParams(
+  o: ElicitationScriptOptions,
+  sessionId: string,
+): Record<string, unknown> {
   return {
     mode: "form",
     // F29: FLAT. A type that models the scope as a nested object parses nothing a real

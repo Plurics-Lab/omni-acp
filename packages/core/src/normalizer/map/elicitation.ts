@@ -99,7 +99,9 @@ export function mapElicitation(params: unknown): MappedElicitationRequest {
     // a second application keeps the FIRST one's params — which is what makes `map(map(x))`
     // deep-equal `map(x)`, the idempotence bullet.
     raw: p,
-    ...(typeof meta === "object" && meta !== null ? { _meta: meta as Record<string, unknown> } : {}),
+    ...(typeof meta === "object" && meta !== null
+      ? { _meta: meta as Record<string, unknown> }
+      : {}),
   };
 }
 

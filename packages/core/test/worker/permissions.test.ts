@@ -392,10 +392,14 @@ describe("the same handling through baselineInteractions (M2-PLAN §1.3 seam A)"
       strategy.close();
     }).not.toThrow();
     expect(() =>
-      strategy.answer("x_00000000000000000000000001" as never, { action: "deny" }, {
-        tokenId: OWNER.tokenId,
-        clientId: OWNER.clientId,
-      }),
+      strategy.answer(
+        "x_00000000000000000000000001" as never,
+        { action: "deny" },
+        {
+          tokenId: OWNER.tokenId,
+          clientId: OWNER.clientId,
+        },
+      ),
     ).toThrow(/no interaction/);
   });
 });

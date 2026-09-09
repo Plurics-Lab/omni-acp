@@ -221,9 +221,7 @@ export function runInteractionConformance(
       expect(r.decisions()[0]?.optionId).toBeNull();
       if (typeof answer === "object" && answer !== null && "outcome" in answer) {
         const outcome = (answer as RequestPermissionResponse).outcome;
-        expect(outcome.outcome === "selected" && outcome.optionId).not.toBe(
-          ALLOW_ALWAYS.optionId,
-        );
+        expect(outcome.outcome === "selected" && outcome.optionId).not.toBe(ALLOW_ALWAYS.optionId);
       }
       expect(TERMINAL).toContain(r.interactions().at(-1)?.status);
     });
@@ -275,19 +273,21 @@ export function runInteractionConformance(
       const r = rig();
       const answer = await settle(r, r.elicitation());
       expect(answer).toMatchObject({ action: expect.any(String) as unknown as string });
-      expect(["accept", "decline", "cancel"]).toContain(
-        (answer as { action: string }).action,
-      );
+      expect(["accept", "decline", "cancel"]).toContain((answer as { action: string }).action);
     });
 
     it("`answer` on an id it never held is interaction_not_found (§19.6, M2-R2)", () => {
       const strategy = make();
       let thrown: unknown;
       try {
-        strategy.answer("x_00000000000000000000000099" as InteractionId, { action: "deny" }, {
-          tokenId: "tok_conformance" as never,
-          clientId: "cli_conformance",
-        });
+        strategy.answer(
+          "x_00000000000000000000000099" as InteractionId,
+          { action: "deny" },
+          {
+            tokenId: "tok_conformance" as never,
+            clientId: "cli_conformance",
+          },
+        );
       } catch (e) {
         thrown = e;
       }

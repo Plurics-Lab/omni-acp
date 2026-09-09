@@ -13,10 +13,7 @@ import type {
   TurnId,
   WorkerId,
 } from "@omni-acp/protocol";
-import {
-  createInteractionChannel,
-  type InteractionRequestHandle,
-} from "../src/interactions.js";
+import { createInteractionChannel, type InteractionRequestHandle } from "../src/interactions.js";
 import type { Transport } from "../src/transport.js";
 
 /**
@@ -176,9 +173,7 @@ describe('Worker.on("interaction") and InteractionRequestHandle', () => {
     const channel = createInteractionChannel(transport, WID);
     let fired = 0;
     channel.onInteraction(() => fired++);
-    channel.handleEnvelope(
-      envelope(parkedPermission(), { kind: "omni.policy_decision" } as never),
-    );
+    channel.handleEnvelope(envelope(parkedPermission(), { kind: "omni.policy_decision" } as never));
     channel.handleEnvelope(envelope(parkedPermission(), { kind: "acp.session_update" } as never));
     expect(fired).toBe(0);
     expect(channel.pending).toEqual([]);
@@ -239,7 +234,7 @@ describe('Worker.on("interaction") and InteractionRequestHandle', () => {
     ]);
   });
 
-  it('deny() is one verb for both arms: reject_once for a permission, decline for an elicitation', async () => {
+  it("deny() is one verb for both arms: reject_once for a permission, decline for an elicitation", async () => {
     for (const payload of [parkedPermission(), parkedElicitation()]) {
       const { transport, calls } = recordingTransport();
       const channel = createInteractionChannel(transport, WID);
@@ -320,7 +315,9 @@ describe('Worker.on("interaction") and InteractionRequestHandle', () => {
     channel.handleEnvelope(envelope(parkedPermission()));
     const req = handle as unknown as InteractionRequestHandle;
     expect(req.settled).toBe(false);
-    channel.handleEnvelope(envelope(settled({ answer: { optionId: "reject", by: "human", parkedMs: 41230 } })));
+    channel.handleEnvelope(
+      envelope(settled({ answer: { optionId: "reject", by: "human", parkedMs: 41230 } })),
+    );
     expect(req.settled).toBe(true);
     expect(calls).toEqual([]);
   });
@@ -395,7 +392,12 @@ describe('Worker.on("interaction") and InteractionRequestHandle', () => {
         expiresAt: null,
         settledAt: "2026-01-01T00:00:41.230Z",
         settledBy: "human",
-        answer: { optionId: "allow-once", by: "human", byToken: "tok_a" as TokenId, parkedMs: 41230 },
+        answer: {
+          optionId: "allow-once",
+          by: "human",
+          byToken: "tok_a" as TokenId,
+          parkedMs: 41230,
+        },
       },
       state: "running",
       seq: 42 as Seq,

@@ -102,7 +102,10 @@ export function createInteractionChannel(transport: Transport, id: WorkerId): In
       return !pending.has(snapshot.requestId);
     },
     allow: (optionId) =>
-      post(snapshot.requestId, optionId === undefined ? { action: "allow" } : { action: "allow", optionId }),
+      post(
+        snapshot.requestId,
+        optionId === undefined ? { action: "allow" } : { action: "allow", optionId },
+      ),
     deny: () => post(snapshot.requestId, { action: "deny" }),
     answer: (content) => {
       // F30, enforced BEFORE the round trip: answers are keyed by QUESTION id, and naming a
