@@ -8,10 +8,12 @@ import {
   type PersistenceHandle,
   type ResolvedEventLogConfig,
 } from "@omni-acp/protocol";
+import { createDeliveryStore } from "./delivery-store.js";
 import { createSqliteEventStore } from "./event-store.js";
 import { acquireDataDirLock } from "./lock.js";
-import { createPersistenceHandle } from "./persistence.js";
-import { migrate, type SqliteDatabase } from "./schema.js";
+import { createPersistenceHandle, type DurablePersistenceHandle } from "./persistence.js";
+import { createRunStore } from "./run-store.js";
+import { migrate, withTransaction, type SqliteDatabase } from "./schema.js";
 import { withSuppressedSqliteWarning } from "./warning.js";
 import { createSqliteWorkerStore } from "./worker-store.js";
 
@@ -52,6 +54,17 @@ export interface OpenPersistenceOptions {
   readonly bootId?: string;
   /** §14.6's rule, injectable so a resolved descriptor (or a test) can widen or narrow it. */
   readonly digest?: (e: EventEnvelope, bytes: number) => boolean;
+  /**
+   * M2 (§24.5). `run.retentionDays` and `webhooks.retentionDays` — swept by M1's existing timer,
+   * together with the runs' own rows.
+   *
+   * Optional, and defaulting to `config.retentionDays`, because the daemon's one caller of this
+   * function (`daemon/src/event-store.ts`) belongs to another work package and passes an
+   * `eventLog` config and nothing else. The fallback is the only number available and is the one
+   * an operator who has not thought about runs would expect.
+   */
+  readonly runRetentionDays?: number;
+  readonly deliveryRetentionDays?: number;
 }
 
 interface DatabaseSyncCtor {
@@ -68,7 +81,9 @@ interface DatabaseSyncCtor {
  *
  * Owned by M1-WP-A.
  */
-export async function openPersistence(o: OpenPersistenceOptions): Promise<PersistenceHandle> {
+export async function openPersistence(
+  o: OpenPersistenceOptions,
+): Promise<DurablePersistenceHandle> {
   if (o.config.driver !== "sqlite") {
     throw new OmniError(
       "internal",
@@ -148,6 +163,11 @@ export async function openPersistence(o: OpenPersistenceOptions): Promise<Persis
       ...(o.digest === undefined ? {} : { digest: o.digest }),
     });
     const workers = createSqliteWorkerStore(db);
+    // Schema v2's two tables (§24.2). They are created by `migrate` above whether or not a run is
+    // ever made — a CREATE-only migration that ran lazily would mean the first `POST /v1/runs`
+    // after an upgrade pays for a DDL statement under a write lock.
+    const runs = createRunStore(db);
+    const deliveries = createDeliveryStore(db);
 
     o.logger.info("event persistence opened", {
       file: inMemory ? IN_MEMORY : file,
@@ -159,6 +179,13 @@ export async function openPersistence(o: OpenPersistenceOptions): Promise<Persis
     return createPersistenceHandle({
       events,
       workers,
+      runs,
+      deliveries,
+      transaction: (fn) => withTransaction(db, fn),
+      ...(o.runRetentionDays === undefined ? {} : { runRetentionDays: o.runRetentionDays }),
+      ...(o.deliveryRetentionDays === undefined
+        ? {}
+        : { deliveryRetentionDays: o.deliveryRetentionDays }),
       bootId,
       config: o.config,
       clock: o.clock,

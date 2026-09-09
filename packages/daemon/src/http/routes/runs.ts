@@ -21,12 +21,20 @@ import { sseResponse } from "../sse.js";
 export function registerRunRoutes(app: Hono, daemon: Daemon): void {
   const auth = authMiddleware(daemon);
 
+  // `202`, not `201`: the run is ACCEPTED here and converges on the daemon's own time (H25). A
+  // `201 Created` would promise a finished resource, and the whole point of §24.5 is that nothing
+  // about a run's outcome — least of all its webhook — happens inside this request.
   app.post("/v1/runs", auth, async (c) => {
     const body = CreateRunRequest.parse(await readJson(c));
-    return c.json(await daemon.runs.create(body, authOf(c.req.raw)), 201);
+    return c.json(await daemon.runs.create(body, authOf(c.req.raw)), 202);
   });
 
-  app.get("/v1/runs", auth, (c) => c.json({ runs: daemon.runs.list(authOf(c.req.raw)) }));
+  // `cursor` is always `null`: `RunRegistry.list` (§5.8.8, frozen) returns an array and has no
+  // seat for one. The field is present because `RunListResponse` declares it, and a body that
+  // omitted it would make a client's `cursor` handling depend on which route answered.
+  app.get("/v1/runs", auth, (c) =>
+    c.json({ runs: daemon.runs.list(authOf(c.req.raw)), cursor: null }),
+  );
 
   app.get("/v1/runs/:rid", auth, (c) =>
     c.json(daemon.runs.get(runId(c.req.param("rid")), authOf(c.req.raw))),
