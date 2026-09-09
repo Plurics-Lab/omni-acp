@@ -28,11 +28,11 @@
     "patchInfo": null,
     "vendorPatch": null,
     "interactions": [],
-    "verdict": "ok",
+    "verdict": "partial",
     "warnings": [],
     "failedToolCalls": [],
     "deniedToolCalls": [],
-    "strandedToolCalls": [],
+    "strandedToolCalls": ["call_b"],
     "pendingInteractions": [],
     "error": null
   },

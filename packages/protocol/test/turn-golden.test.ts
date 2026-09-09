@@ -199,7 +199,75 @@ describe("the corpus covers every acceptance clause", () => {
     for (const name of names) {
       const { envelopes, expected } = load(name);
       expect(reduceTurn(expected.turnId, envelopes).patch).toBeNull();
+      expect(reduceTurn(expected.turnId, envelopes).patchInfo).toBeNull();
     }
+  });
+
+  /**
+   * M2-A-WP-W, ruling M2-R8. Two of the twelve transcripts end a TERMINAL turn holding a tool
+   * call nobody terminalized, and this is the whole corpus split out so the rule is visible
+   * rather than buried in two expectation files:
+   *
+   *  - `permission-deny` — the write we denied is left `pending` for ever; the agent's only
+   *    signal is English prose we never parse (findings 6 and 7).
+   *  - `tool-call-upsert` — `call_b` is announced and never resolved.
+   *
+   * Both were `verdict: "ok"` while `strandedToolCalls` was the Land step's `[]` stub. They are
+   * `partial` now, and that is a CORRECTION rather than a regression: a turn that ended without
+   * being told what happened to a tool it started was never "ok", and M2-PLAN §1.6 deviation 6 is
+   * the record that the Land step saw this coming and left the rule to be implemented here.
+   */
+  it("strands exactly the calls whose last status was never terminal, and only on a TERMINAL turn", () => {
+    const stranded = new Map<string, readonly string[]>();
+    for (const name of names) {
+      const { envelopes, expected } = load(name);
+      const result = reduceTurn(expected.turnId, envelopes);
+      stranded.set(name, result.strandedToolCalls);
+
+      // The rule, re-derived from the result itself rather than from the fixture: for a terminal
+      // turn it is exactly the non-terminal ids in stream order, and for a running one it is [].
+      const terminal = turnStatus(expected.turnId, envelopes).state !== "running";
+      const expectedIds = terminal
+        ? result.toolCalls
+            .filter((c) => c.status !== "completed" && c.status !== "failed")
+            .map((c) => c.toolCallId)
+        : [];
+      expect(result.strandedToolCalls, name).toStrictEqual(expectedIds);
+      // Never synthesized into a status, and never counted as a failure.
+      for (const id of result.strandedToolCalls) {
+        expect(result.failedToolCalls, name).not.toContain(id);
+      }
+      // And it always forces at least `partial`.
+      if (result.strandedToolCalls.length > 0) {
+        expect(result.verdict, name).not.toBe("ok");
+      }
+    }
+
+    // The corpus split, named so a fixture that quietly grows or loses a strand is visible.
+    expect(Object.fromEntries(stranded)).toStrictEqual({
+      cancelled: [],
+      "crash-mid-turn": [],
+      "diff-changes": [],
+      "happy-turn": [],
+      "interleaved-turns": [],
+      "no-message-id": [],
+      "permission-deny": ["call_2"],
+      "prompt-error": [],
+      // `running-partial` HAS an `in_progress` call, and strands nothing: it is not over yet.
+      "running-partial": [],
+      "tool-call-upsert": ["call_b"],
+      "unknown-turn": [],
+      "usage-last-wins": [],
+    });
+
+    // The one that proves "only when terminal" is doing work.
+    const running = load("running-partial");
+    expect(turnStatus(running.expected.turnId, running.envelopes).state).toBe("running");
+    expect(
+      reduceTurn(running.expected.turnId, running.envelopes).toolCalls.some(
+        (c) => c.status !== "completed" && c.status !== "failed",
+      ),
+    ).toBe(true);
   });
 
   it("a turn ended by worker_state{closed} has stopReason null and a non-null error", () => {

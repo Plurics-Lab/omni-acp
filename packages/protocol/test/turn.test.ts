@@ -700,3 +700,170 @@ describe("the v1/v2 `=` rows are structurally equal AT COMPILE TIME (§12.7)", (
     expect(diagnostics).toEqual([]);
   });
 });
+
+/**
+ * M2-A-WP-W. §21.5 and ruling M2-R8's half of the fold: the calls a finished turn was never told
+ * about, and the honest nulls D8 attaches an explanation to.
+ */
+describe("reduceTurn reports stranded tool calls rather than synthesizing one (M2-R8)", () => {
+  const call = (id: string, extra: Record<string, unknown> = {}, turnId: TurnId = T) =>
+    env(
+      {
+        kind: "acp.session_update",
+        payloadVersion: 2,
+        payload: { sessionUpdate: "tool_call_update", toolCallId: id, ...extra } as never,
+      },
+      turnId,
+    );
+
+  it("is empty on a turn where every call reached a terminal status", () => {
+    const r = reduceTurn(T, [
+      running(),
+      call("a", { status: "pending" }),
+      call("a", { status: "completed" }),
+      call("b", { status: "failed" }),
+      idle("end_turn"),
+    ]);
+    expect(r.strandedToolCalls).toEqual([]);
+    expect(r.failedToolCalls).toEqual(["b"]);
+  });
+
+  it("reports every non-terminal LAST status, in stream order", () => {
+    const r = reduceTurn(T, [
+      running(),
+      call("first", { status: "in_progress" }),
+      call("second", { status: "completed" }),
+      call("third", { status: "pending" }),
+      idle("cancelled"),
+    ]);
+    expect(r.strandedToolCalls).toEqual(["first", "third"]);
+    expect(r.verdict).toBe("partial");
+  });
+
+  it("counts a call whose status was NEVER sent — `null` is exactly the condition it reports", () => {
+    const r = reduceTurn(T, [running(), call("ghost", { title: "Terminal" }), idle("end_turn")]);
+    expect(r.toolCalls[0]?.status).toBeNull();
+    expect(r.strandedToolCalls).toEqual(["ghost"]);
+  });
+
+  it("does not treat `cancelled` as terminal — the agent said it stopped, not that it finished", () => {
+    // F36: neither real agent EVER sends this for a stranded call. An agent that volunteered it
+    // would still not be telling us the tool completed.
+    const r = reduceTurn(T, [running(), call("a", { status: "cancelled" }), idle("cancelled")]);
+    expect(r.strandedToolCalls).toEqual(["a"]);
+  });
+
+  it("strands nothing on a RUNNING turn, and everything the moment it ends", () => {
+    const live = [running(), call("a", { status: "pending" })];
+    expect(reduceTurn(T, live).strandedToolCalls).toEqual([]);
+    expect(reduceTurn(T, live).verdict).toBe("ok");
+    expect(turnStatus(T, live).state).toBe("running");
+
+    const ended = [...live, idle("end_turn")];
+    expect(reduceTurn(T, ended).strandedToolCalls).toEqual(["a"]);
+    expect(reduceTurn(T, ended).verdict).toBe("partial");
+  });
+
+  it("also strands on a turn ended by a worker close rather than by idle", () => {
+    const r = reduceTurn(T, [
+      running(),
+      call("a", { status: "pending" }),
+      env(
+        {
+          kind: "omni.worker_state",
+          payloadVersion: 2,
+          payload: { state: "closed", previous: "running", reason: "cancel_timeout" },
+        },
+        null,
+      ),
+    ]);
+    expect(r.strandedToolCalls).toEqual(["a"]);
+    // `failed` still outranks `partial`: the close carried an error.
+    expect(r.verdict).toBe("failed");
+  });
+
+  it("is stable under re-delivery, re-ordering and replay, like every other field", () => {
+    const envelopes = [
+      running(),
+      call("a", { status: "pending" }),
+      call("b", { status: "completed" }),
+      idle("cancelled"),
+    ];
+    const first = reduceTurn(T, envelopes);
+    expect(first.strandedToolCalls).toEqual(["a"]);
+    expect(reduceTurn(T, [...envelopes, ...structuredClone(envelopes)])).toStrictEqual(first);
+    expect(reduceTurn(T, [...envelopes].reverse())).toStrictEqual(first);
+  });
+
+  it("ignores another turn's open call", () => {
+    const r = reduceTurn(T, [
+      running(),
+      call("mine", { status: "completed" }),
+      call("theirs", { status: "pending" }, OTHER),
+      idle("end_turn"),
+    ]);
+    expect(r.strandedToolCalls).toEqual([]);
+  });
+});
+
+describe("reduceTurn explains every patch null (D8, §25.3)", () => {
+  const PATCH_TEXT = ["diff --", "git a/x b/x\n"].join("");
+
+  it("reads the provider's own warnings out of the `omni/patch` block", () => {
+    // §25.1: the warning "has to reach `idle._meta` through this same channel — it is the only
+    // one a pure fold can read it from". `omni/warnings` is the REDUCER's key; a provider writes
+    // into its own `PatchResult` and this is what surfaces it.
+    const r = reduceTurn(T, [
+      running(),
+      idleWithMeta({
+        "omni/patch": {
+          text: null,
+          source: null,
+          truncated: false,
+          quality: "unavailable",
+          warnings: [
+            { code: "patch_timeout", message: "the provider did not answer", source: "patch" },
+            { code: "bogus", message: "no source" },
+          ],
+        },
+      }),
+    ]);
+    expect(r.patch).toBeNull();
+    expect(r.patchInfo).toEqual({ source: null, truncated: false, quality: "unavailable" });
+    expect(r.warnings).toEqual([
+      { code: "patch_timeout", message: "the provider did not answer", source: "patch" },
+    ]);
+  });
+
+  it("keeps a well-formed patch and its quality", () => {
+    const r = reduceTurn(T, [
+      running(),
+      idleWithMeta({
+        "omni/patch": {
+          text: PATCH_TEXT,
+          source: "git",
+          truncated: true,
+          quality: "shared_worktree",
+          warnings: [],
+        },
+      }),
+    ]);
+    expect(r.patch).toBe(PATCH_TEXT);
+    expect(r.patchInfo).toEqual({ source: "git", truncated: true, quality: "shared_worktree" });
+  });
+
+  it("a malformed block is null, never a throw and never a half-built patchInfo", () => {
+    for (const bad of [{ quality: "excellent" }, "a patch", null, 7, { text: "x" }]) {
+      const r = reduceTurn(T, [running(), idleWithMeta({ "omni/patch": bad })]);
+      expect(r.patch, JSON.stringify(bad)).toBeNull();
+      expect(r.patchInfo, JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it("an absent key is M1: `patch` and `patchInfo` are both null and no warning is invented", () => {
+    const r = reduceTurn(T, [running(), idle("end_turn")]);
+    expect(r.patch).toBeNull();
+    expect(r.patchInfo).toBeNull();
+    expect(r.warnings).toEqual([]);
+  });
+});

@@ -34,11 +34,11 @@
         "at": "2026-09-03T12:00:00.800Z"
       }
     ],
-    "verdict": "ok",
+    "verdict": "partial",
     "warnings": [],
     "failedToolCalls": [],
     "deniedToolCalls": [],
-    "strandedToolCalls": [],
+    "strandedToolCalls": ["call_2"],
     "pendingInteractions": [],
     "error": null
   },

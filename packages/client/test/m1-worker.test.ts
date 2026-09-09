@@ -111,7 +111,14 @@ describe("Worker.hibernate() / wake() — H18 and H19", () => {
     await worker.hibernate();
     wire.hibernateWorker(snapshot.workerId);
 
-    await expect(worker.prompt("hello")).resolves.toMatchObject({ verdict: "ok" });
+    // The claim is that the prompt LANDS, so `stopReason` is what says so. The verdict is
+    // `partial` rather than `ok` because this fixture's denied `call_2` is never terminalized —
+    // M2-A-WP-W's `strandedToolCalls` (ruling M2-R8), asserted in full in `prompt.test.ts`.
+    await expect(worker.prompt("hello")).resolves.toMatchObject({
+      stopReason: "end_turn",
+      verdict: "partial",
+      strandedToolCalls: ["call_2"],
+    });
   });
 });
 

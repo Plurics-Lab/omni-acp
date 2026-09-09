@@ -38,7 +38,16 @@ export type FixtureAgentName =
   | "plan"
   | "thought"
   | "mode"
-  | "hybrid";
+  | "hybrid"
+  /**
+   * M2's two stall fixtures (CONTRACTS.md §5.8, the fixture table). `stall-silent` is one update
+   * and then silence with nothing open — DESIGN §7's `silentMs` budget; `stall-in-tool` opens a
+   * `tool_call{status:"pending"}` and never terminalizes it — F36's tool budget and
+   * `TurnResult.strandedToolCalls`. Added by M2-A-WP-W; the other M2 fixture names
+   * (`elicit-*`, `permission-allow-always-only`) belong to WP-I and WP-P and land with them.
+   */
+  | "stall-silent"
+  | "stall-in-tool";
 
 /**
  * Absolute path to one of the repository's own fixture agents (`fixtures/agents/*.mjs`).
