@@ -1,5 +1,4 @@
 import {
-  OmniError,
   type Clock,
   type InteractionId,
   type MappedPermissionRequest,
@@ -38,8 +37,7 @@ const REJECT_ONCE_KIND = "reject_once";
  * for us: `PermissionOptionKind` is a closed enum in the schema, and D4 rule 6 requires an
  * unknown kind to survive far enough to be treated as a non-grant. So the shape check is here.
  */
-function offeredOptions(req: MappedPermissionRequest): readonly PermissionOption[] {
-  const raw: unknown = req.options;
+function narrowOptions(raw: unknown): readonly PermissionOption[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter(
     (o): o is PermissionOption =>
@@ -48,6 +46,10 @@ function offeredOptions(req: MappedPermissionRequest): readonly PermissionOption
       typeof (o as { optionId?: unknown }).optionId === "string" &&
       typeof (o as { kind?: unknown }).kind === "string",
   );
+}
+
+function offeredOptions(req: MappedPermissionRequest): readonly PermissionOption[] {
+  return narrowOptions(req.options);
 }
 
 /**
@@ -69,17 +71,71 @@ function selectableGrant(o: PermissionOption): boolean {
 }
 
 /** D4 rule 2's ordering: a known session-grant id first, then any `allow_once`. */
-function pickAllow(options: readonly PermissionOption[]): PermissionOption | null {
-  const sessionGrant = options.find(
-    (o) => SESSION_GRANT_OPTION_IDS.has(o.optionId) && selectableGrant(o),
-  );
-  if (sessionGrant !== undefined) return sessionGrant;
-  return options.find((o) => o.kind === ALLOW_ONCE_KIND) ?? null;
+function pickAllow(
+  options: readonly PermissionOption[],
+  allowSessionGrants: boolean,
+): { option: PermissionOption; rule: string } | null {
+  if (allowSessionGrants) {
+    const sessionGrant = options.find(
+      (o) => SESSION_GRANT_OPTION_IDS.has(o.optionId) && selectableGrant(o),
+    );
+    if (sessionGrant !== undefined) return { option: sessionGrant, rule: "d4:2-session-grant" };
+  }
+  const once = options.find((o) => o.kind === ALLOW_ONCE_KIND);
+  return once === undefined ? null : { option: once, rule: "d4:2-allow-once" };
 }
 
 /** D4 rule 4's first half: deny means the offered `reject_once`, and nothing else. */
 function pickDeny(options: readonly PermissionOption[]): PermissionOption | null {
   return options.find((o) => o.kind === REJECT_ONCE_KIND) ?? null;
+}
+
+/**
+ * The ONE place in the repository an `optionId` may be chosen (§5.8.9, ruling M2-R16).
+ *
+ * The policy engine's whole vocabulary is `PolicyAction`; it never sees and never produces an
+ * option id, and the `policy-never-names-an-option` guard makes that structural rather than
+ * promised. This function is the other half of that split: everything below the engine that has
+ * to turn an "allow" or a "deny" into one of the ids the agent actually offered lives here, and
+ * D4's six hard rules are enforced in exactly this file.
+ *
+ * `cfg.allowSessionGrants` is the knob D4 rule 2's ordering needs once there is an operator
+ * policy: `false` makes a session-scoped grant no better than a plain `allow_once`, which is what
+ * an operator who does not want an approval to outlive one call is asking for. Rule 3 is NOT a
+ * knob — an `allow_always` is never selectable by any value of any field.
+ *
+ * `OptionChoice.optionId === null` is rule 4's "nothing acceptable was offered", and the caller
+ * answers JSON-RPC `-32603`. It never means cancel (rule 5).
+ *
+ * The body is `pickAllow` / `pickDeny` / `selectableGrant` above, unchanged — the extraction that
+ * WP-P acceptance 2 requires, after which `permission-responder.test.ts` passes UNEDITED.
+ * `createBaselineResponder` now calls THIS rather than keeping a second copy, which is the point:
+ * two copies of D4 is how one of them quietly stops enforcing it.
+ *
+ * Owned by M2-B-WP-P.
+ */
+export function selectOption(
+  action: "allow" | "deny",
+  offered: readonly PermissionOption[],
+  cfg: { allowSessionGrants: boolean },
+): OptionChoice {
+  // TOTAL over any input, for the reason `offeredOptions` exists: this is called from the
+  // permission path, and a throw there is an agent waiting forever on a JSON-RPC id (F1).
+  const options = narrowOptions(offered);
+
+  if (action === "allow") {
+    const grant = pickAllow(options, cfg.allowSessionGrants);
+    // Rule 2 downgrades to deny when no acceptable grant is offered — never to "cancelled"
+    // (rule 5), which would cancel the whole prompt turn rather than this one action.
+    if (grant !== null) return { optionId: grant.option.optionId, rule: grant.rule };
+    const fallback = pickDeny(options);
+    if (fallback !== null) return { optionId: fallback.optionId, rule: "d4:2-downgraded-to-deny" };
+    return { optionId: null, rule: "d4:4-nothing-acceptable" };
+  }
+
+  const rejection = pickDeny(options);
+  if (rejection !== null) return { optionId: rejection.optionId, rule: "d4:4-reject-once" };
+  return { optionId: null, rule: "d4:4-nothing-acceptable" };
 }
 
 /**
@@ -120,10 +176,13 @@ export function createBaselineResponder(mode: "allow" | "deny", clock: Clock): P
       const offered = offeredOptions(req);
       const title = titleOf(req);
 
-      // Rule 2 downgrades to deny when no acceptable grant is offered — never to "cancelled"
-      // (rule 5), which would cancel the whole prompt turn rather than this one action.
+      // The M1 decision, now expressed through the ONE selector (§20.1). `allowSessionGrants` is
+      // `true` because that IS M1's ordering, and this responder must stay byte-identical to it.
+      const choice = selectOption(mode, offered, { allowSessionGrants: true });
       const chosen =
-        mode === "allow" ? (pickAllow(offered) ?? pickDeny(offered)) : pickDeny(offered);
+        choice.optionId === null
+          ? null
+          : (offered.find((o) => o.optionId === choice.optionId) ?? null);
 
       const record: PolicyDecisionPayload = {
         requestId,
@@ -148,37 +207,4 @@ export function createBaselineResponder(mode: "allow" | "deny", clock: Clock): P
       return { response, record };
     },
   };
-}
-
-/**
- * The ONE place in the repository an `optionId` may be chosen (§5.8.9, ruling M2-R16).
- *
- * The policy engine's whole vocabulary is `PolicyAction`; it never sees and never produces an
- * option id, and the `policy-never-names-an-option` guard makes that structural rather than
- * promised. This function is the other half of that split: everything below the engine that has
- * to turn an "allow" or a "deny" into one of the ids the agent actually offered lives here, and
- * D4's six hard rules are enforced in exactly this file.
- *
- * `cfg.allowSessionGrants` is the knob D4 rule 2's ordering needs once there is an operator
- * policy: `false` makes a session-scoped grant no better than a plain `allow_once`, which is what
- * an operator who does not want an approval to outlive one call is asking for. Rule 3 is NOT a
- * knob — an `allow_always` is never selectable by any value of any field.
- *
- * `OptionChoice.optionId === null` is rule 4's "nothing acceptable was offered", and the caller
- * answers JSON-RPC `-32603`. It never means cancel (rule 5).
- *
- * Unimplemented at the Land step ON PURPOSE, and declared here anyway: M2-B-WP-P extracts the
- * body VERBATIM from `pickAllow` / `pickDeny` / `selectableGrant` above, after which
- * `permission-responder.test.ts` must pass UNEDITED (§20.2, WP-P acceptance 2). The declaration
- * is Land's because `packages/core/src/index.ts` is frozen for every work package, so a stub that
- * did not exist here would turn a WP-P-local extraction into a cross-owner request.
- *
- * Owned by M2-B-WP-P.
- */
-export function selectOption(
-  _action: "allow" | "deny",
-  _offered: readonly PermissionOption[],
-  _cfg: { allowSessionGrants: boolean },
-): OptionChoice {
-  throw new OmniError("internal", "unimplemented: M2-B-WP-P (option selection)");
 }

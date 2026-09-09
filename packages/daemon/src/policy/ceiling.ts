@@ -1,4 +1,3 @@
-import { OmniError } from "@omni-acp/protocol";
 import type { PolicyCeiling, ResolvedDaemonConfig } from "@omni-acp/protocol";
 
 /**
@@ -8,11 +7,19 @@ import type { PolicyCeiling, ResolvedDaemonConfig } from "@omni-acp/protocol";
  * document, so an operator reading a `403` or an audit row can say WHICH ceiling refused without
  * being handed a rule set to compare by eye.
  *
+ * A ceiling is written INLINE on `TokenConfig.policyCeiling`, so it has no name of its own and
+ * the name is derived from the only thing that identifies it: the token it belongs to. That is
+ * also the thing an operator needs, since the fix is always "edit this token's ceiling".
+ *
  * Owned by M2-B-WP-P.
  */
 export function ceilingFor(
-  _cfg: ResolvedDaemonConfig,
-  _tokenId: string,
+  cfg: ResolvedDaemonConfig,
+  tokenId: string,
 ): { name: string; ceiling: PolicyCeiling } | null {
-  throw new OmniError("internal", "unimplemented: M2-B-WP-P");
+  const token = cfg.tokens.find((t) => t.id === tokenId);
+  if (token === undefined) return null;
+  const ceiling = token.policyCeiling;
+  if (ceiling === null || ceiling === undefined) return null;
+  return { name: `token:${tokenId}`, ceiling };
 }
