@@ -225,19 +225,51 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
     });
     timers.add(timer);
 
-    return await registry.hold(req, {
-      expiresAtMs,
-      onTimeout: o.parkTimeoutAction,
-      emit: (inputs) => {
-        ctx.emit(inputs);
-      },
-      release: () => {
-        timers.delete(timer);
-        if (!fired) timer.cancel();
-        // LAST, so §19.10's n+4 (`omni.worker_state{interaction_resolved}`) follows n+2 and n+3.
-        unpark();
-      },
-    });
+    const release = (): void => {
+      timers.delete(timer);
+      if (!fired) timer.cancel();
+      // LAST, so §19.10's n+4 (`omni.worker_state{interaction_resolved}`) follows n+2 and n+3.
+      unpark();
+    };
+
+    // The `try` wraps the REGISTRATION and not the await, deliberately: the held promise REJECTS
+    // on every `-32603` this strategy deliberately sends (D4 rule 4, and `settleAll`'s teardown),
+    // and a `catch` around the await would swallow the answer it exists to deliver and send a
+    // second one in its place.
+    let held: Promise<unknown>;
+    try {
+      held = registry.hold(req, {
+        expiresAtMs,
+        onTimeout: o.parkTimeoutAction,
+        emit: (inputs) => {
+          ctx.emit(inputs);
+        },
+        release,
+      });
+    } catch (e) {
+      // The park is already ANNOUNCED and the worker has already moved, so a `hold` that refuses
+      // must undo both — otherwise a worker sits in `requires_action` with an empty pending set,
+      // which is §19.5's biconditional broken from the one direction nothing else can reach.
+      // `hold` refuses only on the `maxParked` bound (checked above, so this is a belt) and on a
+      // duplicate id (a ULID collision), and both are `internal` rather than a client's problem.
+      logger.error("holding a parked interaction failed; unparking", {
+        requestId: req.id,
+        error: String(e),
+      });
+      release();
+      return settleNow(req, ctx, {
+        ...refuse(req, {
+          status: "answered",
+          by: "daemon",
+          byToken: null,
+          rule: "limit:max_parked",
+          ruleSource: "default",
+          parkedMs: 0,
+        }),
+        failTurn: null,
+      });
+    }
+    return await held;
   }
 
   /** `parkTimeoutMs` elapsed with no human. Ruling M2-R7: `deny` or `fail`, never `allow`. */

@@ -2,6 +2,7 @@ import { InteractionConfig } from "@omni-acp/protocol";
 import type {
   EventEnvelope,
   EventInput,
+  IdGen,
   InteractionContext,
   InteractionPayload,
   InteractionStrategy,
@@ -103,6 +104,8 @@ export interface RigOptions {
   readonly strategy?: (deps: InteractionStrategyDeps) => InteractionStrategy;
   /** Default true, as the daemon wiring does it; `false` proves the un-wired diagnosis. */
   readonly withLog?: boolean;
+  /** An `IdGen` of the test's own, for the one case that needs a BROKEN one. */
+  readonly ids?: IdGen;
 }
 
 export async function rig(o: RigOptions = {}): Promise<Rig> {
@@ -114,7 +117,7 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
   const deps: InteractionStrategyDeps = {
     workerId: "w_00000000000000000000000001" as never,
     clock: h.clock,
-    ids: h.deps().ids,
+    ids: o.ids ?? h.deps().ids,
     logger: h.logger,
     config,
     onUnresolved: o.onUnresolved ?? "park",

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { OmniError, type InteractionId, type PolicyVerdict } from "@omni-acp/protocol";
+import { seqIds } from "@omni-acp/testkit";
 import { OWNER, TEXT } from "../support/harness.js";
 import {
   ALLOW_ALWAYS,
@@ -877,6 +878,64 @@ describe("onUnresolved arms and the turn projection (§19.9, M2-R24)", () => {
       options: [...MENU, REJECT],
     });
     expect(r.decisions()[0]?.turnId).toBeNull();
+    await r.worker.close("client_request");
+  });
+
+  it("a park that cannot be HELD still ANSWERS, and releases the park it announced", async () => {
+    // An `IdGen` that repeats is a broken one, and it is the one input that can make `hold` refuse
+    // AFTER `ctx.park()` has already moved the worker. Two things must then still be true, and
+    // they are the two this belt exists for: the agent gets a real answer (F1 — an unanswered
+    // request hangs a turn forever), and the strategy releases the park it announced rather than
+    // leaving a refcount nobody will ever decrement.
+    //
+    // What it canNOT restore is the biconditional, because `worker.ts`'s refcount is keyed on the
+    // ID: two parks under one id are one entry, and releasing it releases both. That is a
+    // property of a broken `IdGen`, not something a strategy can paper over — which is precisely
+    // why F33 makes the id daemon-minted and `interaction-id-is-daemon-minted` guards it.
+    const fixed = seqIds();
+    const once = fixed.interaction();
+    const r = await rig({
+      onUnresolved: "park",
+      parkTimeoutMs: 0,
+      ids: { ...fixed, interaction: () => once },
+    });
+    await turn(r);
+
+    const first = r.agent.requestPermission("p1", {
+      sessionId: "sess_recording",
+      toolCall: { toolCallId: "call_1", title: "one" },
+      options: [...MENU],
+    });
+    await flush();
+    expect(r.worker.snapshot().state).toBe("requires_action");
+
+    // The SAME id again: the registry refuses to hold it twice.
+    const second = await r.agent.requestPermission("p2", {
+      sessionId: "sess_recording",
+      toolCall: { toolCallId: "call_2", title: "two" },
+      options: [...MENU],
+    });
+    // NEVER dropped, and never a hang: the agent is answered even though we could not park it.
+    expect(second).toEqual({ result: { outcome: { outcome: "selected", optionId: "reject" } } });
+    expect(r.decisions().at(-1)?.payload).toMatchObject({
+      rule: "limit:max_parked",
+      decision: "deny",
+      by: "daemon",
+    });
+    // The announced park was released rather than left counting: no worker is stuck waiting on a
+    // refcount that has no owner.
+    expect(r.worker.snapshot().state).toBe("running");
+
+    // The FIRST request is still held and still answerable, which is the half that matters.
+    expect(r.strategy.pending).toHaveLength(1);
+    r.worker.answerInteraction(
+      r.strategy.pending[0]?.requestId ?? ("x_missing" as InteractionId),
+      { action: "deny" },
+      WHO,
+    );
+    await flush();
+    await first;
+    expect(r.strategy.pending).toEqual([]);
     await r.worker.close("client_request");
   });
 
