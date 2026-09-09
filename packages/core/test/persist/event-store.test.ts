@@ -275,7 +275,18 @@ describe("migrate (§14.7)", () => {
         .prepare("select name from sqlite_master where type = 'table' order by name")
         .all()
         .map((r) => String(r["name"]));
-      expect(tables).toEqual(["event_state", "events", "meta", "payloads", "workers"]);
+      // Schema v2 adds `runs` and `webhook_deliveries` and touches nothing else (§24.2). The list
+      // is exhaustive on purpose: a table that appeared without a decision behind it shows up
+      // here rather than in production.
+      expect(tables).toEqual([
+        "event_state",
+        "events",
+        "meta",
+        "payloads",
+        "runs",
+        "webhook_deliveries",
+        "workers",
+      ]);
       // `WITHOUT ROWID` on `(worker_id, seq)`: the only access pattern is a clustered prefix
       // scan, and the primary key doubles as the second-daemon backstop.
       const ddl = String(

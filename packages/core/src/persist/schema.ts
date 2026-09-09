@@ -24,6 +24,38 @@ export interface SqliteDatabase {
 }
 
 /**
+ * `fn`, inside ONE SQLite transaction (§24.4 rule 1).
+ *
+ * `begin immediate` rather than a deferred `begin`: the write lock is taken at the START, so two
+ * writers contend here — where `busy_timeout` can wait for them — instead of at the first write,
+ * where one of them would already be holding a read snapshot and would have to be aborted with
+ * `SQLITE_BUSY_SNAPSHOT`.
+ *
+ * A `rollback` that itself throws is swallowed. It means the transaction was already unwound (a
+ * statement error can do that), and letting that secondary failure replace the ORIGINAL error
+ * would hide the reason the caller is here at all.
+ *
+ * NOT re-entrant, and deliberately not made so: a nested `begin` would silently become a no-op
+ * inner "transaction" whose failure could not roll back independently of its parent. Every caller
+ * in this package holds it for exactly one row-plus-delivery write.
+ */
+export function withTransaction<T>(db: SqliteDatabase, fn: () => T): T {
+  db.exec("begin immediate");
+  try {
+    const out = fn();
+    db.exec("commit");
+    return out;
+  } catch (e) {
+    try {
+      db.exec("rollback");
+    } catch {
+      // Already unwound; the original error below is the one worth reporting.
+    }
+    throw e;
+  }
+}
+
+/**
  * The on-disk schema (§14.7) and its migrations.
  *
  * `SCHEMA_VERSION` is reported by `GET /v1/info.persistence.schemaVersion`. A file whose
@@ -32,7 +64,7 @@ export interface SqliteDatabase {
  *
  * Owned by M1-WP-A.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Version 1, and the three decisions §14.7 makes, spelled out where they live:
@@ -133,6 +165,82 @@ create table if not exists event_state (
 `;
 
 /**
+ * Version 2 (§24.2), and the property that matters more than any column in it: it is
+ * **CREATE-only**.
+ *
+ * Not one column of `events`, `workers`, `payloads`, `event_state` or `meta` changes, so an M1
+ * `events.db` opened by an M2 daemon keeps every row it had, `headOf` / `tailOf` are untouched,
+ * and §14.11's conformance suite runs against the migrated file VERBATIM. The whole migration is
+ * two `create table if not exists` statements and three indexes, which is also why it is safe to
+ * run on every open rather than only on the step from 1 to 2.
+ *
+ * The direction that is not free is BACKWARD: a v2 file opened by an M1 daemon must still fail
+ * loudly naming the version, and it does, because `migrateTo` refuses a `schema_version` from
+ * the future exactly as §14.7 already required.
+ *
+ * Three column choices are decisions rather than shape:
+ *
+ *  - **`runs.boot_id`** is a column and an index because §24.4's recovery is a QUERY — "every
+ *    live run that is not mine" — run once at boot. Deriving it from a JSON blob would make the
+ *    one startup path a full-table parse.
+ *  - **`runs.request_json` is SANITIZED before it arrives**: env VALUES are stripped by the
+ *    registry. The row is read back by `GET /v1/runs/{rid}` and outlives the process; a durable
+ *    copy of a client's secrets is not something a later reader can undo.
+ *  - **`webhook_deliveries.lease_boot`** is the only thing that distinguishes "in flight NOW"
+ *    from "in flight when the process died". Without it a restart has to guess — in one
+ *    direction losing deliveries, in the other duplicating them with no `deliveryId` to
+ *    deduplicate on.
+ *
+ * `deliveries_due` indexes `(state, next_attempt_ms)` because the dispatcher's hot query is
+ * exactly `where state = 'pending' and next_attempt_ms <= ? order by next_attempt_ms`.
+ */
+const V2 = `
+create table if not exists runs (
+  run_id          text primary key,
+  daemon_id       text not null,
+  boot_id         text not null,
+  token_id        text not null,
+  worker_id       text,
+  turn_id         text,
+  agent_id        text not null,
+  cwd             text not null,
+  state           text not null,
+  created_at      text not null,
+  updated_at      text not null,
+  finished_at_ms  integer,
+  request_json    text not null,
+  result_json     text,
+  error_json      text,
+  webhook_url     text,
+  idempotency_key text
+) without rowid;
+
+create unique index if not exists runs_idem
+  on runs (token_id, idempotency_key) where idempotency_key is not null;
+create index if not exists runs_by_boot on runs (boot_id, state);
+
+create table if not exists webhook_deliveries (
+  delivery_id     text primary key,
+  run_id          text not null,
+  token_id        text not null,
+  event           text not null,
+  url             text not null,
+  state           text not null,
+  attempt         integer not null default 0,
+  next_attempt_ms integer,
+  lease_boot      text,
+  last_status     integer,
+  last_error      text,
+  response_ms     integer,
+  created_at      text not null,
+  updated_at      text not null,
+  payload_json    text not null
+) without rowid;
+
+create index if not exists deliveries_due on webhook_deliveries (state, next_attempt_ms);
+`;
+
+/**
  * Reads `meta.schema_version`, creates or forward-migrates, and returns the version in force.
  *
  * Forward-only. A file written by a NEWER daemon is a startup failure naming both versions: the
@@ -140,43 +248,61 @@ create table if not exists event_state (
  * schema added, which corrupts the operator's data on a downgrade they may not know happened.
  */
 export function migrate(db: SqliteDatabase, logger: { warn(m: string): void }): number {
+  return migrateTo(db, logger, SCHEMA_VERSION);
+}
+
+/**
+ * `migrate`, with the version this daemon understands made an ARGUMENT.
+ *
+ * It exists because the backward direction is a real obligation and the only honest way to test
+ * it is to run the OLDER code against the NEWER file. `migrateTo(db, logger, 1)` IS an M1 daemon
+ * — the same statements, the same refusal, the same message — so "a v2 file opened by an M1
+ * daemon fails loudly naming the version" is asserted against the shipped code path rather than
+ * against a copy of it in a test, which is the kind of copy that keeps passing after the
+ * original changes.
+ *
+ * `target` is also why `V2` is applied conditionally rather than unconditionally: a daemon that
+ * does not understand a table must not create it, or the file it leaves behind claims a schema
+ * it cannot serve.
+ */
+export function migrateTo(
+  db: SqliteDatabase,
+  logger: { warn(m: string): void },
+  target: number,
+): number {
   db.exec(V1);
+  if (target >= 2) db.exec(V2);
 
   const row = db.prepare("select value from meta where key = 'schema_version'").get();
   const found = row === undefined ? null : Number(row["value"]);
 
-  if (found !== null && Number.isFinite(found) && found > SCHEMA_VERSION) {
+  if (found !== null && Number.isFinite(found) && found > target) {
     throw new OmniError(
       "internal",
-      `event database schema_version ${found} is newer than this daemon understands (${SCHEMA_VERSION}); ` +
+      `event database schema_version ${found} is newer than this daemon understands (${target}); ` +
         `refusing to open it rather than silently downgrading the file`,
     );
   }
 
   if (found === null) {
-    db.prepare("insert into meta (key, value) values ('schema_version', ?)").run(
-      String(SCHEMA_VERSION),
-    );
-    return SCHEMA_VERSION;
+    db.prepare("insert into meta (key, value) values ('schema_version', ?)").run(String(target));
+    return target;
   }
 
   if (!Number.isFinite(found)) {
     // A meta row we cannot parse is not a version we can migrate FROM. Say so and rewrite it to
-    // the version whose tables `db.exec(V1)` has just guaranteed are present.
-    logger.warn(`event database schema_version is unreadable; rewriting it as ${SCHEMA_VERSION}`);
-    db.prepare("update meta set value = ? where key = 'schema_version'").run(
-      String(SCHEMA_VERSION),
-    );
-    return SCHEMA_VERSION;
+    // the version whose tables the statements above have just guaranteed are present.
+    logger.warn(`event database schema_version is unreadable; rewriting it as ${target}`);
+    db.prepare("update meta set value = ? where key = 'schema_version'").run(String(target));
+    return target;
   }
 
-  if (found < SCHEMA_VERSION) {
-    // No forward migration exists yet — V1 is the first version. When one does, it goes here as
-    // a numbered step, and this branch stops being a no-op that only rewrites the number.
-    db.prepare("update meta set value = ? where key = 'schema_version'").run(
-      String(SCHEMA_VERSION),
-    );
-    return SCHEMA_VERSION;
+  if (found < target) {
+    // The 1 -> 2 step is `db.exec(V2)` above and nothing else: CREATE-only, so there is no data
+    // to move and no column to rewrite. Recording the number is the whole remaining step, and
+    // every M1 row in the file is still exactly where M1 left it.
+    db.prepare("update meta set value = ? where key = 'schema_version'").run(String(target));
+    return target;
   }
 
   return found;
