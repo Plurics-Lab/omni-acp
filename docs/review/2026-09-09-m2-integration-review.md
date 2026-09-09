@@ -268,3 +268,39 @@ wake ⇒ `acl_revoked`”，所以这是实现一条已经写好的契约，而�
 （"still answers a turn query for a worker closed by shutdown — the log outlives it"），
 `daemon.workers.size === 0` 则是停机测试证明整队都走了的方式；这两个调用今天是对的，而且都不碰任何已经
 关闭的 statement。加门的三个动词恰好就是 `stop()` 会关掉其后端存储的那三个。
+
+---
+
+## 复核（2026-09-09，修复轮之后，`1370d5b`）
+
+对 V1–V12 逐条重新核对：读当前代码 + 跑该条自己的回归测试 + **亲手复现**。所有行为复现都是 `mkdtemp`
+起的一次性脚本，`listen: null`（零端口），全部走 `daemon.fetch`，跑完即删。
+
+全量 `pnpm -r build && pnpm test` 绿：**222 files / 3305 passed / 157 skipped**；`tests/compat` 的
+hermetic 套件单独跑一次也绿：**2 files / 117 passed / 151 skipped**。
+
+**结论：十二条全部关闭，没有仍然开着的条目。** 上一轮 复核 里那十条“仍然开着”的，这次逐条打在真实
+daemon 上都翻了过来。
+
+### 逐条复核
+
+| # | 怎么核的 | 实测 |
+| - | -------- | ---- |
+| V1 | 同一 `dataDir` 两次启动：boot 1 `denyCidrs: []` 建 run→投递落地；boot 2 改成 `["127.0.0.0/8","::1/128"]` 后重放同一条 | 新建 run `403`，`POST …/{id}/redeliver` 也 **`403 forbidden … inside denied 127.0.0.0/8`**；接收器命中数 `1 → 1`（上一轮是 200 且 `1 → 2`） |
+| V2 / V8 | `policy: {presets:["notes-only"]}`（`default: allow`）+ `onUnresolved:"park"`，`hybrid`(`HYBRID_ASK=1`) 真实 resume，hibernate→`stop()`→同 `dataDir` 重启→唤醒→再 prompt；再跑第三、第四次启动 | 重启前后两条 `omni.policy_decision` 都是 `"by":"policy","rule":"notes-only#default"`（引擎判的，不再是 `m2:onUnresolved`）；`onUnresolved/parkTimeoutMs/parkTimeoutAction/patchMode` 三次启动都还在（`park / 60000 / fail / off`），`clientCapabilities` 仍是 `{"elicitation":{"form":{}}}`；boot 4 删掉 preset 后 prompt `403`，快照 `state: closed / closeReason: acl_revoked`（§23.1） |
+| V3 | token 不写 `cwdRoots`（⇒ homedir），cwd 是 `homedir()` 下的 `mkdtemp`，prompt 带一个根内 `resource_link`；create 路径与 hibernate→重启→wake 路径各打一次 | 两次都是 **`202`**（上一轮 wake 路径是 `500 … no cwdRoots`） |
+| V4 | 出口点守卫是对**注入的 strategy** 的复检，出厂 strategy 不会伪造，所以只能在 `Worker` 这一层证；跑 `core/test/worker/interaction/emit-guard.test.ts` | `worker.ts:1658` 现在是 `#assertOffered(await strategy.permission(...), mapped)`，3 例绿 |
+| V5 / V7 | 默认 `denyCidrs` + `webhooks.mode:"any"`，七种拼法各建一次 run | `127.0.0.1` / `[::ffff:7f00:1]` / `[::ffff:127.0.0.1]` / `[0:0:0:0:0:ffff:7f00:1]` / `0.0.0.0` / `[::ffff:a9fe:a9fe]` / `[::1]` 全是 **403**，接收器 0 命中；`WebhookConfig` 默认值含 `0.0.0.0/8` |
+| V6 | 跑完一个 run 后 `await daemon.stop()`，再调三个读动词与 HTTP | `runs.get` / `runs.list` / `deliveries.list` / `dispatcher.redeliver` 全部 **`OmniError(internal) "the daemon has stopped"`**（不再是裸 `database is not open`），`GET /v1/runs/{id}` 是 `500 {"code":"internal",…}`——有名字的分类错误；`workers.size` 仍按“刻意不做”那节返回 `0` |
+| V9 | 五个 advisory 各跑一条真回合 | `interaction_declined`（人拒答 elicitation）、`interaction_expired`（`parkTimeoutMs:1500` 到期）、`unpoliced_tool_call`（preset 的 `alertOnUnpoliced:["read"]` + hybrid 的 `kind:"read"` 调用）、`policy_blinded`（`interaction.allowAlways:"human"` + 人选 `allow-always`，且快照 `policyBlinded: true`）、`policy_clamped`（ceiling `pathRoots:[<cwd>/note]` + 规则 `path:[<cwd>/note*]`，静态可过、运行期落在根外）——五条都出现在 `TurnResult.warnings` 里 |
+| V10 | A 持租约、B 为观察者；陈旧 reqId 与**真实 parked** reqId 各打一遍，外加已关闭 worker | 非持有者+陈旧 `404 interaction_not_found`；非持有者+畸形 body（真实 reqId）`423 lease_held`；持有者+畸形 body `400 bad_request`；已关闭 worker `410 worker_closed`——四行全部与 §19.6 的顺序一致 |
+| V11 | 停机时留一个 parked elicitation（`elicit-never-answers`），`stop()` 后由下一次启动读日志 | 结算信封 `{"status":"cancelled","answer":{"by":"daemon","action":"decline"}}`——`settleAll` 的 `"shutdown"` 臂在生产代码里终于走到了；`create-daemon-m2.test.ts` 的顺序用例已改成契约顺序 |
+| V12 | 把 `git` 换成记账 shim，同一个 `echo` 回合（不写盘）跑 `on_write` 与 `always` 各一次；再用 `patch-writer` 跑一个真写盘的回合 | `on_write` **3** 条 git 命令（`rev-parse` / `add -A` / `write-tree`），`always` **6** 条——省掉的正是第二对；写盘的回合在 `on_write` 下照样拿到完整 patch（`diff --git a/hello.txt …`，7 条命令） |
+
+### 一处措辞上的小瑕疵（不构成开着的条目）
+
+`policyClampWarning` 的 `to` 取的是**结算时的最终 decision**，不是被夹到的那个动作。于是“allow 被夹成
+park、人再答 allow”这条路径上，警告读作 `"allow" was narrowed to "allow" by token:local:pathRoots`——
+两端同字，字面上自相矛盾（`detail.rule` 是 `human:local`，看得出中间进过人手）。announcement 本身按
+§20.5 出了，`from` / `by` / `rule` 都对，所以 V9 是关闭的；只是这句话对运维不够直白，值得以后顺手改成
+把「夹到的动作」和「最终动作」分开写。
