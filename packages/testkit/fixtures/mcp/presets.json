@@ -1,0 +1,35 @@
+{
+  "$comment": [
+    "The operator MCP preset table every M2-B-WP-S suite resolves against — one entry per",
+    "transport, so `filterMcpCapabilities` has something to keep and something to drop against",
+    "each of the two RECORDED capability blocks in `capabilities.json`.",
+    "",
+    "It is DATA and never launched. DESIGN §8's red row says a client may name a preset and may",
+    "never express a command; the commands below therefore exist to prove that the ONLY place one",
+    "can appear is `DaemonConfig.mcpServers`, and nothing in the test suite spawns them. The names",
+    "resolve to nothing on any machine, on purpose.",
+    "",
+    "Owned by M2-B-WP-S."
+  ],
+  "mcpServers": {
+    "files": {
+      "command": "omni-acp-fixture-mcp-files",
+      "args": ["--root", "."],
+      "env": { "MCP_FILES_MODE": "ro" }
+    },
+    "memory": {
+      "type": "stdio",
+      "command": "omni-acp-fixture-mcp-memory",
+      "args": []
+    },
+    "search": {
+      "type": "http",
+      "url": "https://mcp.example.invalid/search",
+      "headers": { "X-Fixture": "search" }
+    },
+    "feed": {
+      "type": "sse",
+      "url": "https://mcp.example.invalid/feed"
+    }
+  }
+}
