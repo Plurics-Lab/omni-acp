@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { DiffConfig, type PatchHandle, type RunUtility, type WorkerId } from "@omni-acp/protocol";
 import { nullLogger, seqIds } from "@omni-acp/testkit";
 import { createGitDiffProvider } from "../../src/diff/git-provider.js";
 import { truncateAtHunk } from "../../src/diff/git-provider.js";
-import { classifyWorktree } from "../../src/diff/worktrees.js";
+import { classifyWorktree, normalizeTopLevel } from "../../src/diff/worktrees.js";
 
 /**
  * D8's git provider. Every test in this file runs with NO GIT INSTALLED — the provider reaches
@@ -404,6 +404,26 @@ describe("truncateAtHunk", () => {
 
   it("returns 0 when not even the first hunk fits", () => {
     expect(truncateAtHunk(text, 5)).toBe(0);
+  });
+});
+
+describe("normalizeTopLevel — the ONE normalization §25.4 allows", () => {
+  const platform = process.platform;
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  });
+
+  it("case-folds on win32 and NEVER on posix, because `/Repo` and `/repo` are two directories there", () => {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    expect(normalizeTopLevel("C:\\Repo")).toBe(normalizeTopLevel("c:\\repo"));
+
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    expect(normalizeTopLevel("/Repo")).not.toBe(normalizeTopLevel("/repo"));
+  });
+
+  it("resolves a relative path, so two spellings of one directory key as one", () => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    expect(normalizeTopLevel("/repo/packages/..")).toBe(normalizeTopLevel("/repo"));
   });
 });
 

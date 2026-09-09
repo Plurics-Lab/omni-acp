@@ -89,8 +89,14 @@ export function watchdogCases(): readonly CompatCase[] {
         const started = Date.now();
         const result = await worker
           .prompt(
-            "Run a shell command that sleeps for 30 seconds and then prints WOKE. " +
-              "Use the terminal. Do not do anything else.",
+            // The EXACT command §27.2 names, and the two sentences around it are not decoration.
+            // Observed on claude-acp 0.73.0 on 2026-09-09: asked for "a shell command that sleeps
+            // for 30 seconds" it answers "I'll run that in the background so it doesn't block",
+            // the tool call COMPLETES in about five seconds, and there is nothing for a tool
+            // budget to fire on. A watchdog case has to ask for a foreground command by name.
+            "Run this exact command in the FOREGROUND with the shell tool and wait for it to " +
+              "finish before you reply: python3 -c 'import time; time.sleep(30); print(\"WOKE\")'. " +
+              "Do NOT run it in the background. Do not do anything else.",
           )
           .finally(() => {
             // The dedicated worker and the overlay are BOTH this case's to give back: a leaked

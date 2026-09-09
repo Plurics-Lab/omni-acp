@@ -77,9 +77,13 @@ agents:
           case: current-mode-update,
           reason: "session/set_mode answers with the v2 config_option_update (corpus 08)",
         }
+      # NOT the same thing as the `patch-git` case, which RUNS from M2 on: this row is the M1
+      # corpus gap about the v1 `diff` BLOCK — its `oldText`/`newText` are widened fragments and
+      # the only reconstructable patch is the vendor `structuredPatch` extension (F19). D8's
+      # provider reads the disk instead, which is why it needed no agent cooperation at all.
       - {
-          case: git-patch,
-          reason: "diff blocks are widened fragments; structuredPatch is a vendor extension (F19)",
+          case: git-patch-from-diff-blocks,
+          reason: "v1 diff blocks are widened fragments; a patch from them is a vendor extension (F19). D8's git provider reads the disk instead, and `patch-git` asserts that",
         }
     # Corpus gaps — the `capability` skip source. This list MIRRORS the builtin descriptor's own
     # `unverified` (CONTRACTS.md §17.2), which is the single source of truth; it is restated here

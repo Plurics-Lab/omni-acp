@@ -936,3 +936,23 @@ plan and a reader of the tree see the same milestone.
 
 ### Real-agent record
 
+M1's record, in the same shape, for the milestone where it matters more: M2's whole subject is what
+happens when a real agent asks something, stalls, changes its own configuration or writes to a disk we
+then have to diff.
+
+Run on Linux (node 22.23.2, git 2.x, `pnpm 11.25`) on **2026-09-09**, against the two — and only two — real
+ACP agents on this machine:
+
+* `claude-acp` — `npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, logged-in Claude Code;
+* `codex-acp` — `npx -y @agentclientprotocol/codex-acp@1.8.0`, ChatGPT login in `~/.codex/auth.json`.
+
+Both are launched with the daemon's own environment (the catalog's `toSpawnSpec`, §5.4), so each adapter
+finds the login that is already there. Driver `sqlite`, two SDK clients on one token, workspace and
+`dataDir` both `mkdtemp`, `listen.port: 0`.
+
+```
+OMNI_COMPAT_REAL=1 OMNI_COMPAT_CONFIG=agents.local.yaml OMNI_COMPAT_REQUIRE=1 \
+  npx vitest run --project compat
+```
+
+<!-- RESULTS -->

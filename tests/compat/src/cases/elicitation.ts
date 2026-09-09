@@ -1,5 +1,6 @@
 import type { CreateAgentOptions, InteractionRequestHandle, Worker } from "@omni-acp/client";
 import type { EventEnvelope, InteractionPayload } from "@omni-acp/protocol";
+import { readdir } from "node:fs/promises";
 import { until } from "../harness.js";
 import { allEnvelopes, assert, asRecord, type CompatCase, type CompatContext } from "./support.js";
 
@@ -27,7 +28,16 @@ import { allEnvelopes, assert, asRecord, type CompatCase, type CompatContext } f
 /** D10's `park`, straight through the SDK type — the merge widened `CreateAgentOptions`
  *  (WP-I note N6), so the cast this used to need is gone. */
 function parkOptions(ctx: CompatContext): CreateAgentOptions {
-  return { cwd: ctx.cwd, onUnresolved: "park" };
+  return {
+    cwd: ctx.cwd,
+    onUnresolved: "park",
+    // `onUnresolved` only decides what happens when the POLICY could not, and the daemon's default
+    // preset is `deny-all` — which decides everything, including an elicitation. Observed on
+    // claude-acp 0.73.0 on 2026-09-09: with no policy the request is answered
+    // `decision:"deny", by:"policy", rule:"deny-all#default"`, the SDK handler never fires, and
+    // the agent carries on in prose. A park needs a policy whose VERDICT is `park` (M2-WP-J).
+    policy: { default: "park" },
+  };
 }
 
 /**
@@ -48,18 +58,39 @@ const interactionsIn = (envelopes: readonly EventEnvelope[]): InteractionPayload
   envelopes.filter((e) => e.kind === "acp.interaction").map((e) => e.payload as InteractionPayload);
 
 /**
- * The first parked interaction, as a HANDLE.
+ * The first parked interaction as a HANDLE, and a policy for every one AFTER it.
  *
  * Subscribed BEFORE the prompt on purpose: `on("interaction")` fires for a `pending` envelope on
  * the worker's tail (§5.8.10), and a listener attached afterwards would race the very park it is
  * there to catch.
+ *
+ * The `rest` half is what the first real run added (M2-WP-J). A turn that asks a question and
+ * then acts on the answer parks TWICE on claude-acp: `elicitation/create` ("What should I name
+ * the file?"), and then `session/request_permission` ("Write notes.md"). A case that answered only
+ * the first left the second parked, and `parkTimeoutMs` defaults to ten minutes — so the turn
+ * never settled and the case died on vitest's own timeout with nothing to show for it. Every park
+ * a case does not want to inspect is therefore ANSWERED, which is also what a real caller does.
  */
-function firstPark(worker: Worker): { handle: Promise<InteractionRequestHandle>; off: () => void } {
+function parks(
+  worker: Worker,
+  rest: (r: InteractionRequestHandle) => Promise<unknown>,
+): { handle: Promise<InteractionRequestHandle>; count: () => number; off: () => void } {
   let settle!: (r: InteractionRequestHandle) => void;
   const handle = new Promise<InteractionRequestHandle>((resolve) => (settle = resolve));
-  const off = worker.on("interaction", (r) => settle(r));
-  return { handle, off };
+  let seen = 0;
+  const off = worker.on("interaction", (r) => {
+    seen += 1;
+    if (seen === 1) settle(r);
+    else void rest(r).catch(() => undefined);
+  });
+  return { handle, count: () => seen, off };
 }
+
+/** The settlement of the ELICITATION, which is the one every case here is about. */
+const elicitationSettlement = (
+  payloads: readonly InteractionPayload[],
+): InteractionPayload | null =>
+  payloads.find((p) => p.method === "elicitation/create" && p.status !== "pending") ?? null;
 
 export function elicitationCases(): readonly CompatCase[] {
   return [
@@ -78,7 +109,9 @@ export function elicitationCases(): readonly CompatCase[] {
       async run(ctx) {
         const control = await ctx.harness.A.createAgent(ctx.agentId, { cwd: ctx.cwd });
         const asked = await ctx.harness.A.createAgent(ctx.agentId, parkOptions(ctx));
-        const park = firstPark(asked);
+        // The elicitation is this case's to deny; the WRITE permission that follows it is not, and
+        // leaving it parked would hang the turn for the full park timeout (observed 2026-09-09).
+        const park = parks(asked, (r) => r.deny());
         try {
           assert(
             JSON.stringify(control.snapshot.capabilities?.clientCapabilities ?? {}) === "{}",
@@ -125,6 +158,10 @@ export function elicitationCases(): readonly CompatCase[] {
           const result = await turn;
           assert(result.verdict !== "failed", `the answered turn is ${result.verdict}`);
           await until(() => asked.state !== "requires_action", 60_000, 100);
+          // A denied question does not end an agent's turn: claude-acp asks for the write it was
+          // going to do anyway, which is the second park `parks(…)` denied above. Recorded rather
+          // than assumed — the count is what makes it visible in a failure message.
+          assert(park.count() >= 1, `the park worker saw ${String(park.count())} interactions`);
         } finally {
           park.off();
           await asked.close().catch(() => {});
@@ -144,7 +181,11 @@ export function elicitationCases(): readonly CompatCase[] {
       requires: ["elicitation"],
       async run(ctx) {
         const worker = await ctx.harness.A.createAgent(ctx.agentId, parkOptions(ctx));
-        const park = firstPark(worker);
+        // ALLOW what follows: §27.2's row is "answering `question_0` with a `oneOf[].const`
+        // creates THAT file", and the file only gets created if the write the agent asks for
+        // afterwards is granted. That second park is the one F30's bug hid behind — the wrong
+        // file was created, not no file.
+        const park = parks(worker, (r) => r.allow());
         try {
           const turn = worker.prompt(ELICIT_PROMPT);
           const handle = await park.handle;
@@ -159,11 +200,13 @@ export function elicitationCases(): readonly CompatCase[] {
           const result = await turn;
           assert(result.verdict !== "failed", `the answered turn is ${result.verdict}`);
 
-          const settled = interactionsIn(await allEnvelopes(ctx, worker.id)).filter(
-            (p) => p.status !== "pending",
-          );
-          assert(settled.length === 1, `expected one settlement, saw ${String(settled.length)}`);
-          const keys = settled[0]?.answer?.contentKeys ?? [];
+          // The ELICITATION's settlement, found by method rather than by position: a real turn
+          // settles the question AND the write permission it asks for next (observed 2026-09-09,
+          // and the reason this case allows the second one above).
+          const payloads = interactionsIn(await allEnvelopes(ctx, worker.id));
+          const settled = elicitationSettlement(payloads);
+          assert(settled !== null, "the elicitation never settled");
+          const keys = settled.answer?.contentKeys ?? [];
           // EXACTLY ONE property per question reached the wire, and it is the question's OWN
           // because the value is one of the schema's own consts.
           assert(
@@ -176,8 +219,18 @@ export function elicitationCases(): readonly CompatCase[] {
           );
           // A free-text answer is user content: KEYS ONLY ever enter the log (§5.8.3).
           assert(
-            !JSON.stringify(settled[0]?.answer).includes(choice.value),
+            !JSON.stringify(settled.answer).includes(choice.value),
             "the answer's VALUE entered the log; only its keys may",
+          );
+
+          // §27.2's own words: answering with a `oneOf[].const` creates THAT file. F30's bug was
+          // not "no file" — it was `omni-choice.txt` instead of the selected `notes.md`, because
+          // both halves of the pair went out and the agent read the custom one.
+          const entries = await readdir(ctx.cwd);
+          assert(
+            entries.includes(choice.value),
+            `the answered file ${JSON.stringify(choice.value)} was not created; the workspace ` +
+              `holds ${JSON.stringify(entries)} (F30)`,
           );
         } finally {
           park.off();
@@ -203,7 +256,9 @@ export function elicitationCases(): readonly CompatCase[] {
           },
         }));
         const worker = await ctx.harness.A.createAgent(ctx.agentId, parkOptions(ctx));
-        const park = firstPark(worker);
+        // NOBODY answers, which is the whole case — including anything the agent asks after the
+        // question expires. Every park here ends on OUR timer.
+        const park = parks(worker, () => Promise.resolve());
         try {
           const turn = worker.prompt(ELICIT_PROMPT);
           const handle = await park.handle;
@@ -215,17 +270,15 @@ export function elicitationCases(): readonly CompatCase[] {
           await until(() => worker.interactions.length === 0, 120_000, 100);
           const result = await turn;
 
-          const settled = interactionsIn(await allEnvelopes(ctx, worker.id)).filter(
-            (p) => p.status !== "pending",
-          );
-          assert(settled.length === 1, `expected one settlement, saw ${String(settled.length)}`);
+          const settled = elicitationSettlement(interactionsIn(await allEnvelopes(ctx, worker.id)));
+          assert(settled !== null, "the elicitation never settled");
           assert(
-            settled[0]?.status === "expired",
-            `the settlement is ${String(settled[0]?.status)}, not expired`,
+            settled.status === "expired",
+            `the settlement is ${String(settled.status)}, not expired`,
           );
           assert(
-            settled[0]?.answer?.by === "timeout",
-            `the settlement was by ${String(settled[0]?.answer?.by)}, not the timer`,
+            settled.answer?.by === "timeout",
+            `the settlement was by ${String(settled.answer?.by)}, not the timer`,
           );
           assert(
             result.verdict === "ok" || result.verdict === "partial",

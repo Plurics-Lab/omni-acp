@@ -28,7 +28,6 @@ import {
   type PermissionResponder,
   type PersistenceHandle,
   type PolicyEngine,
-  type PolicySelection,
   type PolicySubject,
   type PromptAccepted,
   type ResolvedDaemonConfig,
@@ -600,6 +599,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               }),
           });
           const budgets = rows.watchdog === null ? null : watchdogBudgets(o.config, rows.watchdog);
+          // The same holder trick the create path uses: §21.5's audit line reports how many tool
+          // calls were open when the budget was spent, and the watchdog is the only thing that
+          // knows — so it has to be readable from inside the callback it was built with.
+          const armed: { current: Watchdog | null } = { current: null };
           const watchdog =
             o.watchdog === undefined || budgets === null || !budgets.enabled
               ? undefined
@@ -613,11 +616,12 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
                       log,
                       config: budgets,
                       handle: ref.current,
-                      openToolCalls: 0,
+                      openToolCalls: armed.current?.verdict.openToolCalls.length ?? 0,
                       logger: o.logger.child({ workerId }),
                     });
                   },
                 });
+          armed.current = watchdog ?? null;
           return {
             ...(strategy === undefined
               ? {}
