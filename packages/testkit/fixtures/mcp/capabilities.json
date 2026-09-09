@@ -1,0 +1,21 @@
+{
+  "$comment": [
+    "The `mcpCapabilities` blocks the two real agents ACTUALLY advertise, copied out of the",
+    "recorded corpora rather than recalled. `filterMcpCapabilities`'s tests read these so that a",
+    "future agent-version bump changes ONE file rather than a dozen literals.",
+    "",
+    "The pair is the whole argument of §23.2: codex says `sse:false` and `acp:false` while taking",
+    "stdio servers without complaint, which is why stdio is never filtered and why a filter keyed",
+    "on an absent bit would drop every stdio preset from the agent that uses them most.",
+    "",
+    "Owned by M2-B-WP-S."
+  ],
+  "claude-acp-0.73.0": {
+    "source": "docs/research/transcripts/claude-acp-0.73.0/03-tool-write-allowed.jsonl — initialize result",
+    "mcpCapabilities": { "http": true, "sse": true }
+  },
+  "codex-acp-1.8.0": {
+    "source": "docs/research/transcripts/codex-acp-1.8.0/06-CODEX_CONFIG-approval-untrusted-rejected.log — initialize result",
+    "mcpCapabilities": { "acp": false, "http": true, "sse": false }
+  }
+}
