@@ -479,11 +479,9 @@ describe("bullet 9 — settleAll (§19.8)", () => {
    * bytes a MICROTASK later, so a `void` settle followed by the notify would still put the cancel
    * on stdin FIRST — an agent blocked on our answer may never read it, and the turn hangs forever.
    *
-   * It is driven here rather than through `worker.cancel(OWNER)` because the frozen `worker.ts`
-   * returns early from `cancel()` unless the state is exactly `running`, and a parked worker is
-   * `requires_action`. That is a one-line change to a frozen file and it is reported in the merge
-   * notes; the GUARANTEE this bullet is about is the ordering, and the ordering is asserted below
-   * against the same two calls in the same order.
+   * The test BELOW this one now drives the same guarantee through `worker.cancel(OWNER)`; the
+   * merge applied WP-I's note N2, so `requires_action` is a cancellable state. This one stays
+   * because it isolates the ordering claim from everything else `Worker.cancel` does.
    */
   it("settleAll('cancel') resolves every held promise BEFORE session/cancel reaches stdin", async () => {
     const r = linkRig({ onUnresolved: "park", parkTimeoutMs: 0 });
@@ -510,6 +508,41 @@ describe("bullet 9 — settleAll (§19.8)", () => {
     expect(r.agent.timeline.indexOf("error:p1")).toBeLessThan(cancelAt);
     expect(r.agent.timeline.indexOf("answer:e1")).toBeLessThan(cancelAt);
     r.dispose();
+  });
+
+  it("worker.cancel() on a PARKED worker settles the held promise, then cancels", async () => {
+    // Acceptance 9, through the real `Worker`. Before WP-I note N2 was applied this was
+    // unreachable: `cancel()` returned early unless the state was exactly `running`, so a parked
+    // turn could not be cancelled at all — `settleAll` never ran, the held JSON-RPC promise never
+    // settled, and the turn hung forever. §19.8 names `cancel()` as one of `settleAll`'s four
+    // callers AND gives it the strict ordering requirement, so the early return contradicted the
+    // section rather than merely disappointing it.
+    const r = await rig({ onUnresolved: "park", parkTimeoutMs: 0 });
+    await turn(r);
+    const held = r.agent.requestPermission("p1", {
+      sessionId: "sess_recording",
+      toolCall: { toolCallId: "call_1", title: "one" },
+      options: [...MENU],
+    });
+    await flush();
+
+    // The precondition the old early return tripped over.
+    expect(r.worker.snapshot().state).toBe("requires_action");
+    expect(r.strategy.pending).toHaveLength(1);
+
+    await r.worker.cancel(OWNER);
+    await flush();
+
+    // 1. The held promise SETTLED — this is the hang that used to be forever.
+    expect(await held).toEqual({ error: -32603 });
+    // 2. ...and it settled BEFORE `session/cancel` reached stdin (§19.8's ordering).
+    const cancelAt = r.agent.timeline.indexOf("recv:session/cancel");
+    expect(cancelAt).toBeGreaterThan(-1);
+    expect(r.agent.timeline.indexOf("error:p1")).toBeLessThan(cancelAt);
+    // 3. The park is released and the log does not end on a `pending` interaction.
+    expect(r.strategy.pending).toEqual([]);
+    expect(r.ip(r.interactions().length - 1).status).toBe("cancelled");
+    await r.worker.close("client_request");
   });
 
   it("a synchronous settle followed by the notify REVERSES that order (review R1)", async () => {

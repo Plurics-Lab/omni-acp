@@ -24,14 +24,10 @@ import { allEnvelopes, assert, asRecord, type CompatCase, type CompatContext } f
  * Owned by M2-A-WP-I.
  */
 
-/**
- * `CreateAgentOptions.onUnresolved` is narrowed to `"deny"` in `client/src/server.ts`, which is
- * M2-WP-J's file; the WIRE has accepted all three since the Land step
- * (`CreateWorkerRequest.onUnresolved`, §5.8.6). The widening is recorded in the merge notes, and
- * the cast lives here and nowhere else so there is exactly one place to delete.
- */
+/** D10's `park`, straight through the SDK type — the merge widened `CreateAgentOptions`
+ *  (WP-I note N6), so the cast this used to need is gone. */
 function parkOptions(ctx: CompatContext): CreateAgentOptions {
-  return { cwd: ctx.cwd, onUnresolved: "park" } as unknown as CreateAgentOptions;
+  return { cwd: ctx.cwd, onUnresolved: "park" };
 }
 
 const interactionsIn = (envelopes: readonly EventEnvelope[]): InteractionPayload[] =>

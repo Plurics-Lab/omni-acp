@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile, realpath as fsRealpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -284,16 +284,13 @@ describe("policy ceiling (M2-B, §20.5)", () => {
 // ── §20.1's whole chain, against a real agent process ────────────────────────
 
 /**
- * `packages/testkit/fixtures/agents/permission-allow-always-only.mjs`.
+ * `packages/testkit/fixtures/agents/permission-allow-always-only.mjs`, by name.
  *
- * Resolved as a SIBLING of a fixture that is already in the union, rather than through
- * `fixtureAgentPath("permission-allow-always-only")`: `FixtureAgentName` lives in
- * `packages/testkit/src/paths.ts`, which is not a file this work package owns, and widening it is
- * the one-line request recorded in WP-P's notes (CONTRACTS §5.8.10 asks for it). The path this
- * computes is byte-for-byte the one `fixtureAgentPath` would return.
+ * The merge widened `FixtureAgentName` with the names CONTRACTS §5.8.10 declares, so WP-P's
+ * sibling-path workaround is gone and this is the resolver every other fixture uses.
  */
 function allowAlwaysOnlyFixture(): string {
-  return join(dirname(fixtureAgentPath("echo")), "permission-allow-always-only.mjs");
+  return fixtureAgentPath("permission-allow-always-only");
 }
 
 let workspace = "";

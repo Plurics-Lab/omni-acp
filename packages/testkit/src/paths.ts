@@ -43,11 +43,24 @@ export type FixtureAgentName =
    * M2's two stall fixtures (CONTRACTS.md §5.8, the fixture table). `stall-silent` is one update
    * and then silence with nothing open — DESIGN §7's `silentMs` budget; `stall-in-tool` opens a
    * `tool_call{status:"pending"}` and never terminalizes it — F36's tool budget and
-   * `TurnResult.strandedToolCalls`. Added by M2-A-WP-W; the other M2 fixture names
-   * (`elicit-*`, `permission-allow-always-only`) belong to WP-I and WP-P and land with them.
+   * `TurnResult.strandedToolCalls`. Added by M2-A-WP-W.
    */
   | "stall-silent"
-  | "stall-in-tool";
+  | "stall-in-tool"
+  /**
+   * M2-A-WP-I's four elicitation fixtures, all two lines on top of the shared `elicit-support.mjs`
+   * that carries transcript `12`'s bytes: `oneOf` + the paired `_custom` property, a free-text
+   * custom answer, a multi-question form, and one that never answers so a park can time out.
+   */
+  | "elicit-oneof"
+  | "elicit-custom"
+  | "elicit-multi"
+  | "elicit-never-answers"
+  /**
+   * M2-B-WP-P's degenerate menu: the ONLY grant offered is an `allow_always`, which D4 rule 3
+   * forbids selecting by any path, so an `allow` verdict has to downgrade rather than take it.
+   */
+  | "permission-allow-always-only";
 
 /**
  * Absolute path to one of the repository's own fixture agents (`fixtures/agents/*.mjs`).

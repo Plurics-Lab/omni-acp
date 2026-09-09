@@ -1,5 +1,3 @@
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   alwaysGrantedLease,
   clientCapabilitiesFor,
@@ -30,7 +28,7 @@ import {
   type WorkerHandle,
   type WorkerId,
 } from "@omni-acp/protocol";
-import { nullLogger, seqIds } from "@omni-acp/testkit";
+import { fixtureAgentPath, nullLogger, seqIds } from "@omni-acp/testkit";
 
 /**
  * A REAL worker over a REAL spawned fixture agent, with the M2 interaction strategy injected.
@@ -45,29 +43,17 @@ import { nullLogger, seqIds } from "@omni-acp/testkit";
  * Owned by M2-A-WP-I.
  */
 
-const FIXTURES = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "..",
-  "..",
-  "packages",
-  "testkit",
-  "fixtures",
-  "agents",
-);
-
 export type ElicitFixture =
   "elicit-oneof" | "elicit-custom" | "elicit-multi" | "elicit-never-answers";
 
 /**
- * `fixtureAgentPath` in `@omni-acp/testkit` does not know the `elicit-*` names yet: `paths.ts` is
- * another package's file and widening `FixtureAgentName` is a cross-owner request, recorded in
- * the merge notes. Resolved here the same way `paths.ts` does it — from this module's URL through
- * `fileURLToPath`, never `new URL(...).pathname`, which yields `/C:/…` on Windows.
+ * The four `elicit-*` fixtures, through the testkit's own resolver.
+ *
+ * `FixtureAgentName` now carries the names CONTRACTS §5.8.10 declares (the merge applied WP-I's
+ * note N5 and WP-P's frozen-file request 1), so this no longer resolves the path itself.
  */
 export function elicitFixture(name: ElicitFixture): string {
-  return join(FIXTURES, `${name}.mjs`);
+  return fixtureAgentPath(name);
 }
 
 export const OWNER: ClientRef = { tokenId: "tok_it" as TokenId, clientId: "cli_it" };

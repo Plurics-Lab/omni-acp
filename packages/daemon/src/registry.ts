@@ -1073,13 +1073,20 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
 
     /** H22: `200 InteractionAnswerResult`. Lease-gated INSIDE the handle, exactly as `prompt` is. */
     answer(id, auth, reqId, body): InteractionAnswerResult {
+      // VISIBILITY FIRST (§19.6: visibility → state → existence → lease → shape → …). A worker
+      // this token cannot see must answer `404` whatever is in the body; parsing first made a
+      // malformed body from a stranger a `400`, which inverts the table's first two rows.
+      //
+      // The re-parse below is not dead code even though `body` arrives typed: an in-process
+      // embedder calls this façade directly and its object has been through no route.
+      const handle = get(id, auth);
       let parsed: InteractionAnswerBody;
       try {
         parsed = InteractionAnswerBody.parse(body);
       } catch (e) {
         throw badRequest(e, "invalid interaction answer");
       }
-      return get(id, auth).answerInteraction(assertInteractionId(reqId), parsed, {
+      return handle.answerInteraction(assertInteractionId(reqId), parsed, {
         ...auth.asClientRef(),
         tokenId: auth.tokenId,
       });

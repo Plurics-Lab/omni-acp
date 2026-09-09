@@ -21,7 +21,16 @@ export interface CreateAgentOptions {
   readonly timeoutMs?: number;
   /** M0: only the empty tuple type-checks. MCP presets are M2. */
   readonly mcp?: readonly [];
-  readonly onUnresolved?: "deny";
+  /**
+   * D10's three dispositions, widened from M0's `"deny"`-only literal.
+   *
+   * The WIRE has accepted all three since the M2 Land step (`CreateWorkerRequest.onUnresolved`,
+   * `z.enum(["park","deny","fail"])`) and L25 makes `park` the headline of the interaction
+   * lifecycle — it is what makes the daemon declare `elicitation.form` at all (F28, §19.2). The
+   * `"deny"`-only literal in §5.8's snapshot is M0's, alongside the `mcp?: readonly []` beside it
+   * that says of itself "MCP presets are M2".
+   */
+  readonly onUnresolved?: "park" | "deny" | "fail";
   /**
    * Per-worker override of `hibernate.idleMs`. `0` disables hibernation for THIS worker
    * (`CreateWorkerRequest.idleTimeoutMs`, §15.2).

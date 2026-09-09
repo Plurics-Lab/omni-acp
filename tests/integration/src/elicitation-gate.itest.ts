@@ -133,18 +133,15 @@ describe("elicitation capability gate (D10, F28, F42)", () => {
   }, 60_000);
 
   /**
-   * The CREATE half of F42, end to end: the agent sees what we declared.
+   * BOTH halves of F42, end to end: the agent sees what we declared, on create AND on wake.
    *
-   * The WAKE half is asserted on the wire in
-   * `packages/core/test/worker/interaction/capability.test.ts` — the named regression test that
-   * was written first and failed against the Land commit's literal `clientCapabilities: {}` on
-   * `session-open.ts`'s reopen path, which this package owns and has fixed.
-   *
-   * It is not asserted THROUGH `Worker.wake()` here because the frozen `worker.ts` builds its
-   * `SessionReopenOptions` at line 1139 WITHOUT `clientCapabilities` — it threads the value on
-   * `open` (line 2547) and not on `reopen`, which is F42's second half surviving inside a file
-   * this package may not edit. The one-line hunk is recorded in the merge notes; asserting the
-   * gap here as if it were correct would be worse than reporting it.
+   * The wake half was the one that survived the Land step twice over — `session-open.ts`'s reopen
+   * path hard-coded `clientCapabilities: {}` (fixed by this package, with a named regression test
+   * in `core/test/worker/interaction/capability.test.ts`), and the frozen `worker.ts` then built
+   * its `SessionReopenOptions` without threading the value at all, so a `park` worker that
+   * hibernated woke unable to be asked anything even after the strategy was right. The merge
+   * applied WP-I's note N1, so the second declaration below is asserted by VALUE rather than by
+   * count: a wake that silently dropped the capability would make the second entry `null`.
    */
   it("the agent SEES the declaration, and the worker survives a wake", async () => {
     const cwd = await tempRoot("omni-acp-gate-wake-");
@@ -177,6 +174,7 @@ describe("elicitation capability gate (D10, F28, F42)", () => {
     expect(w.worker.snapshot().generation).toBe(2);
     expect(w.worker.snapshot().wakeCount).toBe(1);
     expect(w.worker.turn(second.turnId).result?.stopReason).toBe("end_turn");
-    expect(declaredIn(w.envelopes())).toHaveLength(2);
+    // F42's second half, by value: the woken process was told the SAME thing the first one was.
+    expect(declaredIn(w.envelopes())).toEqual([{ form: {} }, { form: {} }]);
   }, 60_000);
 });

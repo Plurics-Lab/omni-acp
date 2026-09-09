@@ -922,7 +922,20 @@ export class Worker implements WorkerHandle {
       throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
     }
     // Idempotent, and a no-op when no turn is live (H9).
-    if (this.#state !== "running" || this.#link === null || this.#sessionId === null) return;
+    //
+    // `requires_action` counts as live. A PARKED turn is a running turn whose agent is blocked on
+    // an interaction we are holding, and §19.8 names `cancel()` as one of `settleAll`'s four
+    // callers with the strict ordering requirement — so returning early here would leave the held
+    // JSON-RPC promise unsettled and the turn hung forever, which is the one outcome that whole
+    // section exists to prevent. The escalation timer below still re-checks for `running` alone,
+    // deliberately: by the time it fires `#settleInteractions` has un-parked and this IS running.
+    if (
+      (this.#state !== "running" && this.#state !== "requires_action") ||
+      this.#link === null ||
+      this.#sessionId === null
+    ) {
+      return;
+    }
 
     const turnId = this.#currentTurnId;
 
@@ -1139,8 +1152,19 @@ export class Worker implements WorkerHandle {
         strategy.reopen(this.#asLinkLike(link), {
           cwd: this.#deps.cwd,
           descriptor: this.#runtime(),
-          // Always [] in M1 (DESIGN §8 — presets are M2).
-          mcpServers: [],
+          // THREADED, not hard-coded — the same value `open` above is given.
+          //
+          // Both halves of this were M1 constants that M2 turned into silent data loss on the
+          // wake path. `mcpServers` was "always [] in M1 (DESIGN §8 — presets are M2)": from M2
+          // on, a woken worker would lose every MCP server it was created with, which is strictly
+          // worse than §23.1's row for a preset that vanished from config (that one at least
+          // closes with `acl_revoked`). And `clientCapabilities` is F42's second half: `open`
+          // threads it and a `reopen` that did not would wake a `park` worker unable to be asked
+          // anything at all. Absent ⇒ `[]` / `{}` = M1 (WP-I note N1, WP-S request R4).
+          mcpServers: this.#deps.mcpServers ?? [],
+          ...(this.#deps.clientCapabilities === undefined
+            ? {}
+            : { clientCapabilities: this.#deps.clientCapabilities }),
           budgetMs:
             timeoutMs ?? this.#deps.limits.wakeTimeoutMs ?? this.#deps.limits.handshakeTimeoutMs,
           sessionId,
@@ -1785,7 +1809,15 @@ export class Worker implements WorkerHandle {
    */
   async #cancelInternalFor(reason: string): Promise<void> {
     if (this.#state === "closed") return;
-    if (this.#state !== "running" || this.#link === null || this.#sessionId === null) return;
+    // `requires_action` is live here for the same reason it is in `cancel()` above: a parked turn
+    // that no watchdog could cancel is a turn no budget can ever end.
+    if (
+      (this.#state !== "running" && this.#state !== "requires_action") ||
+      this.#link === null ||
+      this.#sessionId === null
+    ) {
+      return;
+    }
     this.#logger.warn("cancelling the turn on the daemon's own initiative", { reason });
     this.#feedWatchdog({ kind: "cancel_sent", at: this.#deps.clock.now() });
     await this.cancel(this.#deps.lease.holder ?? this.#deps.owner);
