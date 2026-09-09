@@ -251,17 +251,25 @@ export function createSessionStrategy(o: SessionStrategyOptions): SessionStrateg
           at: o.clock.iso(),
         } satisfies ResumeAttempt);
 
+      // F42, FIXED (M2-A-WP-I). `clientCapabilities: {}` used to be hard-coded HERE as well as in
+      // `handshake.ts`, so a `park` worker that hibernated and woke silently stopped declaring
+      // elicitation — and F28 says the agent then asks in PROSE instead, so the park never
+      // happened again for the rest of that worker's life. The value is computed ONCE by
+      // `clientCapabilitiesFor()` and threaded through `SessionOpenOptions`, which `open` above
+      // already uses; this is the second of the two call sites, and the named regression test in
+      // `core/test/worker/interaction/capability.test.ts` was written first and failed here.
+      //
+      // `?? {}` keeps M1's behaviour as the DEFAULT rather than as a migration: a caller that
+      // threads nothing sends exactly what M1 sent (D3).
+      const clientCapabilities = call.clientCapabilities ?? {};
+
       try {
         // ── §15.3 step 4: initialize, against a BRAND NEW process ──────────
         const init = record(
           await budget.race(
             request(link)<unknown>("initialize", {
               protocolVersion: descriptor.protocolVersion,
-              // F42, UNFIXED at the Land step and deliberately so: `SessionReopenOptions` now
-              // carries `clientCapabilities` and this literal ignores it, which is exactly the
-              // line M2-A-WP-I's first test must fail against (M2-PLAN §2, WP-I acceptance 2).
-              // Landing the fix here would leave that test passing on arrival and prove nothing.
-              clientCapabilities: {},
+              clientCapabilities,
             }),
           ),
         );
@@ -269,7 +277,11 @@ export function createSessionStrategy(o: SessionStrategyOptions): SessionStrateg
           throw new OmniError("agent_error", "initialize returned a non-object response");
         }
         assertNegotiated(init["protocolVersion"], descriptor);
-        const fresh = capabilitiesFromInitialize(init, descriptor);
+        // AS SENT (§5.8.4), for the same reason `handshake.ts` records it on the create path:
+        // `initialize`'s `agentCapabilities` never mentions elicitation either way (F28), so our
+        // own declaration is the only record of why an agent asked in prose — and without it D10
+        // is unauditable across a wake.
+        const fresh = capabilitiesFromInitialize(init, descriptor, clientCapabilities);
 
         // ── §15.3 step 5: pick the resume spelling ─────────────────────────
         const spellings = candidateSpellings(descriptor, fresh, call.capabilities);

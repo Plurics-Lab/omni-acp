@@ -803,12 +803,60 @@
     "workerId": "w_00000000000000000000000001",
     "sessionId": "sess-corpus",
     "turnId": "t_00000000000000000000000001",
-    "payloadVersion": 1,
+    "payloadVersion": 2,
     "kind": "acp.interaction",
     "payload": {
       "requestId": "perm_1",
+      "kind": "permission",
       "method": "session/request_permission",
       "request": {
+        "title": "Write hello.txt",
+        "subject": {
+          "type": "tool_call",
+          "toolCall": {
+            "toolCallId": "toolu_01LGdKmGmcWVh9Mvy7x2rvpa",
+            "name": "Write",
+            "status": "pending",
+            "rawInput": {
+              "file_path": "/tmp/acp-ws-wd-G9y7rN/hello.txt",
+              "content": "hello"
+            },
+            "title": "Write hello.txt",
+            "kind": "edit",
+            "content": [
+              {
+                "type": "diff",
+                "path": "/tmp/acp-ws-wd-G9y7rN/hello.txt",
+                "oldText": null,
+                "newText": "hello"
+              }
+            ],
+            "locations": [
+              {
+                "path": "/tmp/acp-ws-wd-G9y7rN/hello.txt"
+              }
+            ]
+          }
+        },
+        "options": [
+          {
+            "optionId": "allow-once",
+            "name": "Yes",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "allow-with-updates",
+            "name": "Yes, allow all edits during this session",
+            "kind": "allow_always"
+          },
+          {
+            "optionId": "reject",
+            "name": "No",
+            "kind": "reject_once"
+          }
+        ]
+      },
+      "raw": {
         "toolCall": {
           "toolCallId": "toolu_01LGdKmGmcWVh9Mvy7x2rvpa",
           "name": "Write",
@@ -859,9 +907,11 @@
         "sessionId": "f79e1b0a-4ab4-410a-a931-0372c03e1171"
       },
       "status": "answered",
+      "toolCallId": "toolu_01LGdKmGmcWVh9Mvy7x2rvpa",
       "answer": {
         "optionId": "reject",
-        "by": "baseline"
+        "by": "baseline",
+        "parkedMs": 0
       }
     }
   },
@@ -876,9 +926,14 @@
     "kind": "omni.policy_decision",
     "payload": {
       "requestId": "perm_1",
+      "kind": "permission",
+      "method": "session/request_permission",
       "title": "Write hello.txt",
       "decision": "deny",
+      "by": "baseline",
       "rule": "m0:auto-deny",
+      "ruleSource": "baseline",
+      "parkedMs": 0,
       "optionId": "reject",
       "offered": [
         {

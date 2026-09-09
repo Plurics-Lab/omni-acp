@@ -1,10 +1,12 @@
-import { createBaselineResponder, createNormalizer } from "@omni-acp/core";
+import { baselineInteractions, createBaselineResponder, createNormalizer } from "@omni-acp/core";
 import { loadTranscript } from "@omni-acp/testkit";
 import type {
   Clock,
   DaemonId,
   EventEnvelope,
   EventInput,
+  InteractionContext,
+  InteractionId,
   RuntimeDescriptor,
   SessionId,
   TimerHandle,
@@ -68,6 +70,12 @@ export const GOLDEN_SCENARIOS: readonly {
   { name: "10-tool-edit-existing", responder: "allow", cwd: "/tmp/acp-ws-edit-96xAuv" },
 ];
 
+/** The one field the generator overrides, so the file is byte-stable across runs. */
+function withRequestId(e: EventInput, requestId: InteractionId): EventInput {
+  const payload = e.payload as Record<string, unknown>;
+  return { ...e, payload: { ...payload, requestId } } as EventInput;
+}
+
 export function goldenNames(): readonly string[] {
   return GOLDEN_SCENARIOS.map((s) => s.name);
 }
@@ -108,6 +116,10 @@ export function emitScenario(name: string, descriptor?: RuntimeDescriptor): Even
     ...(scenario.cwd === undefined ? {} : { cwd: scenario.cwd }),
   });
   const responder = createBaselineResponder(scenario.responder, clock);
+  // Seam A (M2-PLAN §1.3): M1's responder, WRAPPED. `worker.ts`'s in-situ `#baselinePermission`
+  // is the same body and still stamps `payloadVersion: 1`; this is the strategy an M2 daemon
+  // actually wires, and the golden below is what its log holds.
+  const baseline = baselineInteractions(responder, clock);
 
   const out: EventEnvelope[] = [];
   let seq = 0;
@@ -172,31 +184,33 @@ export function emitScenario(name: string, descriptor?: RuntimeDescriptor): Even
     }
 
     if (msg.method === "session/request_permission") {
-      // Ruling M1-R14: the responder sees the V2-MAPPED request. The two envelopes and their
-      // order are §7.4's, verbatim — `acp.interaction` keeps the raw request for audit and
-      // `omni.policy_decision` is the one `reduceTurn` folds.
+      // M2 (WP-I acceptance 1): the envelopes come from `baselineInteractions` — the SHIPPED
+      // strategy — rather than from a second hand-rolled copy of §7.4 living in this generator.
+      // That is what makes the checked-in golden evidence about the code and not about the two
+      // being written the same way twice.
+      //
+      // Ruling M1-R14 is unchanged: the strategy sees the V2-MAPPED request. Ruling M2-R3 is
+      // what moved: `acp.interaction` is `payloadVersion: 2` with the NORMALIZED request and the
+      // agent's bytes beside it in `raw`, plus §19.10's `kind` / `toolCallId` /
+      // `answer.parkedMs`. Nothing else about these envelopes changed, which is the whole claim.
       requestOrdinal += 1;
       const raw = (line.msg as { params?: Record<string, unknown> }).params ?? {};
-      const decision = responder.decide(mapPermissionRequest(raw, runtime));
-      append({
-        kind: "acp.interaction",
-        payloadVersion: 1,
-        turnId: started && !ended ? GOLDEN_TURN : null,
-        payload: {
-          requestId: `perm_${String(requestOrdinal)}`,
-          method: "session/request_permission",
-          request: raw,
-          status: decision.response === null ? "failed" : "answered",
-          answer: { optionId: decision.record.optionId, by: "baseline" },
+      const turnId = started && !ended ? GOLDEN_TURN : null;
+      const ctx: InteractionContext = {
+        turnId,
+        emit: (inputs) => {
+          for (const e of inputs) {
+            // The synthesized `requestId` is made deterministic here — and ONLY here — so the
+            // file is byte-stable; everything else is the strategy's own output.
+            append(withRequestId(e, `perm_${String(requestOrdinal)}` as InteractionId));
+          }
         },
-      });
-      append({
-        kind: "omni.policy_decision",
-        payloadVersion: 2,
-        turnId: started && !ended ? GOLDEN_TURN : null,
-        // The synthesized `requestId` is made deterministic here; everything else is the
-        // responder's own record, including the `toolCallId` join §13.4 needs.
-        payload: { ...decision.record, requestId: `perm_${String(requestOrdinal)}` },
+        park: () => () => {},
+        failTurn: () => {},
+      };
+      void baseline.permission(mapPermissionRequest(raw, runtime), ctx).catch(() => {
+        // D4 rule 4's `-32603`. The envelopes are already appended; the rejection is the ANSWER
+        // to the agent, and this generator has no agent to answer.
       });
       continue;
     }
