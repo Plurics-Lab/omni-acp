@@ -7,7 +7,12 @@ import { fakeClock, nullLogger } from "@omni-acp/testkit";
 import { createDeliveryStore, type DeliveryStoreV2 } from "../../../src/persist/delivery-store.js";
 import { createSqliteEventStore } from "../../../src/persist/event-store.js";
 import { createRunStore } from "../../../src/persist/run-store.js";
-import { migrateTo, withTransaction, type SqliteDatabase } from "../../../src/persist/schema.js";
+import {
+  SCHEMA_VERSION,
+  migrateTo,
+  withTransaction,
+  type SqliteDatabase,
+} from "../../../src/persist/schema.js";
 import { createSqliteWorkerStore } from "../../../src/persist/worker-store.js";
 
 export type RawEventStore = EventStore & { flush(): void; payloadCount(): number };
@@ -31,10 +36,11 @@ export interface RawStore {
 
 /**
  * `version` is the SCHEMA a daemon of that vintage understands: `1` opens the file as an M1
- * daemon would, `2` (the default) as this one does. It is what makes the BACKWARD direction of
- * §24.2 testable against the shipped `migrateTo` rather than against a copy of its logic.
+ * daemon would, `2` as an M2 daemon written before schema v3 did, and the default as THIS one
+ * does. It is what makes the BACKWARD direction of §24.2 testable against the shipped `migrateTo`
+ * rather than against a copy of its logic.
  */
-export function openDb(file: string, version = 2): SqliteDatabase {
+export function openDb(file: string, version = SCHEMA_VERSION): SqliteDatabase {
   const db = new DatabaseSync(file) as unknown as SqliteDatabase;
   db.exec("pragma auto_vacuum = INCREMENTAL");
   db.exec("pragma busy_timeout = 5000");
@@ -63,9 +69,12 @@ export async function rawStore(
   const dir = o.dir ?? (await mkdtemp(join(tmpdir(), "omni-acp-raw-")));
   const file = o.file ?? join(dir, "events.db");
   const clock = fakeClock();
+  // The SAME vintage on a reopen: a restart that silently upgraded the file would make
+  // `reopen()` test a different daemon from the one that wrote it.
+  const version = o.version ?? SCHEMA_VERSION;
 
   const store: RawStore = {
-    db: openDb(file, o.version ?? 2),
+    db: openDb(file, version),
     events: null as unknown as RawEventStore,
     workers: null as unknown as WorkerStore,
     runs: null as unknown as RawStore["runs"],
@@ -79,7 +88,7 @@ export async function rawStore(
     reopen(): void {
       store.events.flush();
       store.db.close();
-      store.db = openDb(file, o.version ?? 2);
+      store.db = openDb(file, version);
       wire();
     },
     async dispose(): Promise<void> {
@@ -97,7 +106,13 @@ export async function rawStore(
       clock,
       file: file === ":memory:" ? null : file,
     });
-    store.workers = createSqliteWorkerStore(store.db);
+    // The worker store's upsert names `m2_json`, which schema v3 adds, so it is wired only when
+    // the file actually has the column — the same rule the v2 stores below follow, for the same
+    // reason: a prepare-time throw inside this helper is far harder to read than a null
+    // dereference in the test that reached for a store its file cannot have.
+    if (hasColumn(store.db, "workers", "m2_json")) {
+      store.workers = createSqliteWorkerStore(store.db);
+    }
     // The v2 stores prepare statements against tables a VERSION-1 open deliberately does not
     // create, so they are wired only when the file actually has them. Reaching `store.runs` on a
     // v1 handle is then a null dereference in the test rather than a confusing prepare-time
@@ -110,6 +125,13 @@ export async function rawStore(
   wire();
 
   return store;
+}
+
+export function hasColumn(db: SqliteDatabase, table: string, column: string): boolean {
+  return db
+    .prepare(`select name from pragma_table_info(?)`)
+    .all(table)
+    .some((r) => String(r["name"]) === column);
 }
 
 export function hasTable(db: SqliteDatabase, name: string): boolean {

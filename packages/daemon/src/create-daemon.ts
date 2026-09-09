@@ -10,6 +10,7 @@ import {
   type DeliveryStore,
   type DiffProvider,
   type RunRegistry,
+  type WebhookDispatcher,
   type DaemonInfo,
   type EventEnvelope,
   type IdGen,
@@ -303,6 +304,16 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
         logger: logger.child({ mod: "session" }),
       }),
     persistence,
+    /**
+     * The ONE resolver of everything an `AuthContext` carries, handed to the registry so the WAKE
+     * path can reach it (review findings V2/V8 and V3).
+     *
+     * A rehydrated worker holds no `AuthContext` — nobody does across a restart — and the two
+     * things it needs from one are the token's RESOLVED `cwdRoots` and a context to rebuild its
+     * policy engine with. Reading them through this store is what keeps the daemon from growing
+     * a second, unresolved spelling of either.
+     */
+    tokens,
     // M2's four per-worker seams. The registry composes one strategy and one watchdog per worker
     // from the REQUEST's own disposition and budgets, and hands every worker the same provider.
     interactions,
@@ -361,6 +372,29 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   }
   const dispatcher = runSubsystem.dispatcher;
   dispatcher?.start();
+
+  /**
+   * `Daemon.dispatcher`, which is ALWAYS present (review finding V1).
+   *
+   * `POST /v1/webhooks/deliveries/{id}/redeliver` has to go through the dispatcher, because the
+   * dispatcher is the only thing that re-runs `assertWebhookUrl` before a replay. With
+   * `webhooks.enabled: false` there is no dispatcher to go through and no delivery could exist,
+   * so the refusal is `bad_request` naming the work package — D29's honest "not implemented yet",
+   * the M1 Land precedent S8 — rather than a bare store write that would bypass the gate.
+   */
+  const dispatcherFacade: WebhookDispatcher = dispatcher ?? unimplementedDispatcher();
+
+  /**
+   * Review finding V6. Flipped INSIDE the stop closure, before persistence closes.
+   *
+   * `notAfterStop` is the one gate the three store-backed accessors on the returned object go
+   * through; see the getters below for why it is on the access rather than on a captured value.
+   */
+  let stopped = false;
+  const notAfterStop = <T>(value: T): T => {
+    if (stopped) throw new OmniError("internal", "the daemon has stopped");
+    return value;
+  };
 
   // The retention sweep, armed last so it cannot race adoption for the same rows (§14.5).
   const retention = armRetention({ persistence, config: resolved, clock, logger });
@@ -477,8 +511,36 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     // M2-B (D9), wired. `deps.runs` still wins — that is the seam a test injects a recorder into
     // — and `unimplementedRuns()` remains as the honest answer for a `Daemon` assembled without
     // the subsystem at all (D29's "not implemented yet", the M1 Land precedent S8).
-    runs: deps?.runs ?? runSubsystem.runs,
-    deliveries: runSubsystem.deliveries,
+    /**
+     * ── review finding V6: a STOPPED daemon refuses, it does not crash ───────────────────────
+     *
+     * `stop()` closes persistence last (correctly) and nothing used to mark the object as
+     * stopped, so `daemon.runs.get(...)` and `daemon.deliveries.list(...)` stayed callable and
+     * threw raw `node:sqlite` errors — `statement has been finalized`, `database is not open` —
+     * from below the error-classification layer. Under D15 ("the library IS the product") an
+     * embedder reading a run's terminal state after shutdown got an unclassified crash instead of
+     * a typed refusal, and the HTTP adapter mapped it to a bare 500.
+     *
+     * GETTERS, so the gate is on the ACCESS and not on a value captured at construction, and one
+     * `OmniError("internal", …)` for all three — the same shape every other refusal on this
+     * object already uses.
+     *
+     * `workers` and `catalog` are deliberately NOT gated, which is the review's own second option.
+     * A worker's event log OUTLIVES its process by design — `daemon.workers.turn(id, auth, tid)`
+     * after `stop()` answering `worker_closed` from the ring is an asserted M1 behaviour ("the log
+     * outlives it"), and `daemon.workers.size` reading 0 is how a shutdown test proves the fleet
+     * went — so a gate there would refuse two calls that are correct today and cross no closed
+     * statement. The three below are exactly the verbs whose backing store `stop()` closes.
+     */
+    get runs(): RunRegistry {
+      return notAfterStop(deps?.runs ?? runSubsystem.runs);
+    },
+    get deliveries(): DeliveryStore {
+      return notAfterStop(runSubsystem.deliveries);
+    },
+    get dispatcher(): WebhookDispatcher {
+      return notAfterStop(dispatcherFacade);
+    },
 
     authContextFor(tokenId: TokenId, clientId?: ClientId | null): AuthContext {
       return tokens.contextFor(tokenId, clientId ?? null);
@@ -544,25 +606,39 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
         /**
          * §24.4's mirror of the boot order, and the FIRST step is §19.8's:
          *
-         *     interactions.settleAll → dispatcher.drain(bounded) → workers → socket
+         *     interactions.settleAll → dispatcher.drain(bounded) → workers closed
+         *       → dispatcher.drain(bounded) → dispatcher.stop → supervisor → socket
          *
          * `settleAll` first because an agent BLOCKED on our answer may never read the shutdown —
          * a log that ends on a `pending` interaction is a log that lies, and a JSON-RPC promise
-         * nobody resolved is a process that will not exit. It runs through `closeAll` below (each
-         * `Worker.close` settles its own strategy), so the explicit step here is the DISPATCHER's:
-         * a bounded drain, never an unbounded one, because a slow receiver must not hold a
-         * shutdown open.
+         * nobody resolved is a process that will not exit. Every drain is BOUNDED, never
+         * unbounded, because a slow receiver must not hold a shutdown open.
          */
+        // Rung 1, and review finding V11 is that it used to be missing entirely: settling
+        // happened only later, inside each `Worker.close`, with reason `"close"` — which left
+        // `settleAll`'s `"shutdown"` arm unreachable in shipped code and put the dispatcher's
+        // drain AHEAD of the settlement envelopes it might have to deliver.
+        await workers.settleAllInteractions().catch((e: unknown) => {
+          logger.warn("settling parked interactions failed", { error: String(e) });
+        });
+        await dispatcher?.drain({ timeoutMs: DISPATCHER_DRAIN_MS }).catch((e: unknown) => {
+          logger.warn("draining webhook deliveries failed", { error: String(e) });
+        });
+        await workers.closeAll(
+          "daemon_shutdown",
+          timeoutMs === undefined ? undefined : { timeoutMs },
+        );
+        // A SECOND bounded drain, and it is the other half of finding V11: terminalizing every
+        // turn above enqueues the run's own `run.*` delivery, and a dispatcher already stopped
+        // would no-op its pump — so under `eventLog.driver:"memory"`, where there is no next boot
+        // to recover it, that delivery would never be attempted at all. Stopping AFTER the drain
+        // is why `stop()` is the last dispatcher call and not the middle one.
         await dispatcher?.drain({ timeoutMs: DISPATCHER_DRAIN_MS }).catch((e: unknown) => {
           logger.warn("draining webhook deliveries failed", { error: String(e) });
         });
         await dispatcher?.stop().catch((e: unknown) => {
           logger.warn("stopping the webhook dispatcher failed", { error: String(e) });
         });
-        await workers.closeAll(
-          "daemon_shutdown",
-          timeoutMs === undefined ? undefined : { timeoutMs },
-        );
         // The backstop: anything the workers did not own (or did not manage to reap) is killed
         // here, so `supervisor.live` is empty when this resolves.
         await supervisor
@@ -587,6 +663,10 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
          * somebody else's store is how a test that reuses one file across two daemons breaks.
          */
         retention.stop();
+        // Review finding V6: SET BEFORE the store closes, so no verb on this object can reach a
+        // finalized statement. Everything above ran while the daemon was still usable, which is
+        // what `closeAll` and the drains need.
+        stopped = true;
         if (deps?.persistence === undefined) {
           try {
             persistence?.close();
@@ -779,6 +859,31 @@ function unimplementedRuns(): RunRegistry {
     cancel: () => Promise.reject(new OmniError("bad_request", "runs are not enabled (M2-B-WP-R)")),
     logFor: no,
     recover: () => ({ abandoned: 0 }),
+  };
+}
+
+/**
+ * `Daemon.dispatcher` with no dispatcher wired — `webhooks.enabled: false`.
+ *
+ * Same rule as `unimplementedRuns`: every verb refuses OUT LOUD naming the work package, because
+ * this object is the only replay path (review finding V1) and a silent no-op here would be a
+ * redeliver that reports success and sends nothing. `drain` and `stop` are the deliberate
+ * exceptions — they are SHUTDOWN paths, they must be total, and "there was nothing to drain" is
+ * true of a daemon with no dispatcher.
+ */
+function unimplementedDispatcher(): WebhookDispatcher {
+  const no = (): never => {
+    throw new OmniError("bad_request", "webhooks are not enabled on this daemon (M2-B-WP-R)");
+  };
+  return {
+    start: () => {},
+    dispatch: no,
+    redeliver: () =>
+      Promise.reject(
+        new OmniError("bad_request", "webhooks are not enabled on this daemon (M2-B-WP-R)"),
+      ),
+    drain: () => Promise.resolve(),
+    stop: () => Promise.resolve(),
   };
 }
 

@@ -83,6 +83,16 @@ export function createPolicyEngine(o: PolicyEngineOptions): PolicyEngine {
   return {
     id,
     snapshot,
+    /**
+     * §20.6's watch list, resolved (the UNION over every applied preset layer).
+     *
+     * It rides on the ENGINE because the engine is the only thing that resolved it and the TURN
+     * is where it has to land: the registry hands it to `createWorker`, `worker.ts` stamps it on
+     * `state_update{idle}._meta["omni/policy"]`, and `reduceTurn` folds
+     * `unpoliced_tool_call` out of it. Review finding V9: before this, `alertOnUnpoliced` was a
+     * config key that nothing ever read.
+     */
+    alertOnUnpoliced: Object.freeze([...policy.alertOnUnpoliced]),
     decide(s: PolicySubject): PolicyVerdict {
       // FIRST MATCH WINS, over rules already ordered last-applied-first by
       // `resolvePolicySelection` - which is what lets an inline rule narrow a preset (§20.2).

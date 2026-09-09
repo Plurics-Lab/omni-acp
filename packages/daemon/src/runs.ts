@@ -63,8 +63,10 @@ export interface RunSubsystem {
  * object and called by `create-daemon.ts`, which is the only file that knows where `workers.adopt`
  * sits relative to them.
  *
- * `stop()` runs the mirror: `interactions.settleAll → dispatcher.drain(bounded) → workers →
- * socket`. Settling first is §19.8 — an agent blocked on our answer may never read the shutdown.
+ * `stop()` runs the mirror: `interactions.settleAll → dispatcher.drain(bounded) → workers closed →
+ * dispatcher.drain(bounded) → dispatcher.stop → socket`. Settling first is §19.8 — an agent blocked
+ * on our answer may never read the shutdown; the SECOND drain is because closing the workers is
+ * what enqueues each run's own terminal `run.*` delivery (review round 2, finding V11).
  *
  * Owned by M2-B-WP-R.
  */

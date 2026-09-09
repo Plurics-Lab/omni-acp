@@ -262,7 +262,10 @@ export function createGitDiffProvider(o: {
       }
     },
 
-    async end(h: PatchHandle, opts?: { signal?: AbortSignal }): Promise<PatchResult> {
+    async end(
+      h: PatchHandle,
+      opts?: { signal?: AbortSignal; wroteFiles?: boolean },
+    ): Promise<PatchResult> {
       const state = live.get(h);
       live.delete(h);
       try {
@@ -277,6 +280,34 @@ export function createGitDiffProvider(o: {
         }
         if (opts?.signal?.aborted === true) {
           return unavailable([warning("patch_diff_failed", { reason: "aborted" })]);
+        }
+
+        /**
+         * §25.4's `on_write`, and review finding V12 is that it did nothing at all: `cfg.mode`
+         * was read in exactly ONE place — to answer `"off"` — so `on_write`, the DOCUMENTED
+         * DEFAULT, ran the same two `git add -A` + `write-tree` pairs per turn that `"always"`
+         * did, and §11.9's stated mitigation for that cost saved nothing.
+         *
+         * The ANSWER is identical to the `after === h.tree` branch below, which is the property
+         * `git-provider.test.ts` already pins ("the two modes agree"): a turn that wrote nothing
+         * has an empty patch either way. What differs is the COST — the second `git add -A` +
+         * `write-tree` pair, plus the `rev-parse` — which is the whole reason the mode exists.
+         *
+         * `wroteFiles` absent means "the caller does not report it", and then the honest reading
+         * is `"always"`: an observation we do not have must never suppress a patch.
+         */
+        if (cfg.mode === "on_write" && opts?.wroteFiles === false) {
+          const nothing = classifyWorktree(state.topLevel, [...state.shared]);
+          return {
+            text: "",
+            source: "git",
+            truncated: false,
+            quality: nothing,
+            warnings:
+              nothing === "shared_worktree"
+                ? [warning("patch_shared_worktree", { workers: state.shared.size + 1 })]
+                : [],
+          };
         }
 
         // F39, the whole reason `begin` runs per turn: the top level must still be the SAME one.

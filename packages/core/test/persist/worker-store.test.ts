@@ -228,3 +228,72 @@ function dummy(w: WorkerId, n: number): Parameters<RawStore["events"]["put"]>[0]
     payload: { code: "internal", message: "x" },
   }) as unknown as Parameters<RawStore["events"]["put"]>[0];
 }
+
+/**
+ * §24.2 v3, and review finding V2/V8's second half: `WorkerRow`'s M2 fields are PERSISTED.
+ *
+ * They were declared at the Land step with the comment "persisted BECAUSE OF THE WAKE PATH" and
+ * NOT ONE of them was ever written: `upsert` had no column, `toRow` did not read one back, and
+ * every field degraded to its M1 default on the first wake after a restart — `onUnresolved:
+ * "park"` came back as `"deny"`, so F28's "the park never happens again" happened. Worse,
+ * `registry.decorate()` then wrote the degraded value back into `snapshot_json`, so the SECOND
+ * boot overwrote the correct value still on disk.
+ */
+describe("the M2 half of a WorkerRow survives the file (review finding V2/V8)", () => {
+  let raw: RawStore;
+
+  beforeEach(async () => {
+    raw = await rawStore();
+  });
+
+  afterEach(async () => {
+    await raw.dispose();
+  });
+
+  const M2: Partial<WorkerRow> = {
+    onUnresolved: "park",
+    parkTimeoutMs: 60_000,
+    parkTimeoutAction: "fail",
+    mcpNames: ["notes", "search"],
+    policyRef: "src-edit+inline",
+    policy: { presets: ["src-edit"], default: "deny" },
+    env: { ANTHROPIC_MODEL: "sonnet" },
+    watchdog: { silentMs: 1_000, toolMs: 2_000, cancelTimeoutMs: 30_000 },
+    patchMode: "always",
+  };
+
+  it("round-trips every one of them, through a REOPEN of the same file", () => {
+    const w = workerId(80);
+    raw.workers.upsert(row(w, M2));
+    raw.reopen();
+    const back = raw.workers.get(w);
+    expect(back).not.toBeNull();
+    for (const [key, value] of Object.entries(M2)) {
+      expect((back as unknown as Record<string, unknown>)[key], key).toEqual(value);
+    }
+  });
+
+  it("keeps `null` and ABSENT apart — they are different facts about the boot that wrote it", () => {
+    const w = workerId(81);
+    // `policyRef: null` is "this worker resolved to no engine id"; an ABSENT `policyRef` is "a
+    // boot that did not know the field wrote this row", and `viewRowsOf`'s `??` fallbacks read
+    // the second one as M1.
+    raw.workers.upsert(row(w, { policyRef: null, env: null }));
+    raw.reopen();
+    const back = raw.workers.get(w) as WorkerRow;
+    expect(back.policyRef).toBeNull();
+    expect(back.env).toBeNull();
+    expect("onUnresolved" in back).toBe(false);
+    expect("patchMode" in back).toBe(false);
+  });
+
+  it("an M1-shaped row stores nothing and reads back as the M1 row it is", () => {
+    const w = workerId(82);
+    raw.workers.upsert(row(w));
+    raw.reopen();
+    const back = raw.workers.get(w) as WorkerRow;
+    for (const key of ["onUnresolved", "parkTimeoutMs", "mcpNames", "policy", "watchdog"]) {
+      expect(key in back, key).toBe(false);
+    }
+  });
+});

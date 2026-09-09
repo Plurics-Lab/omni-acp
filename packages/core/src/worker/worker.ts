@@ -1,5 +1,6 @@
 import {
   AcpRequestError,
+  InteractionAnswerBody,
   OmniError,
   turnStatus,
   workerRef,
@@ -207,6 +208,15 @@ export interface CreateWorkerDeps {
    * `CreateWorkerRequest.mcp` is `string[]`). Absent ⇒ `[]`, which is M1.
    */
   readonly mcpServers?: readonly unknown[];
+  /**
+   * M2-B, §20.6. The resolved `alertOnUnpoliced` kinds, from the worker's own policy engine.
+   *
+   * Stamped on `state_update{idle}._meta["omni/policy"]` so `reduceTurn` can fold
+   * `TurnWarning{code:"unpoliced_tool_call"}` out of it (review finding V9: the fold existed, had
+   * unit tests, and had no production caller at all). Absent ⇒ `[]` ⇒ no key and no warning,
+   * which is M1.
+   */
+  readonly alertOnUnpoliced?: readonly string[];
 }
 
 /**
@@ -250,6 +260,12 @@ const DEFAULT_DIFF_TIMEOUT_MS = 15_000;
  * exactly what lets the git provider land with zero edits to the reducer (ruling M2-R9).
  */
 const PATCH_META = "omni/patch";
+
+/**
+ * M2-B, §20.6. The key `alertOnUnpoliced` rides under, spelled here (the writer) and in
+ * `protocol/src/turn.ts` (the reader) and nowhere else — exactly as `PATCH_META` is.
+ */
+const POLICY_META = "omni/policy";
 
 /**
  * The `elicitation/create` mapper's Land-step stand-in.
@@ -390,6 +406,35 @@ function isRunningStateUpdate(e: EventInput): boolean {
   return p["sessionUpdate"] === "state_update" && p["state"] === "running";
 }
 
+/**
+ * §25.4's WRITE-ISH test, over ONE normalized `acp.session_update` payload (review finding V12).
+ *
+ * Two independent signals, and either is enough:
+ *
+ *  - a tool call whose v2 `kind` is `edit` / `delete` / `move` — the three the schema has for
+ *    "this touches the worktree";
+ *  - any `content[]` block of `type:"diff"`, which is the same block `reduceTurn` folds into
+ *    `TurnResult.changes`, so "the turn reported changes" and "the turn wrote" agree by
+ *    construction.
+ *
+ * Deliberately GENEROUS: F38 records claude-acp under-reporting a two-file read as one
+ * `kind:"read"` call, so anything ambiguous must fall on the "run git" side. A false positive
+ * costs one `git write-tree`; a false negative would cost a patch.
+ */
+function wroteFiles(payload: Record<string, unknown>): boolean {
+  const kind = payload["sessionUpdate"];
+  if (kind !== "tool_call" && kind !== "tool_call_update") return false;
+  if (WRITE_ISH_TOOL_KINDS.has(String(payload["kind"]))) return true;
+  const content = payload["content"];
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (c) => typeof c === "object" && c !== null && (c as { type?: unknown }).type === "diff",
+  );
+}
+
+/** v2 `ToolCallKind`s that mean the worktree may have changed (§25.4). */
+const WRITE_ISH_TOOL_KINDS: ReadonlySet<string> = new Set(["edit", "delete", "move"]);
+
 function stopReasonOf(response: unknown): StopReason {
   if (typeof response === "object" && response !== null) {
     const s = (response as { stopReason?: unknown }).stopReason;
@@ -469,6 +514,34 @@ export class Worker implements WorkerHandle {
 
   /** M2, hunk 7. The watchdog's current deadline, for `WorkerSnapshot.watchdog.armedAt`. */
   #watchdogArmedAt: number | null = null;
+
+  /**
+   * M2, §5.8.4's `policyBlinded`. STICKY, and review finding V9 is that nothing ever set it.
+   *
+   * F26: after ONE `allow_always` the host never asks again for that session and NOTHING on the
+   * wire says so. `interaction.allowAlways:"human"` is the opt-in that permits it, and M2-R19
+   * makes three announcements the price of allowing it — the strategy's `warn` line, the
+   * `blindsPolicy` stamp on the decision, and this flag on the snapshot. Two of the three were
+   * missing. It is set from the SETTLEMENT envelopes as they are appended, because that is the
+   * one channel every strategy — injected or not — has to go through.
+   */
+  #policyBlinded = false;
+
+  /**
+   * M2, §25.4's `diff.mode:"on_write"`. Did THIS turn write anything?
+   *
+   * Review finding V12: `on_write` is `diff.mode`'s documented DEFAULT and behaved identically to
+   * `"always"` — `cfg.mode` was read in exactly one place, to answer `"off"` — so every turn on a
+   * git worker paid two `git add -A` + `write-tree` pairs whether or not it touched a file, and
+   * §11.9's stated mitigation for that cost saved nothing.
+   *
+   * It is folded off the NORMALIZED envelopes in `#stepOut` rather than off the raw v1 updates,
+   * so it reads the same v2 `kind` / `content[].type` the reducer does and needs no per-agent
+   * branch. It is deliberately generous: any `edit` / `delete` / `move` tool call, or any `diff`
+   * content block, counts — a false positive costs one `git write-tree`, a false negative would
+   * cost a patch.
+   */
+  #turnWroteFiles = false;
 
   /**
    * M2, hunk 6. The LIVE config catalogue (§5.8.4), REPLACED WHOLESALE and never merged.
@@ -697,6 +770,9 @@ export class Worker implements WorkerHandle {
       // who still has `capabilities.configOptions`.
       ...(this.#configOptions === null ? {} : { configOptions: this.#configOptions }),
       interactions: this.#deps.interactions?.pending ?? [],
+      // STICKY, and present only once it is TRUE — an M1 `toEqual` over a snapshot must not grow
+      // a key, and "never blinded" is what its absence has always meant (§5.8.4, F26).
+      ...(this.#policyBlinded ? { policyBlinded: true } : {}),
       // `null` when nothing is injected AND when `watchdog.enabled:false` — the two cases a
       // client cannot tell apart and does not need to: neither will ever cancel a turn. When one
       // IS armed, `armedAt` is the deadline it will actually fire at, never a re-derivation.
@@ -769,6 +845,8 @@ export class Worker implements WorkerHandle {
     const turnId = this.#deps.ids.turn();
     this.#state = "running";
     this.#currentTurnId = turnId;
+    // §25.4's `on_write` is a question about THIS turn, so the answer is cleared with it.
+    this.#turnWroteFiles = false;
     // Rule L6, taken at the same instant the turn becomes `running` and before the first thing
     // that can throw: a pin held over an aborted admission is released by the catch below, but a
     // pin taken after one would leave the window this exists to close.
@@ -877,11 +955,11 @@ export class Worker implements WorkerHandle {
       // HUNK 8, the SETTLE half: `end` runs IMMEDIATELY BEFORE `prompt_result` is fed, because
       // that is the input whose `meta` the reducer merges into `state_update{idle}._meta` (seam
       // D). Any later and the key would miss the envelope `reduceTurn` reads it from.
-      const meta = await this.#endPatch(patch);
+      const meta = { ...this.#policyMeta(), ...(await this.#endPatch(patch)) };
       this.#feed({
         type: "prompt_result",
         stopReason: stopReasonOf(res),
-        ...(meta === null ? {} : { meta }),
+        ...(Object.keys(meta).length === 0 ? {} : { meta }),
         // F21. `PromptResponse.usage` is the ONLY place a per-turn token count is reported —
         // `usage_update` is a context-window gauge (`{used, size}`), not a cost. Forwarded raw:
         // the reducer decides whether it is the v2 `Usage` shape and drops it when it is not
@@ -1346,6 +1424,7 @@ export class Worker implements WorkerHandle {
   } {
     const out: TurnOutput = this.#deps.normalizer.step(input);
     const envelopes = this.#deps.log.appendAll(out.emit);
+    this.#observe(envelopes);
     // HUNK 7. The quiet window is anchored on the LAST ENVELOPE APPENDED, never on the prompt
     // response — F25 makes that 7/7 on claude-acp (a `session_info_update` arrives ~20 ms AFTER
     // the response), and codex emits `threadStatus:idle` BEFORE its response. Feeding here, at
@@ -1357,6 +1436,29 @@ export class Worker implements WorkerHandle {
     this.#rescheduleTick(out.scheduleTickAt);
     this.#afterStep(out);
     return { out, envelopes };
+  }
+
+  /**
+   * The two facts about a turn that only the ENVELOPES can tell us, folded where they are written.
+   *
+   * Both are review findings. `policyBlinded` (V9) is sticky and comes off the one
+   * `omni.policy_decision` a settlement emits, so it is set whichever strategy is injected and
+   * whether the grant came from a human POST or from anywhere else. `#turnWroteFiles` (V12) is
+   * §25.4's `on_write` gate: it is what lets `#endPatch` skip the second `git add -A` +
+   * `write-tree` pair on a turn that touched nothing.
+   *
+   * It never throws — a bookkeeping fold that could break an append would be a fold that loses
+   * envelopes.
+   */
+  #observe(envelopes: readonly EventEnvelope[]): void {
+    for (const e of envelopes) {
+      if (e.kind === "omni.policy_decision") {
+        if (e.payload.blindsPolicy === true) this.#policyBlinded = true;
+        continue;
+      }
+      if (e.kind !== "acp.session_update" || this.#turnWroteFiles) continue;
+      if (wroteFiles(e.payload as unknown as Record<string, unknown>)) this.#turnWroteFiles = true;
+    }
   }
 
   /** `#step` for the paths where a throw must not escape into a timer or the SDK's dispatcher. */
@@ -1553,7 +1655,47 @@ export class Worker implements WorkerHandle {
     const mapped: MappedPermissionRequest = this.#deps.normalizer.mapPermissionRequest(req);
     const strategy = this.#deps.interactions;
     if (strategy === undefined) return await this.#baselinePermission(req, mapped);
-    return await strategy.permission(mapped, this.#interactionContext());
+    return this.#assertOffered(
+      await strategy.permission(mapped, this.#interactionContext()),
+      mapped,
+    );
+  }
+
+  /**
+   * §19.7 rule 1 and rule 5, at THE POINT THAT EMITS THE ANSWER (review finding V4).
+   *
+   * `#baselinePermission` has carried this check since §12.6, with the argument spelled out
+   * there: `DaemonDeps.responder` is a public injection point, and a rule only one implementation
+   * upholds is a property of that implementation rather than of the system. `DaemonDeps
+   * .interactions` is a public injection point of exactly the same kind — it is the seam M2's
+   * strategy lands on and the one an embedder replaces — so the shipped M2 path ran with two of
+   * rule 1's three claimed checks and nothing at all where the bytes reach the wire.
+   *
+   * The violation is folded into rule 4's EXISTING answer — `-32603` carrying the offered set —
+   * because that is the shape a caller and an auditor already know how to read. Never the invented
+   * id (rule 1), and never `outcome:"cancelled"` (rule 5): cancelling would kill the whole turn
+   * over one action our own strategy got wrong. Corpus 09 is the recording of what a forged id
+   * costs, and its lesson is that it CANNOT be caught downstream — the agent failed every tool
+   * call and still ended the turn `end_turn`.
+   */
+  #assertOffered(
+    res: RequestPermissionResponse,
+    mapped: MappedPermissionRequest,
+  ): RequestPermissionResponse {
+    const outcome = (res as { outcome?: { outcome?: unknown; optionId?: unknown } } | null)
+      ?.outcome;
+    const optionId = typeof outcome?.optionId === "string" ? outcome.optionId : null;
+    const offered = new Set(mapped.options.map((x) => x.optionId));
+    if (outcome?.outcome === "selected" && optionId !== null && offered.has(optionId)) return res;
+    this.#logger.error("the interaction strategy answered with an option the agent never offered", {
+      outcome: typeof outcome?.outcome === "string" ? outcome.outcome : null,
+      optionId,
+      offered: [...offered],
+    });
+    throw AcpRequestError.internalError(
+      { offered: mapped.options },
+      "the selected permission option was not offered",
+    );
   }
 
   /**
@@ -1626,7 +1768,7 @@ export class Worker implements WorkerHandle {
     return {
       turnId: this.#currentTurnId,
       emit: (inputs) => {
-        this.#deps.log.appendAll(inputs);
+        this.#observe(this.#deps.log.appendAll(inputs));
       },
       park: (id) => this.#park(id),
       failTurn: (reason) => {
@@ -1640,24 +1782,67 @@ export class Worker implements WorkerHandle {
   }
 
   /**
-   * HUNK 5 (M2-PLAN §1.2). `lease.assertHolder(who)` FIRST, exactly as `prompt` / `cancel` /
-   * `wake` do — F22's payoff, again: identity is the lease's business and this handle enforces
-   * state, not identity.
+   * HUNK 5 (M2-PLAN §1.2), in §19.6's ORDER — which review finding V10 found inverted.
+   *
+   *     worker state → interaction existence → lease → body SHAPE → semantics
+   *
+   * The lease used to be first, so a non-holder answering a stale request id got `423 lease_held`
+   * instead of `404 interaction_not_found` — "a stale request id does not report a lease problem
+   * it does not have" is the sentence §19.6 spends on exactly this — and a malformed body from a
+   * non-holder got `400` because the ROUTE parsed before the daemon was ever called. The table's
+   * `410 worker_closed` row was unreachable for the same reason: nothing here looked at the state.
+   *
+   * EXISTENCE before the lease leaks nothing: the pending set is already public through the
+   * ungated `GET …/interactions` (rule L2). The body is parsed HERE rather than in the route or
+   * the registry because this is the one place downstream of the lease.
    */
   answerInteraction(
     id: InteractionId,
-    a: InteractionAnswer,
+    a: unknown,
     who: ClientRef & { tokenId: TokenId },
   ): InteractionAnswerResult {
-    this.#deps.lease.assertHolder(who);
+    if (this.#state === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
     const strategy = this.#deps.interactions;
-    if (strategy === undefined) {
+    if (strategy === undefined || strategy.get(id) === null) {
       // No strategy ⇒ nothing was ever parked, so there is nothing this id could name. The
       // 404 is the honest answer and it names the RESOURCE, which is exactly why
       // `interaction_not_found` exists beside `worker_not_found` (ruling M2-R2).
       throw new OmniError("interaction_not_found", `no interaction ${id} is awaiting an answer`);
     }
-    return strategy.answer(id, a, who);
+    this.#deps.lease.assertHolder(who);
+    let parsed: InteractionAnswer;
+    try {
+      parsed = InteractionAnswerBody.parse(a);
+    } catch (e) {
+      const issues = (e as { issues?: { path?: PropertyKey[]; message?: string }[] } | null)
+        ?.issues;
+      const first = Array.isArray(issues) ? issues[0] : undefined;
+      const where = (first?.path ?? []).join(".");
+      throw new OmniError(
+        "bad_request",
+        `invalid interaction answer${where === "" ? "" : ` (${where})`}: ` +
+          `${first?.message ?? "invalid"}`,
+        { cause: e },
+      );
+    }
+    return strategy.answer(id, parsed, who);
+  }
+
+  /**
+   * §19.8's first rung, callable from the REGISTRY (review finding V11).
+   *
+   * `daemon.stop()` settles every parked interaction before it drains the dispatcher and closes
+   * the workers — an agent blocked on our answer may never read the shutdown. It is idempotent
+   * and never throws: `#doClose` settles again with `"close"` and finds nothing left to hold.
+   */
+  async settleInteractions(reason: "shutdown"): Promise<void> {
+    try {
+      await this.#deps.interactions?.settleAll(reason);
+    } catch (e) {
+      this.#logger.warn("settling parked interactions failed", { reason, error: String(e) });
+    }
   }
 
   get interactions(): readonly InteractionSnapshot[] {
@@ -1902,7 +2087,13 @@ export class Worker implements WorkerHandle {
     if (provider === undefined || handle === null) return null;
     try {
       return {
-        [PATCH_META]: await this.#withDiffBudget((signal) => provider.end(handle, { signal })),
+        // `wroteFiles` is §25.4's `on_write` gate, and the PROVIDER decides what to do with it —
+        // it is the only party that holds `diff.mode` (review finding V12). `false` on a turn
+        // that touched nothing is what lets it answer `{text:""}` from the before-tree it already
+        // has instead of running a second `git add -A` + `write-tree` pair.
+        [PATCH_META]: await this.#withDiffBudget((signal) =>
+          provider.end(handle, { signal, wroteFiles: this.#turnWroteFiles }),
+        ),
       };
     } catch (e) {
       if (OmniError.is(e, "agent_timeout")) {
@@ -1928,6 +2119,22 @@ export class Worker implements WorkerHandle {
       this.#logger.warn("the diff provider failed to produce a patch", { error: String(e) });
       return null;
     }
+  }
+
+  /**
+   * §20.6's watch list, on the ONE envelope a pure fold can read it from (review finding V9).
+   *
+   * `alertOnUnpoliced` is resolved by the policy engine and nothing downstream of it knows the
+   * list; `reduceTurn` folds `unpoliced_tool_call` out of it over the tool calls and interactions
+   * it already has. Carrying it on `idle._meta` — rather than computing the warning daemon-side
+   * — is what keeps D7 true: the SDK's local `reduceTurn()` and `GET /turns/{id}` read the same
+   * key off the same envelope and cannot disagree.
+   *
+   * Absent when nothing is watched, so an M1 `idle` grows no key.
+   */
+  #policyMeta(): Record<string, unknown> {
+    const watched = this.#deps.alertOnUnpoliced ?? [];
+    return watched.length === 0 ? {} : { [POLICY_META]: { alertOnUnpoliced: [...watched] } };
   }
 
   /**

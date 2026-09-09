@@ -1,6 +1,5 @@
 import { OmniError, assertDeliveryId, assertRunId } from "@omni-acp/protocol";
 import type {
-  DeliveryId,
   DeliveryListResponse,
   DeliveryRecord,
   DeliveryStore,
@@ -23,7 +22,9 @@ import { authMiddleware, authOf } from "../auth-middleware.js";
  *
  * `tokenId` is OPTIONAL and means "no scope" — which is admin. Making the scope explicit at the
  * call site rather than implicit in a second method is what keeps the two verbs' rules identical:
- * a row a token may not LIST is a row it may not REPLAY.
+ * a row a token may not LIST is a row it may not REPLAY — and `WebhookDispatcher.redeliver` takes
+ * the same optional `tokenId` for that reason, so the REPLAY half of the rule lives on the one
+ * object that also re-runs the SSRF gate (review finding V1).
  *
  * It is declared HERE, in the route that uses it, because `http-has-no-logic` allows this layer
  * `@omni-acp/protocol` and its own siblings and nothing else — and a type describing what a route
@@ -34,7 +35,6 @@ interface OwnerScopedDeliveryStore extends DeliveryStore {
     rows: readonly DeliveryRecord[];
     cursor: string | null;
   };
-  redeliver(id: DeliveryId, nowMs: number, tokenId?: TokenId): DeliveryRecord;
 }
 
 /**
@@ -71,17 +71,24 @@ export function registerWebhookRoutes(app: Hono, daemon: Daemon): void {
     return c.json(body);
   });
 
-  app.post("/v1/webhooks/deliveries/:deliveryId/redeliver", auth, (c) => {
+  /**
+   * The replay goes through the DISPATCHER, never through the store (review finding V1).
+   *
+   * `WebhookDispatcher.redeliver` is the one code path that re-runs `assertWebhookUrl` before a
+   * replay; the store's own `redeliver` only flips the row back to `pending`, after which the
+   * background poll POSTs it. An operator replaying a dead letter hours or days later would
+   * otherwise re-send to a host whose name now resolves into `denyCidrs` — with the create-time
+   * check the only one that had ever run — which is exactly what §24.6 exists to stop.
+   *
+   * Still `parse → ONE daemon call → serialize`: the admin-or-owner scope rides on the call as
+   * `tokenId`, and `undefined` is admin, which is the same spelling `list` above uses.
+   */
+  app.post("/v1/webhooks/deliveries/:deliveryId/redeliver", auth, async (c) => {
     const who = authOf(c.req.raw);
-    const store = daemon.deliveries as OwnerScopedDeliveryStore;
     return c.json(
-      store.redeliver(
+      await daemon.dispatcher.redeliver(
         assertDeliveryId(c.req.param("deliveryId") ?? ""),
-        // The wall clock, read here because nothing on the `Daemon` contract exposes the injected
-        // one and a route may not import the library that owns it. `redeliver` schedules the row
-        // for "now"; a millisecond of skew moves nothing that matters.
-        Date.now(),
-        ...(who.role === "admin" ? [] : [who.tokenId]),
+        who.role === "admin" ? undefined : who.tokenId,
       ),
     );
   });

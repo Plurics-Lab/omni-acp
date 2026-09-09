@@ -145,6 +145,59 @@ describe("assertWebhookUrl — denyCidrs (control 2), which is ABSOLUTE", () => 
     expect(url.href).toBe("http://127.0.0.1:9000/hook");
   });
 
+  it("refuses an IPv4-MAPPED literal, in every spelling, through assertWebhookUrl", async () => {
+    // Review finding V5/V7, asserted at the layer where it was actually exploitable. `new URL()`
+    // ALWAYS re-serializes a mapped literal to the compressed hex form — `[::ffff:127.0.0.1]`
+    // comes back as `[::ffff:7f00:1]` — so a `cidrContains` test alone could never have caught
+    // this: the dotted-quad regex that used to be the only mapped fold is DEAD on this path.
+    // Proven end to end before the fix: `http://[::ffff:7f00:1]:9/hook` was ACCEPTED under the
+    // DEFAULT denyCidrs and its delivery landed on the same loopback socket
+    // `http://127.0.0.1:9/hook` was refused for.
+    const never = async (): Promise<readonly string[]> => {
+      throw new Error("the resolver must not be called for a literal address");
+    };
+    const config = cfg({ mode: "any" }); // the DEFAULT denyCidrs, unchanged
+    for (const url of [
+      "http://[::ffff:127.0.0.1]:9/hook",
+      "http://[::ffff:7f00:1]:9/hook",
+      "http://[0:0:0:0:0:ffff:7f00:1]:9/hook",
+      "http://[::ffff:169.254.169.254]/latest/meta-data/",
+      "http://[::ffff:a9fe:a9fe]/latest/meta-data/",
+      "http://[::ffff:10.0.0.5]/x",
+      "http://[::ffff:a00:5]/x",
+    ]) {
+      expect(await codeOf(assertWebhookUrl(url, config, never))).toBe("forbidden");
+    }
+    // …and the fold does not over-reach: a mapped PUBLIC address is still allowed.
+    await expect(
+      assertWebhookUrl("http://[::ffff:8.8.8.8]/x", config, never),
+    ).resolves.toBeTruthy();
+    await expect(
+      assertWebhookUrl("http://[::ffff:808:808]/x", config, never),
+    ).resolves.toBeTruthy();
+  });
+
+  it("refuses a resolver ANSWER spelled as an IPv4-mapped hex address", async () => {
+    // The DNS arm's half of V7. c-ares renders an IPv4-mapped AAAA in the dotted form today, but
+    // nothing here makes that a guarantee about every `Resolver` an embedder may wire.
+    const config = cfg({ allow: ["https://rebind.example.com"] });
+    const dns = resolver({ "rebind.example.com": ["::ffff:a9fe:a9fe"] });
+    expect(await codeOf(assertWebhookUrl("https://rebind.example.com/x", config, dns))).toBe(
+      "forbidden",
+    );
+  });
+
+  it("refuses 0.0.0.0, which is a localhost alias on Linux", async () => {
+    // Review V7's second half: the default list refused every other spelling of "this machine"
+    // and let this one through.
+    const never = async (): Promise<readonly string[]> => {
+      throw new Error("unreachable");
+    };
+    expect(
+      await codeOf(assertWebhookUrl("http://0.0.0.0:9/hook", cfg({ mode: "any" }), never)),
+    ).toBe("forbidden");
+  });
+
   it("a DNS FAILURE is a refusal, never a pass", async () => {
     // An address we could not check is not a safe one.
     const config = cfg({ mode: "any" });
@@ -189,8 +242,19 @@ describe("cidrContains", () => {
     expect(cidrContains("fe80::/10", "fec0::1")).toBe(false);
     expect(cidrContains("fc00::/7", "fd00::1")).toBe(true);
     expect(cidrContains("fc00::/7", "fe00::1")).toBe(false);
-    // `::ffff:127.0.0.1` IS 127.0.0.1, and must not be a way around an IPv4 deny rule.
+    // `::ffff:127.0.0.1` IS 127.0.0.1, and must not be a way around an IPv4 deny rule — in
+    // EVERY spelling, because the two producers that feed `assertWebhookUrl` (WHATWG `URL` and
+    // `dns.resolve6`) emit the compressed hex one (review V5/V7).
     expect(cidrContains("127.0.0.0/8", "::ffff:127.0.0.1")).toBe(true);
+    expect(cidrContains("127.0.0.0/8", "::ffff:7f00:1")).toBe(true);
+    expect(cidrContains("127.0.0.0/8", "0:0:0:0:0:ffff:7f00:1")).toBe(true);
+    expect(cidrContains("169.254.0.0/16", "::ffff:a9fe:a9fe")).toBe(true);
+    expect(cidrContains("10.0.0.0/8", "::ffff:a00:5")).toBe(true);
+    // The fold is exact rather than eager: a mapped PUBLIC address still matches nothing private,
+    // and an address one bit away from the `::ffff:0:0/96` prefix keeps its v6 identity.
+    expect(cidrContains("127.0.0.0/8", "::ffff:808:808")).toBe(false);
+    expect(cidrContains("10.0.0.0/8", "::ffff:8.8.8.8")).toBe(false);
+    expect(cidrContains("127.0.0.0/8", "::fffe:7f00:1")).toBe(false);
     // Families do not cross otherwise.
     expect(cidrContains("10.0.0.0/8", "::1")).toBe(false);
     expect(cidrContains("::1/128", "127.0.0.1")).toBe(false);

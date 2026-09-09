@@ -106,6 +106,9 @@ function recordingRegistry(o: {
     get: unimplemented("get"),
     list: () => [],
     closeAll: () => Promise.resolve(),
+    // §19.8's first rung, reachable from the registry (review finding V11). A double that holds
+    // no worker has nothing to settle, and this is a SHUTDOWN path: it must be total.
+    settleAllInteractions: () => Promise.resolve(),
     turn: unimplemented("turn"),
     adopt: () => Promise.resolve({ hibernated: 0, closed: 0, orphans: [] }),
     hibernate: unimplemented("hibernate"),
@@ -236,7 +239,15 @@ describe("POST /v1/workers/{wid}/interactions/{reqId} (H22)", () => {
     }
   });
 
-  it("a body the schema refuses is 400 and never reaches the registry", async () => {
+  /**
+   * Review finding V10. This route used to `InteractionAnswerBody.parse` the body itself, which
+   * put the SHAPE check at the very front of §19.6's order — four rows above where the table puts
+   * it — so a malformed body from a NON-HOLDER answered `400 bad_request` instead of `423
+   * lease_held`. The route now hands the raw JSON straight through; the refusal is
+   * `Worker.answerInteraction`'s, after the lease, and `core/test/worker/interaction/
+   * answer-order.test.ts` drives all four orderings through one assembled worker.
+   */
+  it("hands the body to the registry UNPARSED — §19.6 checks the shape after the lease", async () => {
     for (const body of [
       { action: "shrug" },
       { action: "allow", optionId: 7 },
@@ -245,10 +256,11 @@ describe("POST /v1/workers/{wid}/interactions/{reqId} (H22)", () => {
       null,
     ]) {
       const f = fixture();
-      const res = await f.request(USER, "POST", answerAt(), body);
-      expect(res.status).toBe(400);
-      expect(((await res.json()) as { code: string }).code).toBe("bad_request");
-      expect(f.calls).toEqual([]);
+      await f.request(USER, "POST", answerAt(), body);
+      expect(f.calls).toHaveLength(1);
+      expect(f.calls[0]?.method).toBe("answer");
+      // Verbatim: a route that reshaped it would decide the shape question it must not decide.
+      expect(f.calls[0]?.args[3]).toEqual(body);
     }
   });
 

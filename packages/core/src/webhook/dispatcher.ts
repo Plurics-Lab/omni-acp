@@ -332,13 +332,24 @@ export function createWebhookDispatcher(o: WebhookDispatcherDeps): WebhookDispat
       return deliveryId;
     },
 
-    async redeliver(id: DeliveryId): Promise<DeliveryRecord> {
+    async redeliver(id: DeliveryId, tokenId?: TokenId): Promise<DeliveryRecord> {
       const existing = store.get(id);
-      if (existing === null) throw new OmniError("worker_not_found", `no delivery ${id}`);
+      // ONE answer for "no such delivery" and for "not yours" — the second must not confirm that
+      // the id is real (D13's rule, applied to a delivery). The scope is checked HERE as well as
+      // inside `store.redeliver` because the URL re-check below runs first and must not tell an
+      // unauthorised caller whether somebody else's target is still reachable.
+      if (existing === null || (tokenId !== undefined && existing.tokenId !== tokenId)) {
+        throw new OmniError("worker_not_found", `no delivery ${id}`);
+      }
       // Re-validated, for the reason on `resolve` above: a dead letter is replayed long after it
       // was created, and the answer to "may this ADDRESS be called" may have changed since.
+      //
+      // Review finding V1 is what makes this the ONLY replay path: the daemon route used to call
+      // the STORE's `redeliver`, which flips the row to `pending` and lets the 1s poll POST it —
+      // so an operator replaying a dead letter hours later re-sent to a host whose name now
+      // resolves into `denyCidrs`, with the create-time check the only one that had ever run.
       await assertWebhookUrl(existing.url, o.config, o.resolve);
-      const record = store.redeliver(id, o.clock.now());
+      const record = store.redeliver(id, o.clock.now(), tokenId);
       void pump();
       return record;
     },

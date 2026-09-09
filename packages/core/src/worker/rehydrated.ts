@@ -70,6 +70,14 @@ export interface RehydrateDeps {
   readonly validateContent?: CreateWorkerDeps["validateContent"];
   readonly clientCapabilities?: CreateWorkerDeps["clientCapabilities"];
   readonly mcpServers?: CreateWorkerDeps["mcpServers"];
+  /**
+   * §20.6's watch list, from the engine the WAKE rebuilt (review findings V2/V8 and V9).
+   *
+   * It is forwarded for the same reason `mcpServers` is: a woken worker that stopped stamping
+   * `alertOnUnpoliced` on `idle._meta` would stop producing `unpoliced_tool_call` for exactly the
+   * kinds an operator asked never to pass unnoticed, and nothing would say so.
+   */
+  readonly alertOnUnpoliced?: CreateWorkerDeps["alertOnUnpoliced"];
 }
 
 /**
@@ -148,6 +156,7 @@ export function createRehydratedWorker(
       ? {}
       : { clientCapabilities: deps.clientCapabilities }),
     ...(deps.mcpServers === undefined ? {} : { mcpServers: deps.mcpServers }),
+    ...(deps.alertOnUnpoliced === undefined ? {} : { alertOnUnpoliced: deps.alertOnUnpoliced }),
   };
 
   // No `start()`: there is no process to open and no handshake to run. `restore` seeds the state

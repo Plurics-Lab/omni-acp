@@ -24,11 +24,21 @@ export interface RecordingNormalizer extends Normalizer {
 const running = (): NormalizedSessionUpdate =>
   ({ sessionUpdate: "state_update", state: "running" }) as unknown as NormalizedSessionUpdate;
 
-const idle = (stopReason: StopReason | null): NormalizedSessionUpdate =>
+const idle = (
+  stopReason: StopReason | null,
+  meta?: Readonly<Record<string, unknown>> | null,
+): NormalizedSessionUpdate =>
   ({
     sessionUpdate: "state_update",
     state: "idle",
     stopReason,
+    // Seam D (§5.8.5, ruling M2-R9): `TurnInput.prompt_result.meta` is merged into
+    // `state_update{idle}._meta` WITHOUT reading a single key of it. The real reducer does this
+    // and so must the double, or the two keys that ride it — `omni/patch` and `omni/policy` —
+    // are unobservable in every unit test that uses this harness.
+    ...(meta === null || meta === undefined || Object.keys(meta).length === 0
+      ? {}
+      : { _meta: meta }),
   }) as unknown as NormalizedSessionUpdate;
 
 /**
@@ -49,6 +59,8 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
   let deadline: number | null = null;
   let hardCutoff: number | null = null;
   let stopReason: StopReason | null = null;
+  /** `prompt_result.meta`, held until the settle emits `idle` — seam D's whole mechanism. */
+  let settleMeta: Readonly<Record<string, unknown>> | null = null;
   const inputs: TurnInput["type"][] = [];
   const seen: TurnInput[] = [];
 
@@ -66,6 +78,7 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
     deadline = null;
     hardCutoff = null;
     stopReason = null;
+    settleMeta = null;
   };
 
   return {
@@ -123,6 +136,7 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
         case "prompt_result": {
           state = "settling";
           stopReason = input.stopReason;
+          settleMeta = input.meta ?? null;
           hardCutoff = input.at + o.hardMs;
           deadline = Math.min(input.at + o.quietMs, hardCutoff);
           return out([], deadline, null);
@@ -134,7 +148,12 @@ export function lifecycleNormalizer(o: { quietMs: number; hardMs: number }): Rec
           const settled: SettleReason =
             hardCutoff !== null && input.at >= hardCutoff ? "hard" : "quiet";
           const emit: EventInput[] = [
-            { kind: "acp.session_update", payloadVersion: 2, turnId, payload: idle(stopReason) },
+            {
+              kind: "acp.session_update",
+              payloadVersion: 2,
+              turnId,
+              payload: idle(stopReason, settleMeta),
+            },
           ];
           reset();
           return out(emit, null, settled);

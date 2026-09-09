@@ -1,7 +1,6 @@
 import { realpath } from "node:fs/promises";
 import {
   CreateWorkerRequest,
-  InteractionAnswerBody,
   LeaseRequestBody,
   OmniError,
   PromptRequestBody,
@@ -158,6 +157,21 @@ export interface WorkerRegistryOptions {
     auth: AuthContext,
     onUnresolved: "park" | "deny" | "fail",
   ) => PolicyEngine;
+  /**
+   * The daemon's token store, and the ONE resolver of everything an `AuthContext` carries.
+   *
+   * The create path has a live `AuthContext`; the WAKE path has none — nobody holds one across a
+   * restart (ruling M1-R8) — and it needs two things the raw config cannot give it: the token's
+   * RESOLVED `cwdRoots` (review finding V3: `[]` means `homedir()` and `~` must be expanded, and
+   * `auth.ts` is where that happens) and a context to rebuild the policy engine with (review
+   * finding V2/V8). Reading them through `contextFor` is what stops the daemon growing a second
+   * spelling of either.
+   *
+   * Absent ⇒ a registry with no auth at all, which is what a unit test that constructs one
+   * directly gets: the containment gate then sees `[]` and refuses every path-bearing block, and
+   * a rehydrated worker gets no engine. Both are the fail-closed answers.
+   */
+  readonly tokens?: { contextFor(tokenId: TokenId, clientId?: string | null): AuthContext };
 }
 
 interface Entry {
@@ -194,6 +208,22 @@ interface Entry {
    * `201` body, which is why `create()` hands back a decorated handle rather than the raw one).
    */
   readonly m2: WorkerViewRows;
+  /**
+   * Why this worker may NOT be resumed, or null (§23.1, review finding V2/V8).
+   *
+   * A wake has to reproduce the environment the worker was created in. When it cannot — the
+   * owning token is gone, a policy preset was removed, the ceiling is now narrower than the
+   * worker's own rules, an MCP preset vanished from config — the honest answer is to CLOSE the
+   * worker with `acl_revoked` rather than to wake it unenforced. Set once, at rehydration.
+   */
+  readonly revoked: string | null;
+}
+
+/** What `reviveM2` rebuilt for a rehydrated worker, or why it could not. */
+interface RevivedM2 {
+  readonly engine: PolicyEngine | null;
+  readonly mcpServers: readonly unknown[];
+  readonly revoked: string | null;
 }
 
 /** The registry-owned half of a `WorkerSnapshot`, exactly the §5.8.4 rows `worker.ts` cannot fill. */
@@ -204,6 +234,16 @@ interface WorkerViewRows {
   readonly policy: WorkerSnapshot["policy"];
   /** `PolicyEngine.id` — the ENGINE's identity, for `WorkerRow.policyRef`'s audit trail. */
   readonly policyId: string | null;
+  /**
+   * `CreateWorkerRequest.policy`, verbatim — the input the engine was BUILT from (V2/V8).
+   *
+   * `policyId` identifies an engine; it cannot reconstruct one. This is what `rehydrate()` hands
+   * back to `policyFor` so a woken worker enforces the rules it was created with instead of
+   * `DEFAULT_VERDICT[onUnresolved]`.
+   */
+  readonly policySelection: ParsedCreateWorkerRequest["policy"];
+  /** §20.6's watch list from the resolved engine, threaded to `worker.ts` for `idle._meta`. */
+  readonly alertOnUnpoliced: readonly string[];
   readonly mcp: WorkerSnapshot["mcp"];
   readonly envKeys: readonly string[];
   readonly patchMode: "off" | "on_write" | "always";
@@ -221,6 +261,8 @@ const M1_VIEW: WorkerViewRows = Object.freeze({
   parkTimeoutAction: "deny",
   policy: null,
   policyId: null,
+  policySelection: undefined,
+  alertOnUnpoliced: [],
   mcp: { requested: [], applied: [], dropped: [] },
   envKeys: [],
   patchMode: "on_write",
@@ -419,6 +461,9 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       parkTimeoutAction: entry.m2.parkTimeoutAction,
       mcpNames: entry.m2.mcpNames,
       policyRef: entry.m2.policyId,
+      // The SELECTION, not just the engine id: `policyRef` is an audit trail and cannot rebuild
+      // an engine, and a wake that cannot rebuild one runs unenforced (review finding V2/V8).
+      policy: entry.m2.policySelection ?? null,
       env: entry.m2.env,
       ...(entry.m2.watchdog === null ? {} : { watchdog: entry.m2.watchdog }),
       patchMode: entry.m2.patchMode,
@@ -497,6 +542,66 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
   };
 
   /**
+   * ── review finding V2/V8: a WAKE reproduces `create()`'s M2 resolution ──────────────────────
+   *
+   * The rehydrate path used to build its interaction strategy with `onUnresolved`, the park
+   * budgets and `toSubject` — and no `decide` at all, and no `mcpServers`. So a worker adopted
+   * from a previous boot and then woken ran on `verdictFor`'s `DEFAULT_VERDICT[onUnresolved]`
+   * fallback: no rules, no `clampVerdict`, and §20.5 layer 2 — the per-subject ceiling clamp,
+   * which is the half documented as recovering the precision the static check provably cannot —
+   * stopped running entirely. Meanwhile `viewRowsOf` kept reporting `{sources, default,
+   * ruleCount, ceiling}` for an engine that no longer existed. Concretely: a worker whose policy
+   * denies `edit`/`delete` had those requests auto-denied before the restart, and after it every
+   * one of them PARKED instead — offering a human the chance to allow exactly what the policy was
+   * written to refuse.
+   *
+   * So both are rebuilt from the CURRENT config, exactly as `create()` builds them, out of the
+   * `PolicySelection` and the preset names the row persists. Rebuilding from the current config
+   * rather than from a frozen snapshot is the same rule the descriptor, the timeouts and the
+   * quirk table already follow on this path (M1-WP-C's `RehydrateDeps` header).
+   *
+   * FAIL CLOSED, never degrade: a preset that has vanished, a ceiling that is now narrower, or a
+   * token that has been removed makes this return `revoked`, and `assertMayResume` then closes
+   * the worker with `acl_revoked` — §23.1's answer, and §15.5's 403 row (review R6).
+   *
+   * An M1-written row (no `onUnresolved` at all) is left exactly as it was: it never had an
+   * engine and inventing one would give it a policy it was not created with.
+   */
+  const reviveM2 = (
+    row: WorkerRow,
+    rows: WorkerViewRows,
+    runtime: Parameters<typeof resolveMcpForWorker>[0]["descriptor"],
+    caps: Parameters<typeof resolveMcpForWorker>[0]["caps"],
+  ): RevivedM2 => {
+    const none: RevivedM2 = { engine: null, mcpServers: [], revoked: null };
+    // An M1 row, or a registry with no auth wired (a unit test that builds one directly): there
+    // is nothing to rebuild, and both readings are M1 exactly.
+    if (row.onUnresolved === undefined) return none;
+    const tokens = o.tokens;
+    if (tokens === undefined || o.policyFor === undefined) return none;
+
+    try {
+      const auth = tokens.contextFor(row.snapshot.ownerTokenId, null);
+      const engine = o.policyFor(rows.policySelection, auth, rows.onUnresolved);
+      const mcp = resolveMcpForWorker({
+        names: rows.mcpNames,
+        config: o.config,
+        allow: o.config.tokens.find((tk) => tk.id === auth.tokenId)?.mcpPresets ?? [],
+        descriptor: runtime,
+        caps,
+      });
+      return { engine, mcpServers: mcp.servers, revoked: null };
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      o.logger.warn("a persisted worker's policy or MCP presets no longer resolve", {
+        workerId: row.snapshot.workerId,
+        error: why,
+      });
+      return { engine: null, mcpServers: [], revoked: why };
+    }
+  };
+
+  /**
    * §14.8: a handle for a worker THIS PROCESS never created, built lazily and memoised.
    *
    * Lazily, because reconstructing every row at startup would make a daemon with 10 000 retained
@@ -518,6 +623,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     // (§5.8.8's "persisted BECAUSE OF THE WAKE PATH").
     const rows = viewRowsOf(row);
     const ref: { current: WorkerHandle | null } = { current: null };
+    let revived: RevivedM2 = { engine: null, mcpServers: [], revoked: null };
     let handle: WorkerHandle;
     try {
       // From the CURRENT config, never from the row (M1-WP-C's `RehydrateDeps` header): a
@@ -527,7 +633,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // when its log belongs to somebody else.
       const descriptor = o.catalog.get(row.agentId);
       const runtime = o.catalog.descriptor(row.agentId);
-      const runtimeId = o.catalog.list().find((e) => e.id === row.agentId)?.runtimeId;
+      const catalogEntry = o.catalog.list().find((e) => e.id === row.agentId);
+      const runtimeId = catalogEntry?.runtimeId;
+      // Both of `create()`'s M2 resolutions, redone from THIS boot's config (review V2/V8).
+      revived = reviveM2(row, rows, runtime, catalogEntry?.probed?.capabilities ?? null);
       // The ROW's per-worker env, re-applied over THIS boot's composition (§23.3): a woken worker
       // that lost the variables it was created with is a different worker wearing the same id,
       // which is the whole reason `WorkerRow.env` is persisted. `null` there means the request
@@ -579,6 +688,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         owner,
         // ── M2's seams, rebuilt from the ROW (M2-WP-J) ───────────────────────
         ...(() => {
+          // Narrowed ONCE, out of the mutable holder, so `decide` closes over a non-null engine.
+          const engine = revived.engine;
           const strategy = o.interactions?.({
             workerId,
             clock: o.clock,
@@ -589,6 +700,11 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
             parkTimeoutMs: rows.parkTimeoutMs,
             parkTimeoutAction: rows.parkTimeoutAction,
             responder: o.responder,
+            // The half that was missing: without it a woken worker enforced nothing at all
+            // (review finding V2/V8). Same line as the create path, same engine, same clamp.
+            ...(engine === null
+              ? {}
+              : { decide: (subject: PolicySubject) => engine.decide(subject) }),
             log,
             workerState: () => ref.current?.snapshot().state ?? "hibernated",
             toSubject: (r) =>
@@ -628,13 +744,19 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
               : { interactions: strategy, clientCapabilities: strategy.clientCapabilities }),
             ...(watchdog === undefined ? {} : { watchdog }),
             ...(rows.patchMode === "off" || o.diff === undefined ? {} : { diff: o.diff }),
+            // §23.1: a woken worker reopens its session with the SAME presets it was created
+            // with, resolved against the current config. It used to reopen with `mcpServers: []`.
+            ...(revived.mcpServers.length === 0 ? {} : { mcpServers: revived.mcpServers }),
+            ...(engine === null || engine.alertOnUnpoliced.length === 0
+              ? {}
+              : { alertOnUnpoliced: engine.alertOnUnpoliced }),
             // §26.2's gate, on the wake path too: a woken worker takes prompts, and a prompt is
             // exactly where an out-of-root `resource_link` would arrive.
             validateContent: async (content: readonly unknown[]) => {
               await assertPromptContent({
                 content,
                 cwd: row.snapshot.cwd,
-                cwdRoots: cwdRootsOf(o.config, row.snapshot.ownerTokenId),
+                cwdRoots: cwdRootsOf(o, row.snapshot.ownerTokenId),
                 promptCapabilities:
                   ref.current?.snapshot().capabilities?.promptCapabilities ?? null,
                 realpath,
@@ -673,7 +795,18 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // From the ROW, so a worker that hibernated under `park` wakes under `park` (F28/F42). A
       // row written by an M1 boot carries none of them and reads as M1, which is the honest
       // answer for a worker that was created before any of this existed.
-      m2: rows,
+      //
+      // `policy` and `alertOnUnpoliced` come from the REBUILT engine and not from the persisted
+      // snapshot: a snapshot that advertises `{sources, default, ruleCount, ceiling}` for an
+      // engine nothing rebuilt is exactly the lie review finding V2/V8 names, so a worker with no
+      // `decide` reports no policy.
+      m2: {
+        ...rows,
+        policy: revived.engine?.snapshot ?? null,
+        policyId: revived.engine?.id ?? rows.policyId,
+        alertOnUnpoliced: revived.engine?.alertOnUnpoliced ?? [],
+      },
+      revoked: revived.revoked,
       idleTimer: null,
     };
     if (OCCUPIES_A_SLOT.includes(row.snapshot.state)) reacquire(entry);
@@ -887,6 +1020,29 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
    * It runs BEFORE `reserveForWake`, so a 403 costs neither a slot nor an `npx` cold start.
    */
   const assertMayResume = async (entry: Entry, auth: AuthContext): Promise<void> => {
+    /**
+     * §23.1's row, implemented (review finding V2/V8): "a preset that vanished from config between
+     * hibernate and wake ⇒ `acl_revoked`". It sits FIRST, above the agent and cwd checks, because
+     * it is the same class of refusal — the current config forbids this worker — and because
+     * waking it would be waking it UNENFORCED, which is the outcome the whole finding is about.
+     *
+     * The worker is CLOSED rather than left hibernated: it can never be resumed under this
+     * config, and a row that answers 403 forever on every wake is a row an operator has to reap
+     * by hand. `acl_revoked` maps to `forbidden` (§9's table), which is §15.5's own 403 row.
+     */
+    const revoked = entry.revoked;
+    if (revoked !== null) {
+      await closeEntry(entry, "acl_revoked").catch((e: unknown) => {
+        o.logger.warn("closing a worker whose config no longer resolves failed", {
+          workerId: entry.id,
+          error: String(e),
+        });
+      });
+      throw new OmniError(
+        "forbidden",
+        `worker ${entry.id} cannot be resumed under the current configuration: ${revoked}`,
+      );
+    }
     auth.assertAgent(entry.agentId);
     await auth.assertCwd(entry.handle.snapshot().cwd);
   };
@@ -1105,6 +1261,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         parkTimeoutAction,
         policy: engine?.snapshot ?? null,
         policyId: engine?.id ?? null,
+        policySelection: req.policy,
+        alertOnUnpoliced: engine?.alertOnUnpoliced ?? [],
         mcp: { requested: req.mcp ?? [], applied: mcp.applied, dropped: mcp.dropped },
         envKeys: env.keys,
         patchMode,
@@ -1189,6 +1347,10 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
             ...(watchdog === undefined ? {} : { watchdog }),
             ...(diff === undefined ? {} : { diff }),
             ...(mcp.servers.length === 0 ? {} : { mcpServers: mcp.servers }),
+            // §20.6, so `unpoliced_tool_call` can be folded off `idle._meta` (V9).
+            ...(view.alertOnUnpoliced.length === 0
+              ? {}
+              : { alertOnUnpoliced: view.alertOnUnpoliced }),
             // §26.2, and the reason the guard is STRUCTURAL: this creation path MUST pass it,
             // bound to the token's `cwdRoots` and to the worker's own `promptCapabilities`. zod
             // holds neither, which is why the schema's text-only refine was deleted rather than
@@ -1221,6 +1383,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           hibernateIdleMs: idleBudget(req.idleTimeoutMs),
           idleTimer: null,
           m2: view,
+          // A worker this boot created resolved everything it needs a moment ago.
+          revoked: null,
         };
         entries.set(workerId, entry);
         watchEntry(entry);
@@ -1437,22 +1601,17 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     // The handle's own body is where the state and lease checks live (hunks 5 and 6), so an
     // un-configured daemon answers `interaction_not_found` and `-32601` here rather than a 500.
 
-    /** H22: `200 InteractionAnswerResult`. Lease-gated INSIDE the handle, exactly as `prompt` is. */
+    /**
+     * H22: `200 InteractionAnswerResult`. Lease-gated INSIDE the handle, exactly as `prompt` is.
+     *
+     * VISIBILITY FIRST (§19.6: visibility → state → existence → lease → shape → semantics), and
+     * then ONE call. The body is passed through UNPARSED — review finding V10: parsing it here
+     * made a malformed body from a non-holder a `400` where the table says `423`, and there is no
+     * way to check the shape after the lease from a caller that is above the lease.
+     */
     answer(id, auth, reqId, body): InteractionAnswerResult {
-      // VISIBILITY FIRST (§19.6: visibility → state → existence → lease → shape → …). A worker
-      // this token cannot see must answer `404` whatever is in the body; parsing first made a
-      // malformed body from a stranger a `400`, which inverts the table's first two rows.
-      //
-      // The re-parse below is not dead code even though `body` arrives typed: an in-process
-      // embedder calls this façade directly and its object has been through no route.
       const handle = get(id, auth);
-      let parsed: InteractionAnswerBody;
-      try {
-        parsed = InteractionAnswerBody.parse(body);
-      } catch (e) {
-        throw badRequest(e, "invalid interaction answer");
-      }
-      return handle.answerInteraction(assertInteractionId(reqId), parsed, {
+      return handle.answerInteraction(assertInteractionId(reqId), body, {
         ...auth.asClientRef(),
         tokenId: auth.tokenId,
       });
@@ -1478,6 +1637,23 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // The same line `prompt` carries, for the same reason.
       if (entry.handle.snapshot().state === "hibernated") await assertMayResume(entry, auth);
       return await entry.handle.setConfig(parsed, auth.asClientRef());
+    },
+
+    /**
+     * §19.8 / §24.4 rule 5's FIRST rung, so `daemon.stop()` can run it before anything else
+     * (review finding V11).
+     *
+     * Best effort over the fleet and never a throw: one worker that cannot settle must not hold a
+     * shutdown open, and `Worker.settleInteractions` already swallows its own failures. Only LIVE
+     * entries are visited — a hibernated or closed worker holds no JSON-RPC promise by definition.
+     */
+    async settleAllInteractions(): Promise<void> {
+      await Promise.all(
+        [...entries.values()].map(async (entry) => {
+          if (entry.handle.snapshot().state === "closed") return;
+          await entry.handle.settleInteractions("shutdown");
+        }),
+      );
     },
 
     /** A hibernated worker owns no process, so it is bounded separately from `maxWorkers` (H14). */
@@ -1680,6 +1856,7 @@ function decorateHandle(handle: WorkerHandle, snapshot: () => WorkerSnapshot): W
       return snapshot();
     },
     answerInteraction: (id, a, who) => handle.answerInteraction(id, a, who),
+    settleInteractions: (reason) => handle.settleInteractions(reason),
     setConfig: (body, who) => handle.setConfig(body, who),
     cancelInternal: (reason) => handle.cancelInternal(reason),
   };
@@ -1699,6 +1876,11 @@ function viewRowsOf(row: WorkerRow): WorkerViewRows {
     parkTimeoutAction: row.parkTimeoutAction ?? M1_VIEW.parkTimeoutAction,
     policy: row.snapshot.policy ?? null,
     policyId: row.policyRef ?? null,
+    // The INPUT the engine was built from, so `reviveM2` can rebuild it. `undefined` on an M1 row
+    // and on a worker that asked for no policy are the same call to `policyFor`, which is what
+    // `create()` does with `req.policy` too.
+    policySelection: row.policy ?? undefined,
+    alertOnUnpoliced: [],
     mcp: row.snapshot.mcp ?? { requested: row.mcpNames ?? [], applied: [], dropped: [] },
     envKeys: row.snapshot.envKeys ?? Object.keys(row.env ?? {}),
     patchMode: row.patchMode ?? M1_VIEW.patchMode,
@@ -1807,13 +1989,29 @@ function fireWatchdog(o: {
 }
 
 /**
- * The token's `cwdRoots` as the CURRENT config declares them.
+ * The token's `cwdRoots`, RESOLVED — the same list the create path binds the gate to.
  *
- * A rehydrated worker has no `AuthContext` — nobody is holding it across a restart (ruling
- * M1-R8) — and §26.2 binds the content gate to the token's roots, so they are read from the
- * config the same way `whoami`'s reporting fields are. A token the operator has since removed
- * resolves to `[]`, which refuses every `resource_link` and is the fail-closed answer.
+ * A rehydrated worker has no `AuthContext` (nobody holds one across a restart, ruling M1-R8) and
+ * §26.2 binds the content gate to the token's roots, so this used to read `config.tokens.find(…)
+ * ?.cwdRoots ?? []` directly. Review finding V3 is what that cost: `TokenConfig.cwdRoots` is
+ * `z.array(z.string()).default([])` — UNEXPANDED and UNRESOLVED — while the authoritative
+ * resolution lives in `auth.ts`'s `toEntry`, which turns `[]` into `[homedir()]` and `resolvePath`s
+ * every entry. So the one containment root list in the daemon had two spellings: with the common
+ * `cwdRoots: []` a woken worker's gate got `[]` and `assertPromptContent` threw `internal`
+ * ("prompt containment is mis-bound: no cwdRoots") — a 500 on every path-bearing prompt block —
+ * and with `["~/work"]` the unexpanded `~` failed the cwd-inside-roots assertion instead.
+ *
+ * Both directions failed CLOSED, which is why this is a correctness bug rather than a hole; the
+ * fix is to delete the second spelling. A token the operator has since removed throws
+ * `unauthorized` out of `contextFor` and resolves to `[]` here, which refuses every
+ * `resource_link` and is still the fail-closed answer.
  */
-function cwdRootsOf(config: ResolvedDaemonConfig, tokenId: TokenId): readonly string[] {
-  return config.tokens.find((t) => t.id === tokenId)?.cwdRoots ?? [];
+function cwdRootsOf(o: WorkerRegistryOptions, tokenId: TokenId): readonly string[] {
+  const tokens = o.tokens;
+  if (tokens === undefined) return [];
+  try {
+    return tokens.contextFor(tokenId, null).cwdRoots;
+  } catch {
+    return [];
+  }
 }

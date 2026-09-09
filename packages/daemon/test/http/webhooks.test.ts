@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DaemonConfig,
   HEADER,
@@ -13,13 +13,14 @@ import {
   type DeliveryRecord,
   type DeliveryStore,
   type ResolvedDaemonConfig,
+  type Resolver,
   type RunId,
   type Seq,
   type TokenId,
   type WorkerId,
 } from "@omni-acp/protocol";
-import { openPersistence } from "@omni-acp/core";
-import { fakeClock, nullLogger, stubDaemon } from "@omni-acp/testkit";
+import { createWebhookDispatcher, openPersistence } from "@omni-acp/core";
+import { fakeClock, nullLogger, seqIds, stubDaemon } from "@omni-acp/testkit";
 import { createTokenStore } from "../../src/auth.js";
 import { createHttpApp } from "../../src/http/app.js";
 
@@ -51,6 +52,9 @@ function config(dataDir: string): ResolvedDaemonConfig {
   return DaemonConfig.parse({
     dataDir,
     eventLog: { driver: "sqlite" },
+    // `mode:"any"` so the SSRF gate's verdict is decided by `denyCidrs` and the RESOLVER alone,
+    // which is what the redelivery re-check test below moves.
+    webhooks: { enabled: true, mode: "any" },
     tokens: [
       { id: "admin", role: "admin", secretSha256: hashSecret(SECRETS["admin"] ?? "") },
       { id: "alice", role: "user", secretSha256: hashSecret(SECRETS["alice"] ?? "") },
@@ -62,6 +66,10 @@ function config(dataDir: string): ResolvedDaemonConfig {
 interface Rig {
   readonly daemon: Daemon;
   readonly deliveries: DeliveryStore;
+  /** What the SSRF gate's resolver answers for `hooks.example.com`, movable mid-test. */
+  resolvesTo(...addresses: readonly string[]): void;
+  /** Every URL the dispatcher actually POSTed to. */
+  readonly posted: readonly string[];
   request(who: string | null, method: string, path: string): Promise<Response>;
   /** Close and re-open the same data dir — the restart, without the temp dir going. */
   restart(): Promise<void>;
@@ -93,20 +101,57 @@ async function rig(): Promise<Rig> {
    * real, and it is also closer to what `create-daemon.ts` does: the store is a member, not a
    * snapshot of one.
    */
-  const deliveries: DeliveryStore = {
+  const deliveries: DeliveryStore & {
+    get(id: DeliveryId): { url: string; tokenId: TokenId } | null;
+    redeliver(id: DeliveryId, nowMs: number, tokenId?: TokenId): DeliveryRecord;
+  } = {
     enqueue: (r) => handle.deliveries.enqueue(r),
     due: (nowMs, limit) => handle.deliveries.due(nowMs, limit),
     claim: (id, bootId, nowMs) => handle.deliveries.claim(id, bootId, nowMs),
     settle: (r) => handle.deliveries.settle(r),
     requeueStale: (bootId, nowMs) => handle.deliveries.requeueStale(bootId, nowMs),
     list: (o) => handle.deliveries.list(o),
+    // `get` is the row the DISPATCHER reads before it re-runs the SSRF gate on a replay, so the
+    // facade has to carry it too — a delegating double that stopped one method short of the real
+    // store is how the wiring under test would answer 500 instead of 403 (review finding V1).
+    get: (id) => handle.deliveries.get(id),
     redeliver: (id, nowMs, tokenId?: TokenId) => handle.deliveries.redeliver(id, nowMs, tokenId),
   };
+
+  /**
+   * The REAL dispatcher, over the real store — because `POST …/redeliver` goes through it now
+   * (review finding V1) and it is the only thing that re-runs `assertWebhookUrl` before a replay.
+   * A double here would let the route look wired while the gate never ran, which is precisely the
+   * shape of the bug: `WebhookDispatcher.redeliver` had a passing unit test and no caller.
+   */
+  let answers: readonly string[] = ["93.184.216.34"];
+  const posted: string[] = [];
+  const resolve: Resolver = (hostname: string) => {
+    if (hostname !== "hooks.example.com") throw new Error(`unexpected lookup: ${hostname}`);
+    return Promise.resolve(answers);
+  };
+  const dispatcher = createWebhookDispatcher({
+    store: deliveries,
+    config: resolved.webhooks,
+    secrets: resolved.webhooks.secrets,
+    tokenSecrets: { alice: "alice-webhook-signing-key", admin: "admin-webhook-signing-key" },
+    bootId: "boot_test",
+    clock,
+    ids: seqIds(),
+    logger: nullLogger(),
+    resolve,
+    // No socket, ever: the dispatcher pumps on its own after a successful redeliver.
+    fetch: (input) => {
+      posted.push(String(input));
+      return Promise.resolve(new Response("", { status: 200 }));
+    },
+  });
 
   const daemon = stubDaemon({
     config: resolved,
     authenticate: (headers: Headers) => tokens.verify(headers),
     deliveries,
+    dispatcher,
     fetch: (req: Request) =>
       Promise.resolve(app?.fetch(req) ?? new Response(null, { status: 500 })),
   });
@@ -115,6 +160,10 @@ async function rig(): Promise<Rig> {
   return {
     daemon,
     deliveries,
+    posted,
+    resolvesTo(...addresses: readonly string[]): void {
+      answers = addresses;
+    },
     request: (who, method, path) =>
       daemon.fetch(
         new Request(`http://daemon.invalid${path}`, {
@@ -321,6 +370,7 @@ describe("webhook routes (H26)", () => {
       "POST",
       `/v1/webhooks/deliveries/${deliveryId(1)}/redeliver`,
     );
+    if (res.status !== 200) throw new Error(`${String(res.status)}: ${await res.text()}`);
     expect(res.status).toBe(200);
     const record = (await res.json()) as DeliveryRecord;
     // The SAME id, and `attempt` back to 0: a dead-letter REPLAY, not a second event.
@@ -359,6 +409,61 @@ describe("webhook routes (H26)", () => {
     const res = await r.request("alice", "POST", "/v1/webhooks/deliveries/nope/redeliver");
     expect(res.status).toBe(400);
     expect(((await res.json()) as { message: string }).message).toBe("malformed delivery id");
+  });
+
+  /**
+   * Review finding V1, end to end over the real route, the real store and the real dispatcher.
+   *
+   * The route used to call the delivery STORE's `redeliver`, which only flips the row back to
+   * `pending`; the background poll then POSTed it. So the SSRF gate ran exactly once, at CREATE,
+   * and an operator replaying a dead letter hours or days later re-sent to whatever the name
+   * resolves to NOW — which is the DNS-rebinding-to-metadata case §24.6 exists for.
+   *
+   * Reverting the route to `store.redeliver(...)` makes the second block answer `200` and the
+   * receiver get a POST, which is exactly the behaviour that was shipped.
+   */
+  it("a REDELIVERY re-runs the SSRF gate, so a name that has since rebound is refused", async () => {
+    const r = await make();
+    seed(r, 1, "alice");
+    r.deliveries.claim(deliveryId(1), "boot_a", T0);
+    r.deliveries.settle({
+      deliveryId: deliveryId(1),
+      ok: false,
+      status: 500,
+      error: "receiver answered 500",
+      responseMs: 4,
+      nextAttemptMs: null,
+      state: "failed",
+      nowMs: T0 + 4,
+    });
+
+    // Hours later, the same NAME resolves into the metadata range.
+    r.resolvesTo("169.254.169.254");
+    const rebound = await r.request(
+      "alice",
+      "POST",
+      `/v1/webhooks/deliveries/${deliveryId(1)}/redeliver`,
+    );
+    expect(rebound.status).toBe(403);
+    const body = (await rebound.json()) as { code: string; message: string };
+    expect(body.code).toBe("forbidden");
+    expect(body.message).toContain("169.254.169.254");
+    // Refused BEFORE the write: the dead letter is still a dead letter, so the poll that would
+    // have sent it has nothing to pick up.
+    expect(r.deliveries.list({ limit: 1 }).rows[0]?.state).toBe("failed");
+    expect(r.posted).toEqual([]);
+
+    // …and the gate is not simply always-closed: back on a public address it replays and SENDS.
+    r.resolvesTo("93.184.216.34");
+    const ok = await r.request(
+      "alice",
+      "POST",
+      `/v1/webhooks/deliveries/${deliveryId(1)}/redeliver`,
+    );
+    expect(ok.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(r.posted).toEqual(["https://hooks.example.com/x"]);
+    });
   });
 
   it("redelivering an id nobody enqueued is a 404", async () => {

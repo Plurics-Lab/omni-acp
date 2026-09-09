@@ -32,6 +32,12 @@
 //   HYBRID_SESSION_DIR=<dir>   where sessions are persisted so a LATER PROCESS can resume one.
 //                              Default `<tmpdir>/omni-hybrid-sessions`; never the cwd, so a test
 //                              that hands this agent `process.cwd()` does not write to the repo.
+//   HYBRID_ASK=1               ALSO request `session/request_permission` for an `edit` tool call
+//                              whose `locations[]` point inside the session's cwd, and swallow
+//                              whatever comes back. It exists because this is the ONE fixture
+//                              that implements a real resume, so it is the only one that can show
+//                              what a woken worker's policy engine does — review finding V2/V8,
+//                              where a restart silently left the engine unbuilt.
 //
 // RESUME (M1). This fixture already ADVERTISED `loadSession: true` and
 // `sessionCapabilities.resume` — claude-acp's own handshake — while implementing neither, so
@@ -61,6 +67,7 @@ const IGNORE_EOF = process.env.HYBRID_IGNORE_EOF === "1";
 const FATAL_STDERR = process.env.HYBRID_FATAL_STDERR === "1";
 const NEVER_ANSWER = process.env.HYBRID_NEVER_ANSWER === "1";
 const RATE_LIMIT = process.env.HYBRID_RATE_LIMIT ?? "";
+const ASK = process.env.HYBRID_ASK === "1";
 const SESSION_DIR = process.env.HYBRID_SESSION_DIR ?? join(tmpdir(), "omni-hybrid-sessions");
 
 // ── the session store: one small JSON file per session, keyed by id ──────────
@@ -271,6 +278,45 @@ acp
       // ONE COMPLETE LINE. §13.4's stderr signal keys on a whole line precisely because a
       // partial one can match a pattern that the full line would not.
       process.stderr.write("FATAL: hybrid fixture cannot continue\n");
+    }
+
+    if (ASK) {
+      // A SECOND tool call, this one asking. `kind:"edit"` with a location inside the session's
+      // own cwd is the subject a `src-edit`-shaped rule is written against, and the options are
+      // the three claude-acp offers (F26's menu, minus nothing).
+      const cwd = readSession(sessionId)?.cwd ?? process.cwd();
+      await send({
+        sessionUpdate: "tool_call",
+        toolCallId: "hybrid-call-2",
+        title: "Write notes.md",
+        kind: "edit",
+        status: "pending",
+        locations: [{ path: join(cwd, "notes.md") }],
+      });
+      try {
+        await ctx.client.request("session/request_permission", {
+          sessionId,
+          toolCall: {
+            toolCallId: "hybrid-call-2",
+            title: "Write notes.md",
+            kind: "edit",
+            locations: [{ path: join(cwd, "notes.md") }],
+          },
+          options: [
+            { optionId: "allow-once", name: "Yes", kind: "allow_once" },
+            { optionId: "allow-always", name: "Yes, always", kind: "allow_always" },
+            { optionId: "reject", name: "No", kind: "reject_once" },
+          ],
+        });
+      } catch {
+        // A `-32603` is a legitimate answer (D4 rule 4) and this fixture is not the party that
+        // decides what it means; the DECISION envelope is what a test reads.
+      }
+      await send({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "hybrid-call-2",
+        status: "completed",
+      });
     }
 
     // A tool that failed ON ITS OWN MERITS — no permission was ever requested, so `verdict`

@@ -515,11 +515,18 @@ export const WebhookConfig = z.object({
   mode: z.enum(["allowlist", "any"]).default("allowlist"),
   /** Exact scheme+host+port, no wildcards. */
   allow: z.array(z.string().url()).default([]),
-  /** CIDRs the RESOLVED address may never be in. Blocks DNS rebinding to cloud metadata. */
+  /**
+   * CIDRs the RESOLVED address may never be in. Blocks DNS rebinding to cloud metadata.
+   *
+   * `0.0.0.0/8` is here because `0.0.0.0` is a standard localhost alias on Linux — a connect to
+   * it reaches the loopback interface exactly as `127.0.0.1` does — and review finding V7 caught
+   * it ALLOWED under a default that already refused every other spelling of "this machine".
+   */
   denyCidrs: z
     .array(z.string())
     .default([
       "127.0.0.0/8",
+      "0.0.0.0/8",
       "::1/128",
       "169.254.0.0/16",
       "fe80::/10",

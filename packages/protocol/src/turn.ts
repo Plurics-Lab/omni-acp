@@ -1,4 +1,5 @@
 import type { StopReason, ToolCallContent, ToolCallStatus } from "./acp.js";
+import type { PolicyAction } from "./config.js";
 import type { OmniErrorBody, OmniErrorCode } from "./errors.js";
 import type {
   EventEnvelope,
@@ -196,6 +197,17 @@ const WARNINGS_META = "omni/warnings";
  */
 const PATCH_META = "omni/patch";
 
+/**
+ * M2-B, §20.6. `{alertOnUnpoliced: string[]}` — the resolved watch list, stamped on `idle` by
+ * `worker.ts` because the fold below holds no policy engine and no config.
+ *
+ * Review finding V9: `unpolicedToolCalls` had unit tests and ZERO production callers, so
+ * `alertOnUnpoliced` was a config key that did nothing. Deriving the warning HERE — from an
+ * envelope, in the one fold both the SDK and `GET /turns/{id}` run — is what keeps D7 true; a
+ * daemon-side post-pass would have made the two disagree.
+ */
+const POLICY_META = "omni/policy";
+
 /** Only reachable when `reduceTurn` is asked about a turn no envelope mentions. */
 const UNKNOWN_WORKER_ID = "w_unknown" as WorkerId;
 
@@ -255,6 +267,8 @@ interface Fold {
   vendorPatch: TurnResult["vendorPatch"];
   /** M1 (§13.4). The advisories the Normalizer stamped on `idle`, before this fold adds its own. */
   streamWarnings: TurnWarning[];
+  /** M2 (§20.6). Read off `state_update{idle}._meta["omni/policy"]`; absent ⇒ nothing is watched. */
+  alertOnUnpoliced: readonly string[];
   /** Tool calls THIS daemon denied, from our OWN `omni.policy_decision` — never from prose. */
   denied: string[];
   deniedTitles: Map<string, string>;
@@ -376,6 +390,94 @@ function readWarnings(raw: unknown): TurnWarning[] {
   });
 }
 
+/**
+ * The clamp's other half: it is announced on the TURN as well as on the decision (§20.5).
+ *
+ * A policy that is quietly narrower than it reads is how an operator plans around a rule that
+ * never fires, so §20.5 requires both records and this is the one that reaches `TurnResult`.
+ * `null` when nothing was clamped, so a caller can append it unconditionally.
+ *
+ * It takes the three fields it reads rather than a `PolicyVerdict`, which is what lets BOTH
+ * callers use it: `reduceTurn` folds it out of `omni.policy_decision` (review finding V9 — it had
+ * no production caller at all before), and a verdict is still structurally assignable, so
+ * `@omni-acp/core`'s `policyClampWarning(verdict)` is unchanged.
+ *
+ * Owned by M2-B-WP-P.
+ */
+export function policyClampWarning(v: {
+  readonly clamped: { readonly from: PolicyAction; readonly by: string } | null;
+  readonly action: string;
+  readonly rule: string;
+}): TurnWarning | null {
+  if (v.clamped === null) return null;
+  return {
+    code: "policy_clamped",
+    message: `"${v.clamped.from}" was narrowed to "${v.action}" by ${v.clamped.by}`,
+    source: "policy",
+    detail: { from: v.clamped.from, to: v.action, by: v.clamped.by, rule: v.rule },
+  };
+}
+
+/** `omni/policy.alertOnUnpoliced`, read as data: anything that is not a list of strings is `[]`. */
+function readStringList(raw: unknown): readonly string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x): x is string => typeof x === "string");
+}
+
+/**
+ * §20.6 - the thing that is invisible in the frame.
+ *
+ * F40: a read-only `ls -A <cwd>` (`kind:"execute"`) ran to `completed` with NO permission request,
+ * while `python3 -c ...` in the same cwd raised one. The split is decided inside the host and is
+ * not visible anywhere in the `tool_call` frame, so the daemon CANNOT predict which calls will
+ * reach the engine.
+ *
+ * Two consequences, both binding: policy is evaluated on what actually ARRIVES, never on what we
+ * expected to arrive; and "no permission request" must never be read as "no tool ran".
+ * `PolicyPreset.alertOnUnpoliced` lists the kinds that must never pass unnoticed, and a tool call
+ * of a listed kind that never reached the engine becomes
+ * `TurnWarning{code:"unpoliced_tool_call", source:"policy"}` on the turn.
+ *
+ * PURE, and deliberately a fold over what the turn already has: the tool calls it saw and the
+ * interactions it recorded. It invents nothing about the agent - it reports a gap between two
+ * things we watched.
+ *
+ * It lives in `protocol` rather than in `core/policy` (where it was written, and where
+ * `@omni-acp/core` still re-exports it from) for ONE reason: `reduceTurn` is the only caller that
+ * can keep D7 - the SDK's local fold and `GET /turns/{id}` must not disagree - and `protocol` may
+ * not import `core`. Review finding V9 is what moved it: it had unit tests and no caller at all.
+ *
+ * Owned by M2-B-WP-P.
+ */
+export function unpolicedToolCalls(o: {
+  readonly alertOnUnpoliced: readonly string[];
+  readonly toolCalls: readonly Pick<ToolCallView, "toolCallId" | "kind">[];
+  readonly interactions: readonly Pick<InteractionRecord, "toolCallId">[];
+}): readonly TurnWarning[] {
+  if (o.alertOnUnpoliced.length === 0) return [];
+  const watched = new Set(o.alertOnUnpoliced);
+  const policed = new Set(
+    o.interactions.map((i) => i.toolCallId).filter((id): id is string => id !== null),
+  );
+
+  const out: TurnWarning[] = [];
+  const seen = new Set<string>();
+  for (const call of o.toolCalls) {
+    const kind = call.kind;
+    if (kind === null || !watched.has(kind)) continue;
+    if (policed.has(call.toolCallId)) continue;
+    if (seen.has(call.toolCallId)) continue;
+    seen.add(call.toolCallId);
+    out.push({
+      code: "unpoliced_tool_call",
+      message: `a "${kind}" tool call ran without reaching the policy engine`,
+      source: "policy",
+      detail: { toolCallId: call.toolCallId, kind },
+    });
+  }
+  return out;
+}
+
 function upsertToolCall(f: Fold, payload: Record<string, unknown>): void {
   const id = str(payload["toolCallId"]);
   if (id === null) return;
@@ -446,6 +548,9 @@ function applySessionUpdate(f: Fold, seq: Seq, payload: Record<string, unknown>)
         if (meta !== null) {
           f.vendorPatch = readVendorPatch(meta[VENDOR_PATCH_META]) ?? f.vendorPatch;
           f.streamWarnings.push(...readWarnings(meta[WARNINGS_META]));
+          // §20.6's watch list, read as data and never trusted as shape (the same defensive
+          // reading `readPatch` gets, and for the same reason: this key crosses a wire).
+          f.alertOnUnpoliced = readStringList(record(meta[POLICY_META])?.["alertOnUnpoliced"]);
           // M2, seam D. The reducer that stamped this key does not know what it means; this
           // does, and it is the only place that does (ruling M2-R9).
           if (PATCH_META in meta) {
@@ -518,6 +623,7 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
     tokens: null,
     vendorPatch: null,
     streamWarnings: [],
+    alertOnUnpoliced: [],
     denied: [],
     deniedTitles: new Map(),
     patch: null,
@@ -632,18 +738,78 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
             source: "policy",
           });
         }
+        /**
+         * §20.5's OTHER half, and review finding V9's first item: a ceiling clamp is announced on
+         * the DECISION and on the TURN, and only the first of the two was ever built.
+         *
+         * "A policy that is quietly narrower than it reads is how an operator plans around a rule
+         * that never fires" — so the warning is derived here, from the envelope the clamp is
+         * already recorded on, rather than by a caller who has to remember to ask for it.
+         */
+        const clamp = policyClampWarning({
+          clamped: e.payload.clamped ?? null,
+          action: e.payload.decision,
+          rule: e.payload.rule,
+        });
+        if (clamp !== null) f.streamWarnings.push(clamp);
+        /**
+         * M2-R19's third announcement (review finding V9's last item). F26: after ONE
+         * `allow_always` the host never consults us again for that session and NOTHING on the
+         * wire says so, which is precisely why `interaction.allowAlways:"human"` costs three
+         * announcements — the strategy's log line, `blindsPolicy` on the decision, and this.
+         */
+        if (e.payload.blindsPolicy === true) {
+          f.streamWarnings.push({
+            code: "policy_blinded",
+            message:
+              `a session-wide grant was selected for interaction ${e.payload.requestId}; ` +
+              "the policy engine will not be consulted again for this session",
+            source: "policy",
+            detail: { requestId: e.payload.requestId, optionId: e.payload.optionId },
+          });
+        }
         break;
       }
       case "omni.error":
         f.error = errorBody(e.payload);
         break;
-      case "acp.interaction":
+      case "acp.interaction": {
         // Folded ONLY for the pending set (§5.8.5): `pending` MEANS parked (ruling M2-R5), so a
         // `pending` envelope adds and any other status removes. The RECORD still comes from
         // `omni.policy_decision` alone, so this fold keeps one source of truth per field.
-        if (e.payload.status === "pending") f.pending.add(e.payload.requestId);
-        else f.pending.delete(e.payload.requestId);
+        if (e.payload.status === "pending") {
+          f.pending.add(e.payload.requestId);
+          break;
+        }
+        f.pending.delete(e.payload.requestId);
+        /**
+         * §19.9's two advisories, and review finding V9 found neither of them anywhere in the
+         * repository outside CONTRACTS.md.
+         *
+         * They are derived HERE and not from `omni.policy_decision`, because this is the envelope
+         * that carries `status` and the elicitation's `action` — F31 says accept and decline are
+         * indistinguishable in the agent's own stream, so this record is the ONLY place the
+         * outcome exists at all.
+         */
+        if (e.payload.status === "expired") {
+          f.streamWarnings.push({
+            code: "interaction_expired",
+            message: `interaction ${e.payload.requestId} expired with no answer`,
+            source: "policy",
+            detail: { requestId: e.payload.requestId, method: e.payload.method },
+          });
+        }
+        const action = e.payload.answer?.action;
+        if (action === "decline" || action === "cancel") {
+          f.streamWarnings.push({
+            code: "interaction_declined",
+            message: `interaction ${e.payload.requestId} was ${action}d`,
+            source: "policy",
+            detail: { requestId: e.payload.requestId, action, method: e.payload.method },
+          });
+        }
         break;
+      }
       case "omni.worker_state":
       case "omni.run":
         break;
@@ -718,6 +884,16 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
   const pendingInteractions = [...f.pending];
 
   const warnings: TurnWarning[] = [...f.streamWarnings];
+  // §20.6, F40: a tool call of a WATCHED kind that never reached the policy engine. The list
+  // came off `idle._meta["omni/policy"]`, which is what lets this stay a pure fold — and what
+  // makes `alertOnUnpoliced` a config key that finally does something (review finding V9).
+  warnings.push(
+    ...unpolicedToolCalls({
+      alertOnUnpoliced: f.alertOnUnpoliced,
+      toolCalls,
+      interactions: f.interactions,
+    }),
+  );
   for (const id of deniedToolCalls) {
     warnings.push({
       code: "tool_denied",

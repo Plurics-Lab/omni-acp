@@ -174,7 +174,7 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
         failTurn: null,
       });
     }
-    return await park(req, ctx);
+    return await park(req, ctx, verdict);
   }
 
   /** The auto-resolved arms: two envelopes, in M1's order, and nothing is ever held. */
@@ -205,7 +205,11 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
   }
 
   /** The park arm. Emits n+0, parks (n+1), arms the deadline, and holds the promise open. */
-  async function park(req: InteractionRequest, ctx: InteractionContext): Promise<unknown> {
+  async function park(
+    req: InteractionRequest,
+    ctx: InteractionContext,
+    verdict: PolicyVerdict,
+  ): Promise<unknown> {
     const parkedAtMs = o.clock.now();
     const expiresAtMs = parkTimeoutMs > 0 ? parkedAtMs + parkTimeoutMs : null;
     const block: ParkBlock = {
@@ -246,6 +250,10 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
       held = registry.hold(req, {
         expiresAtMs,
         onTimeout: o.parkTimeoutAction,
+        // Review finding V9: a verdict clamped from `allow` to `park` is the one clamp that turns
+        // an auto-allow into a human decision, and it used to vanish here — every settlement built
+        // afterwards hard-coded `clamped: null`, so `omni.policy_decision` never carried it.
+        clamped: verdict.clamped,
         emit: (inputs) => {
           ctx.emit(inputs);
         },
@@ -288,6 +296,7 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
           byToken: null,
           rule: `m2:parkTimeout:${o.parkTimeoutAction}`,
           ruleSource: "default",
+          clamped: held.clamped,
           parkedMs: held.parkedMs(o.clock.now()),
         }),
       "timeout",
@@ -445,7 +454,9 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
       rule: `human:${who.tokenId}`,
       // A human is not a rule SOURCE; naming one would claim a policy document decided this.
       ruleSource: null,
-      clamped: null,
+      // …but the CLAMP that made this a human decision at all is still the truth about it
+      // (review finding V9): `allow` narrowed to `park` by a ceiling is why anyone was asked.
+      clamped: held.clamped,
       parkedMs: held.parkedMs(o.clock.now()),
     };
 
@@ -622,7 +633,9 @@ export function createInteractionStrategy(o: InteractionStrategyDeps): Interacti
       byToken: null,
       rule: expired ? `m2:parkTimeout:${o.parkTimeoutAction}` : `m2:settle:${reason}`,
       ruleSource: "default" as const,
-      clamped: null,
+      // The clamp that parked it survives the teardown: the audit's question is why a human was
+      // asked, and that answer does not change because nobody answered (review finding V9).
+      clamped: held.clamped,
       parkedMs: held.parkedMs(o.clock.now()),
       blindsPolicy: false,
       status: (expired ? "expired" : "cancelled") as "expired" | "cancelled",
@@ -669,7 +682,7 @@ interface HumanOptions {
   readonly byToken: TokenId;
   readonly rule: string;
   readonly ruleSource: null;
-  readonly clamped: null;
+  readonly clamped: PolicyVerdict["clamped"];
   readonly parkedMs: number;
 }
 

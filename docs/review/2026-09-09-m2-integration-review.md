@@ -197,3 +197,74 @@ mode=always  : 6 git commands   （逐字相同）
 ```
 
 §11.9 拿来当缓解措施的那个开关，今天一次 `git add -A` 都没省下。
+
+---
+
+## 处理记录（2026-09-09，修复轮第二次）
+
+十二条全部处理完毕。**每一条都配了一个在 revert 掉生产改动后会红的测试**，下表最后一列写的就是那个测试，
+以及它在缺少修复时实际报出来的断言。全量 `pnpm -r build && pnpm test` 绿：**222 files / 3305 passed /
+157 skipped**；`pnpm lint` 与 `prettier --check` 干净。
+
+`docs/CONTRACTS.md` 与 `docs/M2-PLAN.md` 已随之更新：契约改动写在它们各自的段落里（§19.6 的检查顺序、
+§19.7 rule 1/5、§19.8 的调用方、§19.9 的两条 advisory、§20.5/§20.6、§23.1 的唤醒重解析、§24.2 的
+schema v3、§24.4 rule 5 的停机阶梯、§24.6 的 redeliver 复检与数值折叠、§25.4 的 `on_write`、§26.2 的
+两个注入点），M2-PLAN 新增 §5.3 汇总，并修订了 §5.2 里被本轮推翻的第 3、5 两行。
+
+### 逐条
+
+| # | 结论 | 落点 | 回归测试（revert 后报什么） |
+| - | ---- | ---- | ---- |
+| V1 | 修 | `POST …/redeliver` 改走 `Daemon.dispatcher`；`WebhookDispatcher.redeliver(id, tokenId?)` | `daemon/test/http/webhooks.test.ts` "a REDELIVERY re-runs the SSRF gate…"：revert 后 `expected 200 to be 403` |
+| V2 / V8 | 修 | 唤醒路径重建引擎与 MCP；`WorkerRow` 的 M2 字段真正落盘（schema v3） | `tests/integration/src/restart-policy.itest.ts`（3 例）+ `daemon/test/registry-wake.test.ts`（3 例）：revert `decide` 后 `expected 'deny' to be 'allow'`，revert 落盘后再多一条 `expected 'deny' to be 'park'` |
+| V3 | 修 | `cwdRootsOf` 走 token store | `daemon/test/registry-wake.test.ts` "binds it to the RESOLVED cwdRoots…"：revert 后 `'…: no cwdRoots'` ≠ `'…: cwd is outside cwdRoots'`；`core/test/worker/prompt-content.test.ts` 的结构审计同时转红 |
+| V4 | 修 | `#assertOffered` 也作用于注入的 strategy | `core/test/worker/interaction/emit-guard.test.ts`：revert 后伪造的 `optionId` 与 `cancelled` 都原样上线 |
+| V5 / V7 | 修（本轮之前已在工作树里，本次一并提交） | `toBytes` 数值折叠 `::ffff:0:0/96`；默认 `denyCidrs` 加 `0.0.0.0/8` | `core/test/webhook/guard.test.ts` 在 `assertWebhookUrl` 这一层的三个新用例 |
+| V6 | 修 | `stop()` 后 `runs`/`deliveries`/`dispatcher` 抛 typed `OmniError` | `daemon/test/create-daemon.test.ts` "refuses the run and delivery verbs with a TYPED error…"：revert 后 `expected Error: database is not open to be an instance of OmniError` |
+| V9 | 修 | 五个 advisory 全部产出；park 路径带上 clamp；`policyBlinded` 置位 | `protocol/test/turn.test.ts`（5 例）+ `core/test/worker/interaction/policy-announcements.test.ts`（8 例）：revert 后共 10 条红 |
+| V10 | 修 | §19.6 顺序落到 `Worker.answerInteraction`，路由不再预先 parse | `core/test/worker/interaction/answer-order.test.ts`：revert 后 `'lease_held'` ≠ `'interaction_not_found'`、`'interaction_settled'` ≠ `'worker_closed'` |
+| V11 | 修 | stop 阶梯补上 `settleAllInteractions()`，并在 `closeAll` 之后再 drain 一次 | `daemon/test/create-daemon-m2.test.ts` 的停机顺序用例：revert 后少了 `"interactions settled"` |
+| V12 | 修（选“实现 gate”，见下） | `DiffProvider.end(h, {wroteFiles})`，provider 侧按 `cfg.mode` 决定 | `core/test/diff/git-provider.test.ts` 的 `on_write` 四例 + `core/test/worker/patch-on-write.test.ts` 五例 |
+
+### 两处“二选一”的取舍
+
+**V1 —— 选“把重放走 dispatcher”，不选“在 daemon 层补一次 `assertWebhookUrl`”。**
+第二个方案要在 `create-daemon.ts` 里再写一遍 SSRF 门，于是同一条规则有两处实现，而它们唯一的区别正是
+“谁记得调用它”——这就是这条 finding 本身的形状。走 dispatcher 让「重放」和「首投」共用同一段代码，
+`tokenId` 作为可选参数挂在同一个动词上，也让 D13 的 “不能 LIST 的行就不能 REPLAY” 变成一条规则而不是两条。
+代价是 `Daemon` 多了一个成员 `dispatcher`；它和 `runs` / `deliveries` 一样恒在，`webhooks.enabled:false`
+时是 `unimplementedDispatcher()`，每个动词 `bad_request` 并点名工作包（D29 的“尚未实现”，M1 Land 先例 S8）。
+
+**V2 —— 引擎重建不了时选 `acl_revoked`（V8 的说法），不选 `not_resumable`（V2 的说法）。**
+`not_resumable` 是 agent 说“我恢复不了这个会话”（§15.5 的 422，带 `ResumeReport`）；这里 agent 没有任何
+问题，是**当前配置**不再允许这个 worker——那正是 M1-R23 造 `acl_revoked` 的场景，§15.5 也已经为它准备了
+403 `forbidden` 那一行。§23.1 的表格本来就写着 “a preset that vanished from config between hibernate and
+wake ⇒ `acl_revoked`”，所以这是实现一条已经写好的契约，而不是新开一个语义。worker 被 CLOSE 掉而不是留在
+`hibernated`：在这份配置下它永远醒不来，留着只会让运维手工收尸。
+
+**V12 —— 选“实现 gate”，不选“删掉 enum 成员”。**
+删 `on_write` 要动 `diff.mode` 的默认值、`CreateWorkerRequest.patch` 的枚举、`WorkerRow.patchMode`、
+`M1_VIEW`，以及 §25.4 / §11.9 两处文档，波及面比实现更大；而且 §11.9 把它列为“每回合一对子进程”的
+缓解措施，删掉等于承认那条成本没有对策。实现的方式是把两半分给各自知道答案的一方：`worker.ts` 只报告
+「这一回合写没写」（从**归一化后**的信封上折出来，因此不含任何 per-agent 分支），`git-provider.ts` 持有
+`cfg.mode`，自己决定要不要省掉第二对 `git add -A` + `write-tree`。`begin` 省不掉——F39 说“在不在仓库里”
+必须每回合问一次——所以省下的是一半，这也正是 review 建议里写的那一半。缺席的 `wroteFiles` 一律当成
+`true`：拿不到的观测不能用来压掉一个补丁。
+
+### 附带修掉、但十二条里没有写到的两件事
+
+1. **`WorkerRow` 的 M2 字段从来没有落过盘**（复核那一节发现的）。这是 V2/V8 的前置条件：不修它，
+   重建引擎也没有 `PolicySelection` 可读，而且 `onUnresolved` 会在第一次唤醒时从 `park` 退成 `deny`，
+   `decorate()` 再把退化值写回 `snapshot_json`，第二次启动就把磁盘上正确的值覆盖掉。
+   `SCHEMA_VERSION` 2 → 3 加了一列 `workers.m2_json`（唯一一次 `alter table`，用 `pragma_table_info`
+   守卫所以每次 open 都安全），`WorkerRow` 同时新增 `policy: PolicySelection | null`。
+2. **`RehydrateDeps` 没有转发 `alertOnUnpoliced`**，于是 V9 的 `unpoliced_tool_call` 在唤醒后的 worker 上
+   会静默消失。一并补上。
+
+### 一处刻意的“不做”
+
+`daemon.stop()` 之后 **`workers` 与 `catalog` 没有加门**（V6 建议里的第二个选项）。
+`daemon.workers.turn(id, auth, tid)` 在 stop 之后从 ring 里答 `worker_closed` 是 M1 已经断言过的行为
+（"still answers a turn query for a worker closed by shutdown — the log outlives it"），
+`daemon.workers.size === 0` 则是停机测试证明整队都走了的方式；这两个调用今天是对的，而且都不碰任何已经
+关闭的 statement。加门的三个动词恰好就是 `stop()` 会关掉其后端存储的那三个。

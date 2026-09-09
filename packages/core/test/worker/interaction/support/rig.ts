@@ -3,6 +3,7 @@ import type {
   EventEnvelope,
   EventInput,
   IdGen,
+  Lease,
   InteractionContext,
   InteractionPayload,
   InteractionStrategy,
@@ -106,6 +107,18 @@ export interface RigOptions {
   readonly withLog?: boolean;
   /** An `IdGen` of the test's own, for the one case that needs a BROKEN one. */
   readonly ids?: IdGen;
+  /**
+   * A `Lease` of the test's own. The harness's default GRANTS every `assertHolder`, which is
+   * right for every bullet about interactions and wrong for the one about §19.6's check ORDER:
+   * that table's whole subject is what a NON-HOLDER is told (review finding V10).
+   */
+  readonly lease?: Lease;
+  /**
+   * §20.6's resolved watch list, handed to the WORKER exactly as the registry hands it one, so
+   * `state_update{idle}._meta["omni/policy"]` carries it and `reduceTurn` can fold
+   * `unpoliced_tool_call` out of it (review finding V9).
+   */
+  readonly alertOnUnpoliced?: readonly string[];
 }
 
 export async function rig(o: RigOptions = {}): Promise<Rig> {
@@ -131,7 +144,12 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
   };
   const strategy = (o.strategy ?? createInteractionStrategy)(deps);
   const worker = await h.create({
-    overrides: { interactions: strategy, normalizer: normalizerWithRaw(h) },
+    overrides: {
+      interactions: strategy,
+      normalizer: normalizerWithRaw(h),
+      ...(o.lease === undefined ? {} : { lease: o.lease }),
+      ...(o.alertOnUnpoliced === undefined ? {} : { alertOnUnpoliced: o.alertOnUnpoliced }),
+    },
   });
 
   return {

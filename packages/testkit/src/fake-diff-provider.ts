@@ -38,6 +38,13 @@ export interface FakeDiffProvider extends DiffProvider {
   readonly begun: readonly PatchHandle[];
   /** Handles `end` was called with, in order. */
   readonly ended: readonly PatchHandle[];
+  /**
+   * What each `end` was TOLD about the turn: §25.4's `on_write` observation (review finding V12).
+   *
+   * `undefined` is a caller that reports nothing, which the provider must read as "assume it
+   * wrote" — an observation we do not have may not suppress a patch.
+   */
+  readonly wroteFiles: readonly (boolean | undefined)[];
   /** Handles `abandon` was called with, in order — the leak check a temp index needs. */
   readonly abandoned: readonly PatchHandle[];
   /** True while a hung `end` is still outstanding. */
@@ -47,6 +54,7 @@ export interface FakeDiffProvider extends DiffProvider {
 export function fakeDiffProvider(o: FakeDiffProviderOptions = {}): FakeDiffProvider {
   const begun: PatchHandle[] = [];
   const ended: PatchHandle[] = [];
+  const wroteFiles: (boolean | undefined)[] = [];
   const abandoned: PatchHandle[] = [];
   let outstanding = 0;
   let counter = 0;
@@ -65,6 +73,7 @@ export function fakeDiffProvider(o: FakeDiffProviderOptions = {}): FakeDiffProvi
   return {
     begun,
     ended,
+    wroteFiles,
     abandoned,
     get hanging(): boolean {
       return outstanding > 0;
@@ -91,8 +100,12 @@ export function fakeDiffProvider(o: FakeDiffProviderOptions = {}): FakeDiffProvi
       return Promise.resolve(handle);
     },
 
-    end(h: PatchHandle, opts?: { signal?: AbortSignal }): Promise<PatchResult> {
+    end(
+      h: PatchHandle,
+      opts?: { signal?: AbortSignal; wroteFiles?: boolean },
+    ): Promise<PatchResult> {
       ended.push(h);
+      wroteFiles.push(opts?.wroteFiles);
       if (o.fail === true) return Promise.reject(new Error("fake diff provider: end failed"));
       if (o.hang !== true) return Promise.resolve(result());
 

@@ -132,6 +132,9 @@ function enforcingRegistry(fixture: {
     get: (id) => notFound(id),
     list: () => [],
     closeAll: () => Promise.resolve(),
+    // §19.8's first rung, reachable from the registry (review finding V11). A double that holds
+    // no worker has nothing to settle, and this is a SHUTDOWN path: it must be total.
+    settleAllInteractions: () => Promise.resolve(),
     turn: (id) => notFound(id),
     adopt: () => Promise.resolve({ hibernated: 0, closed: 0, orphans: [] }),
     hibernate: (id) => Promise.resolve(notFound(id)),

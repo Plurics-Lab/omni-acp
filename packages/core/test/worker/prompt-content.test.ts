@@ -393,6 +393,21 @@ interface InjectionReport {
   readonly boundToCwdRoots: boolean;
   /** …and to the worker's `promptCapabilities`. */
   readonly boundToPromptCapabilities: boolean;
+  /** How many `validateContent:` properties the registry passes. The CREATE and WAKE paths. */
+  readonly injectionSites: number;
+  /** Every one of them binds BOTH inputs, so neither path can be the unbound one. */
+  readonly everySiteBound: boolean;
+  /**
+   * There is exactly ONE spelling of `cwdRoots` in the registry, and it is the RESOLVED one
+   * (review finding V3).
+   *
+   * `TokenConfig.cwdRoots` is `z.array(z.string()).default([])` — unexpanded, unresolved, and
+   * `[]` meaning `homedir()` — while the authoritative resolution lives in `auth.ts`'s `toEntry`.
+   * The wake path used to read the raw config array, so the one containment root list in the
+   * daemon had two spellings and a legitimate in-root `resource_link` became a 500 after a
+   * restart. This asserts the raw read is gone and the resolved one is present.
+   */
+  readonly rootsComeFromTheTokenStore: boolean;
 }
 
 const AWAIT_INJECTED = /await\s*\(\s*this\.#deps\.validateContent\s*\?\?/;
@@ -421,6 +436,11 @@ export function auditPromptContentInjection(sources: readonly SourceFile[]): Inj
   );
 
   const registryCall = PASSES_VALIDATE_CONTENT.exec(registry.code);
+  const sites = [...registry.code.matchAll(new RegExp(PASSES_VALIDATE_CONTENT, "g"))];
+  const boundAt = (index: number): boolean => {
+    const near = registry.code.slice(index, index + 600);
+    return /\bcwdRoots\b/.test(near) && /\bpromptCapabilities\b/.test(near);
+  };
   // The binding is looked for in the SAME statement, so that a `validateContent` passed with a
   // hand-rolled always-true closure is not mistaken for the real gate.
   const window =
@@ -435,6 +455,13 @@ export function auditPromptContentInjection(sources: readonly SourceFile[]): Inj
     creationPathInjects: registryCall !== null,
     boundToCwdRoots: /\bcwdRoots\b/.test(window),
     boundToPromptCapabilities: /\bpromptCapabilities\b/.test(window),
+    injectionSites: sites.length,
+    everySiteBound: sites.length > 0 && sites.every((m) => boundAt(m.index)),
+    // A raw-config read is `…tokens.find(…)?.cwdRoots`; the resolved one goes through the token
+    // store's `contextFor`, which is the SAME `AuthContext` the create path binds to.
+    rootsComeFromTheTokenStore:
+      !/tokens\s*\.\s*find\([\s\S]{0,160}?cwdRoots/.test(registry.code) &&
+      /contextFor\([^)]*\)\s*\.\s*cwdRoots/.test(registry.code),
   };
 }
 
@@ -474,6 +501,19 @@ describe("guard: assert-prompt-content-is-called (§26.2, review R2)", () => {
     expect(report.creationPathInjects).toBe(true);
     expect(report.boundToCwdRoots).toBe(true);
     expect(report.boundToPromptCapabilities).toBe(true);
+  });
+
+  /**
+   * Review finding V3. `registry.ts` has TWO `validateContent` sites — `create()` and
+   * `rehydrate()` — and the structural audit only ever looked at the first match, so the wake
+   * path could (and did) bind the gate to a different, unresolved root list without anything
+   * going red. `TokenConfig.cwdRoots` is `z.array(z.string()).default([])`; `[]` means
+   * `homedir()` and `~` has to be expanded, and both happen in `auth.ts` and nowhere else.
+   */
+  it("BOTH paths inject the gate, and both read the RESOLVED cwdRoots (review finding V3)", () => {
+    expect(report.injectionSites).toBeGreaterThanOrEqual(2);
+    expect(report.everySiteBound).toBe(true);
+    expect(report.rootsComeFromTheTokenStore).toBe(true);
   });
 
   it("is demonstrated FAILING on each planted violation", () => {
@@ -536,5 +576,30 @@ describe("guard: assert-prompt-content-is-called (§26.2, review R2)", () => {
       boundToCwdRoots: true,
       boundToPromptCapabilities: true,
     });
+
+    // (5) The WAKE path's own violation (review finding V3): the gate is passed, and bound, but
+    //     to the RAW config array instead of to the resolved `AuthContext` roots. The first
+    //     match still looks perfect, which is exactly why the audit could not see this before.
+    const rawRoots = sourceFile(
+      "packages/daemon/src/registry.ts",
+      "const create = {\n" +
+        "  validateContent: (content: readonly unknown[]) =>\n" +
+        "    assertPromptContent({ content, cwd, cwdRoots: auth.cwdRoots,\n" +
+        "      promptCapabilities: built?.snapshot().capabilities?.promptCapabilities ?? null }),\n" +
+        "};\n" +
+        "function cwdRootsOf(config: C, tokenId: string) {\n" +
+        "  return config.tokens.find((t) => t.id === tokenId)?.cwdRoots ?? [];\n" +
+        "}\n" +
+        "const wake = {\n" +
+        "  validateContent: (content: readonly unknown[]) =>\n" +
+        "    assertPromptContent({ content, cwd, cwdRoots: cwdRootsOf(config, tokenId),\n" +
+        "      promptCapabilities: null }),\n" +
+        "};\nexport const x = [create, wake];\n",
+    );
+    const report5 = auditPromptContentInjection([rawRoots]);
+    expect(report5.creationPathInjects).toBe(true);
+    expect(report5.boundToCwdRoots).toBe(true);
+    expect(report5.injectionSites).toBe(2);
+    expect(report5.rootsComeFromTheTokenStore).toBe(false);
   });
 });

@@ -342,6 +342,68 @@ describe("createGitDiffProvider (§25, D8)", () => {
     }
   });
 
+  /**
+   * §25.4's `on_write`, which review finding V12 found doing NOTHING.
+   *
+   * `cfg.mode` was read in exactly one place — `begin`'s `=== "off"` — so `on_write`, the
+   * DOCUMENTED DEFAULT, ran the same two `git add -A` + `write-tree` pairs per turn that
+   * `"always"` did. §11.9 names this mode as the mitigation for "patch costs a subprocess pair
+   * per turn, and `git add -A` is O(worktree)", and it was saving nothing at all. The test above
+   * ("agrees between mode on_write and mode always") was true and could not have caught it: it
+   * asserts the two ANSWERS agree, which they must, and says nothing about the COST.
+   */
+  describe('diff.mode:"on_write" (review finding V12)', () => {
+    it("runs NO second git pair when the turn reported no write", async () => {
+      const git = fakeGit(happyScript());
+      const p = provider(git, { mode: "on_write" });
+      const handle = (await p.begin({ cwd: TOP, workerId: WORKER })) as PatchHandle;
+      const opened = git.verbs().length;
+
+      const result = await p.end(handle, { wroteFiles: false });
+
+      // Not one more process. `begin` cannot know whether the turn will write, so the pair it
+      // already ran is the price of the mode; `end`'s is the half `on_write` exists to skip.
+      expect(git.verbs().length).toBe(opened);
+      expect(git.verbs()).not.toContain("diff-tree");
+      // …and the ANSWER is the one both modes give for a turn that wrote nothing.
+      expect(result).toEqual({
+        text: "",
+        source: "git",
+        truncated: false,
+        quality: "exact",
+        warnings: [],
+      });
+    });
+
+    it('"always" ignores the same report and runs the pair — the modes differ in COST', async () => {
+      const git = fakeGit(happyScript());
+      const p = provider(git, { mode: "always" });
+      const handle = (await p.begin({ cwd: TOP, workerId: WORKER })) as PatchHandle;
+      const opened = git.verbs().length;
+
+      expect((await p.end(handle, { wroteFiles: false })).text).toBe(PATCH);
+      expect(git.verbs().length).toBeGreaterThan(opened);
+    });
+
+    it("runs the pair under on_write when the turn DID write", async () => {
+      const git = fakeGit(happyScript());
+      const p = provider(git, { mode: "on_write" });
+      const handle = (await p.begin({ cwd: TOP, workerId: WORKER })) as PatchHandle;
+
+      expect((await p.end(handle, { wroteFiles: true })).text).toBe(PATCH);
+      expect(git.verbs()).toContain("diff-tree");
+    });
+
+    it("an ABSENT report is treated as a write — an observation we do not have suppresses nothing", async () => {
+      const git = fakeGit(happyScript());
+      const p = provider(git, { mode: "on_write" });
+      const handle = (await p.begin({ cwd: TOP, workerId: WORKER })) as PatchHandle;
+
+      expect((await p.end(handle)).text).toBe(PATCH);
+      expect(git.verbs()).toContain("diff-tree");
+    });
+  });
+
   it("never throws: an unknown handle, a double end and abandon are all answers", async () => {
     const git = fakeGit(happyScript());
     const p = provider(git);

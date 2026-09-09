@@ -64,7 +64,7 @@ export function withTransaction<T>(db: SqliteDatabase, fn: () => T): T {
  *
  * Owned by M1-WP-A.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * Version 1, and the three decisions §14.7 makes, spelled out where they live:
@@ -241,6 +241,35 @@ create index if not exists deliveries_due on webhook_deliveries (state, next_att
 `;
 
 /**
+ * Version 3 (review finding V2/V8): ONE nullable column, `workers.m2_json`.
+ *
+ * `WorkerRow` has carried M2's rows since the Land step — `onUnresolved`, `parkTimeoutMs`,
+ * `parkTimeoutAction`, `mcpNames`, `policyRef`, `env`, `watchdog`, `patchMode`, and now the
+ * `PolicySelection` a wake needs to rebuild the engine — and NOT ONE of them was ever written to
+ * disk: `upsert` had no column for them and `toRow` did not read them back. So the comment on
+ * `WorkerRow` ("persisted BECAUSE OF THE WAKE PATH") was false, and every one of those fields
+ * degraded to its M1 default on the first wake after a restart — `onUnresolved: "park"` came back
+ * as `"deny"`, `clientCapabilities.elicitation` came back as `{}`, and F28's "the park never
+ * happens again" happened. Worse, `decorate()` then wrote the degraded values back into
+ * `snapshot_json`, so the SECOND boot overwrote the correct value still on disk.
+ *
+ * ONE JSON column rather than nine typed ones, for the reason `snapshot_json` is one blob: none
+ * of these fields is ever queried, ordered or filtered on — they are read back whole, by exactly
+ * one caller, on the wake path — and a column per optional field is nine migrations waiting to
+ * happen. The columns §14.7 names exist so `abandoned()` / `closedBefore()` / `list()` are
+ * indexed queries; nothing here is one of those.
+ *
+ * It is an `alter table`, so unlike V2 it is not CREATE-only and cannot be re-run blindly. The
+ * guard is `pragma_table_info` — a QUESTION about the file rather than a version number, which is
+ * what makes it safe on every open, including on a file some future step has already altered.
+ */
+function applyV3(db: SqliteDatabase): void {
+  const columns = db.prepare("select name from pragma_table_info('workers')").all();
+  if (columns.some((c) => String(c["name"]) === "m2_json")) return;
+  db.exec("alter table workers add column m2_json text");
+}
+
+/**
  * Reads `meta.schema_version`, creates or forward-migrates, and returns the version in force.
  *
  * Forward-only. A file written by a NEWER daemon is a startup failure naming both versions: the
@@ -272,6 +301,8 @@ export function migrateTo(
 ): number {
   db.exec(V1);
   if (target >= 2) db.exec(V2);
+  // A daemon that does not understand a column must not create it, exactly as with V2's tables.
+  if (target >= 3) applyV3(db);
 
   const row = db.prepare("select value from meta where key = 'schema_version'").get();
   const found = row === undefined ? null : Number(row["value"]);
@@ -299,8 +330,11 @@ export function migrateTo(
 
   if (found < target) {
     // The 1 -> 2 step is `db.exec(V2)` above and nothing else: CREATE-only, so there is no data
-    // to move and no column to rewrite. Recording the number is the whole remaining step, and
-    // every M1 row in the file is still exactly where M1 left it.
+    // to move and no column to rewrite. The 2 -> 3 step is `applyV3` above and nothing else: one
+    // nullable column, so every existing row reads it as `null` and reads back as an M1 row —
+    // which is exactly what it is, since no boot before this one ever wrote those fields.
+    // Recording the number is the whole remaining step, and every M1 row in the file is still
+    // exactly where M1 left it.
     db.prepare("update meta set value = ? where key = 'schema_version'").run(String(target));
     return target;
   }

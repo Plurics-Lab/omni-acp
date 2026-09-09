@@ -867,3 +867,183 @@ describe("reduceTurn explains every patch null (D8, §25.3)", () => {
     expect(r.warnings).toEqual([]);
   });
 });
+
+/**
+ * The five M2 advisories that were SPECIFIED and never produced (review finding V9).
+ *
+ * `policyClampWarning` (§20.5) and `unpolicedToolCalls` (§20.6) had unit tests and ZERO production
+ * callers; §19.9's `interaction_declined` / `interaction_expired` existed nowhere in the
+ * repository outside CONTRACTS.md; and M2-R19's `policy_blinded` — one of the three announcements
+ * that are the PRICE of allowing `interaction.allowAlways:"human"` — was never built either. So
+ * `alertOnUnpoliced` was a config key that did nothing and several "it is never silent"
+ * guarantees were silent.
+ *
+ * All five are derived HERE, from envelopes, for one reason: D7 says the SDK's local
+ * `reduceTurn()` and the daemon's `GET /turns/{id}` must not be able to disagree, and a
+ * daemon-side post-pass could not keep that. `worker.ts` puts the one input the fold cannot
+ * derive — the resolved `alertOnUnpoliced` — on `state_update{idle}._meta["omni/policy"]`.
+ */
+describe("reduceTurn derives M2's policy advisories from the envelopes (review finding V9)", () => {
+  const decision = (payload: Record<string, unknown>) =>
+    env({
+      kind: "omni.policy_decision",
+      payloadVersion: 2,
+      payload: {
+        requestId: "x_00000000000000000000000001",
+        kind: "permission",
+        method: "session/request_permission",
+        title: "Write hello.txt",
+        decision: "allow",
+        by: "policy",
+        rule: "p#r1",
+        optionId: "allow-once",
+        offered: [],
+        toolCallId: "call_1",
+        ...payload,
+      } as never,
+    });
+
+  const interaction = (payload: Record<string, unknown>) =>
+    env({
+      kind: "acp.interaction",
+      payloadVersion: 2,
+      payload: {
+        requestId: "x_00000000000000000000000001",
+        kind: "elicitation",
+        method: "elicitation/create",
+        request: {},
+        status: "answered",
+        toolCallId: null,
+        ...payload,
+      } as never,
+    });
+
+  const toolCall = (toolCallId: string, kind: string) =>
+    env({
+      kind: "acp.session_update",
+      payloadVersion: 2,
+      payload: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "run it",
+        kind,
+        status: "completed",
+      },
+    });
+
+  const codes = (envelopes: readonly EventEnvelope[]): string[] =>
+    reduceTurn(T, envelopes).warnings.map((w) => w.code);
+
+  it("`policy_clamped` — §20.5's clamp is announced on the TURN as well as on the decision", () => {
+    const result = reduceTurn(T, [
+      running(),
+      decision({ clamped: { from: "allow", by: "policyCeiling:pathRoots" } }),
+      idle("end_turn"),
+    ]);
+    const clamp = result.warnings.find((w) => w.code === "policy_clamped");
+    expect(clamp).toBeDefined();
+    expect(clamp?.source).toBe("policy");
+    expect(clamp?.detail).toEqual({
+      from: "allow",
+      to: "allow",
+      by: "policyCeiling:pathRoots",
+      rule: "p#r1",
+    });
+    // Nothing clamped, nothing said.
+    expect(codes([running(), decision({}), idle("end_turn")])).not.toContain("policy_clamped");
+  });
+
+  it("`policy_blinded` — F26's session-wide grant, which nothing on the wire announces", () => {
+    const result = reduceTurn(T, [
+      running(),
+      decision({ blindsPolicy: true, optionId: "allow-always" }),
+      idle("end_turn"),
+    ]);
+    const blinded = result.warnings.find((w) => w.code === "policy_blinded");
+    expect(blinded).toBeDefined();
+    expect(blinded?.detail).toMatchObject({ optionId: "allow-always" });
+    expect(codes([running(), decision({}), idle("end_turn")])).not.toContain("policy_blinded");
+  });
+
+  it("`interaction_declined` — F31 says this record is the outcome's ONLY trace", () => {
+    expect(
+      codes([
+        running(),
+        interaction({ answer: { optionId: null, by: "human", action: "decline" } }),
+        idle("end_turn"),
+      ]),
+    ).toContain("interaction_declined");
+    expect(
+      codes([
+        running(),
+        interaction({ answer: { optionId: null, by: "human", action: "cancel" } }),
+        idle("end_turn"),
+      ]),
+    ).toContain("interaction_declined");
+    // An ACCEPTED elicitation is not a declined one.
+    expect(
+      codes([
+        running(),
+        interaction({ answer: { optionId: null, by: "human", action: "accept" } }),
+        idle("end_turn"),
+      ]),
+    ).not.toContain("interaction_declined");
+  });
+
+  it("`interaction_expired` — a park that reached its deadline with no human", () => {
+    expect(codes([running(), interaction({ status: "expired" }), idle("end_turn")])).toContain(
+      "interaction_expired",
+    );
+    expect(codes([running(), interaction({}), idle("end_turn")])).not.toContain(
+      "interaction_expired",
+    );
+  });
+
+  it("a PENDING interaction produces neither — it has not settled at all", () => {
+    const pending = interaction({
+      status: "pending",
+      park: { parkedAt: "x", expiresAt: null, onTimeout: "deny" },
+    });
+    expect(codes([running(), pending, idle("end_turn")])).not.toContain("interaction_expired");
+    expect(codes([running(), pending, idle("end_turn")])).not.toContain("interaction_declined");
+  });
+
+  it("`unpoliced_tool_call` — §20.6/F40, off `idle._meta['omni/policy']`", () => {
+    const withMeta = (meta: Record<string, unknown> | null) =>
+      env({
+        kind: "acp.session_update",
+        payloadVersion: 2,
+        payload: {
+          sessionUpdate: "state_update",
+          state: "idle",
+          stopReason: "end_turn",
+          ...(meta === null ? {} : { _meta: meta }),
+        },
+      });
+
+    // The watch list is present and a WATCHED kind ran with no decision to its name.
+    const flagged = reduceTurn(T, [
+      running(),
+      toolCall("call_ls", "execute"),
+      withMeta({ "omni/policy": { alertOnUnpoliced: ["execute"] } }),
+    ]);
+    const warning = flagged.warnings.find((w) => w.code === "unpoliced_tool_call");
+    expect(warning).toBeDefined();
+    expect(warning?.detail).toEqual({ toolCallId: "call_ls", kind: "execute" });
+
+    // A tool call the engine DID see is not unpoliced.
+    expect(
+      codes([
+        running(),
+        toolCall("call_1", "execute"),
+        decision({ toolCallId: "call_1" }),
+        withMeta({ "omni/policy": { alertOnUnpoliced: ["execute"] } }),
+      ]),
+    ).not.toContain("unpoliced_tool_call");
+
+    // No watch list on the turn ⇒ no warning, which is every M1 turn and the default.
+    expect(codes([running(), toolCall("call_ls", "execute"), withMeta(null)])).not.toContain(
+      "unpoliced_tool_call",
+    );
+  });
+});

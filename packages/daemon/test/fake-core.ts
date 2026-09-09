@@ -23,7 +23,7 @@ import {
   type WorkerSnapshot,
   type WorkerState,
 } from "@omni-acp/protocol";
-import type { CreateWorkerDeps, MemoryEventLogOptions } from "@omni-acp/core";
+import type { CreateWorkerDeps, MemoryEventLogOptions, RehydrateDeps } from "@omni-acp/core";
 
 /**
  * The WP-3 / WP-4 factories the daemon calls, as doubles.
@@ -364,15 +364,26 @@ export interface CoreScript {
   handshake: "ok" | "jsonrpc_error" | "timeout";
   /** Set by the fake so a test can reach the worker it just created. */
   readonly workers: FakeWorker[];
+  /**
+   * Every `createRehydratedWorker(row, log, deps)` the registry made, with the DEPS.
+   *
+   * The deps are the whole subject of review findings V2/V8 and V3: the wake path used to build
+   * its strategy with no `decide`, reopen its session with no `mcpServers`, and bind the
+   * containment gate to the RAW `cwdRoots` off the config. None of those is visible from the
+   * handle, so a double that dropped the third argument could not see any of them.
+   */
+  readonly rehydrated: { row: WorkerRow; deps: RehydrateDeps }[];
   reset(): void;
 }
 
 export const coreScript: CoreScript = {
   handshake: "ok",
   workers: [],
+  rehydrated: [],
   reset(): void {
     coreScript.handshake = "ok";
     coreScript.workers.length = 0;
+    coreScript.rehydrated.length = 0;
   },
 };
 
@@ -714,7 +725,10 @@ export async function fakeCoreModule(
     // M1's two: the write-through log (M1-WP-A) and the handle over a persisted row (M1-WP-C).
     // Both are stubs in this tree, and both are on the daemon-wiring path this suite drives.
     createPersistedEventLog: testPersistedEventLog,
-    createRehydratedWorker: (row, log) => testRehydratedWorker(row, log),
+    createRehydratedWorker: (row, log, deps) => {
+      coreScript.rehydrated.push({ row, deps });
+      return testRehydratedWorker(row, log);
+    },
     alwaysGrantedLease: (holder) => ({
       holder,
       // The registry disposes every lease on close/closeAll (its TTL timer must not outlive the

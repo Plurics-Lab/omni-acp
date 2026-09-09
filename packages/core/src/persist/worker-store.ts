@@ -24,6 +24,53 @@ const parse = <T>(v: unknown): T | null =>
   v === null || v === undefined ? null : (JSON.parse(String(v)) as T);
 
 /**
+ * The M2 half of a `WorkerRow`, as one JSON blob (§24.2 v3, review finding V2/V8).
+ *
+ * It is spelled out rather than derived with `Omit<>`, and the enumeration is the point: this is
+ * the list of fields a WAKE has to reproduce, and a field added to `WorkerRow` that is not added
+ * here is a field that silently stops surviving a restart — which is exactly the bug being fixed.
+ */
+type M2Row = Pick<
+  WorkerRow,
+  | "onUnresolved"
+  | "parkTimeoutMs"
+  | "parkTimeoutAction"
+  | "mcpNames"
+  | "policyRef"
+  | "policy"
+  | "env"
+  | "watchdog"
+  | "patchMode"
+>;
+
+const M2_KEYS = [
+  "onUnresolved",
+  "parkTimeoutMs",
+  "parkTimeoutAction",
+  "mcpNames",
+  "policyRef",
+  "policy",
+  "env",
+  "watchdog",
+  "patchMode",
+] as const satisfies readonly (keyof M2Row)[];
+
+/**
+ * The M2 fields a row actually carries, or `null` for a row that carries none.
+ *
+ * `undefined` and `null` are DIFFERENT here and both are kept: `policyRef: null` is "this worker
+ * resolved to no engine id" while an absent `policyRef` is "a boot that did not know the field
+ * wrote this row", and `viewRowsOf`'s `??` fallbacks read the second one as M1.
+ */
+function m2Of(row: WorkerRow): M2Row | null {
+  const out: Record<string, unknown> = {};
+  for (const key of M2_KEYS) {
+    if (row[key] !== undefined) out[key] = row[key];
+  }
+  return Object.keys(out).length === 0 ? null : (out as M2Row);
+}
+
+/**
  * The durable half of the Worker Registry — D2's `workerId → (agentId, sessionId, cwd, label,
  * owner, state, capabilities, closeResult, …)` (§14.8, L17).
  *
@@ -49,8 +96,8 @@ export function createSqliteWorkerStore(db: SqliteDatabase): WorkerStore {
        worker_id, daemon_id, boot_id, agent_id, session_id, cwd, label, owner_token, state,
        close_reason, close_result, crashed, created_at, updated_at, hibernated_at,
        last_active_ms, closed_at_ms, head_seq, tail_seq, capabilities, resume_json, orphan_json,
-       process_json, wake_count, wake_failures, hibernate_idle_ms, snapshot_json
-     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+       process_json, wake_count, wake_failures, hibernate_idle_ms, snapshot_json, m2_json
+     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      on conflict(worker_id) do update set
        daemon_id = excluded.daemon_id,
        boot_id = excluded.boot_id,
@@ -76,7 +123,8 @@ export function createSqliteWorkerStore(db: SqliteDatabase): WorkerStore {
        wake_count = excluded.wake_count,
        wake_failures = excluded.wake_failures,
        hibernate_idle_ms = excluded.hibernate_idle_ms,
-       snapshot_json = excluded.snapshot_json`,
+       snapshot_json = excluded.snapshot_json,
+       m2_json = excluded.m2_json`,
   );
   // `tail_seq` is absent from the update list on purpose: the EventStore raises it inside the
   // retention transaction, and a registry upsert that carried a stale value would tell a client
@@ -101,6 +149,10 @@ export function createSqliteWorkerStore(db: SqliteDatabase): WorkerStore {
     if (snapshot === null) {
       throw new OmniError("internal", `worker row ${String(r["worker_id"])} has no snapshot`);
     }
+    // `null` for every row written before schema v3, and for every worker that has no M2 rows at
+    // all. Spread back verbatim: a key that is absent stays absent, which is what makes
+    // `viewRowsOf`'s M1 fallbacks fire for exactly the rows they are meant for.
+    const m2 = parse<M2Row>(r["m2_json"]) ?? {};
     const headSeq = Math.max(Number(r["head_seq"] ?? 0), snapshot.headSeq);
     return {
       // §14.4 again, one layer up: the column can be AHEAD of the snapshot (retention raises it
@@ -119,6 +171,7 @@ export function createSqliteWorkerStore(db: SqliteDatabase): WorkerStore {
         r["hibernate_idle_ms"] === null || r["hibernate_idle_ms"] === undefined
           ? null
           : Number(r["hibernate_idle_ms"]),
+      ...m2,
     };
   };
 
@@ -152,6 +205,10 @@ export function createSqliteWorkerStore(db: SqliteDatabase): WorkerStore {
         s.wakeFailures,
         row.hibernateIdleMs,
         JSON.stringify(s),
+        // §24.2 v3, and review finding V2/V8: these are the fields `WorkerRow` has always
+        // documented as "persisted BECAUSE OF THE WAKE PATH" and that nothing ever wrote. A row
+        // whose M2 fields are all absent stores `null` and reads back as the M1 row it is.
+        json(m2Of(row)),
       );
     },
 

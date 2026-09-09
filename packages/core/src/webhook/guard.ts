@@ -146,7 +146,22 @@ export function cidrContains(cidr: string, address: string): boolean {
   return ((netBytes[whole] ?? 0) & mask) === ((addrBytes[whole] ?? 0) & mask);
 }
 
-/** IPv4 -> 4 bytes, IPv6 -> 16 bytes, `::ffff:a.b.c.d` -> the 4 bytes it actually is. */
+/**
+ * IPv4 -> 4 bytes, IPv6 -> 16 bytes, and an IPv4-MAPPED address -> the 4 bytes it actually is.
+ *
+ * The mapped fold is NUMERIC and not lexical, and that is the whole of review finding V5/V7.
+ * `assertWebhookUrl` derives its host from `new URL(raw).hostname`, and WHATWG URL ALWAYS
+ * re-serializes a mapped literal to the compressed hex form — `http://[::ffff:127.0.0.1]/` comes
+ * back as `[::ffff:7f00:1]` — so a dotted-quad regex is DEAD on the one path that matters. The
+ * address then parsed to 16 bytes, `cidrContains` refused every IPv4 rule on the length
+ * comparison, and `::ffff:7f00:1` reached the same loopback socket `127.0.0.1` was refused for.
+ * `::ffff:a9fe:a9fe` reached the cloud metadata endpoint the same way.
+ *
+ * So the prefix is detected STRUCTURALLY — ten zero bytes, then `ff ff` — after the 16 bytes are
+ * parsed, which folds every spelling of one address to one answer: `::ffff:127.0.0.1`,
+ * `::ffff:7f00:1` and `0:0:0:0:0:ffff:7f00:1` are all `127.0.0.1`. The dotted-quad regex stays as
+ * a fast path for the form a resolver produces.
+ */
 function toBytes(raw: string): number[] | null {
   const text = raw.replace(/^\[|]$/g, "").replace(/%.*$/, "");
   const kind = isIP(text);
@@ -167,7 +182,15 @@ function toBytes(raw: string): number[] | null {
     tail === undefined
       ? left
       : [...left, ...new Array<number>(16 - left.length - right.length).fill(0), ...right];
-  return bytes.length === 16 && bytes.every((b) => Number.isInteger(b)) ? bytes : null;
+  if (!(bytes.length === 16 && bytes.every((b) => Number.isInteger(b)))) return null;
+  if (isMappedV4(bytes)) return bytes.slice(12);
+  return bytes;
+}
+
+/** `::ffff:0:0/96` — the ONE prefix RFC 4291 gives an IPv4 address inside an IPv6 one. */
+function isMappedV4(bytes: readonly number[]): boolean {
+  for (let i = 0; i < 10; i++) if (bytes[i] !== 0) return false;
+  return bytes[10] === 0xff && bytes[11] === 0xff;
 }
 
 function v4(text: string): number[] | null {

@@ -2,11 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { openPersistence } from "@omni-acp/core";
+import { createInteractionStrategy, openPersistence } from "@omni-acp/core";
 import {
   EventLogConfig,
   type DaemonConfig,
+  type DaemonDeps,
   type DeliveryId,
+  type InteractionStrategy,
   type PersistenceHandle,
   type WebhookDispatcher,
   type WorkerSnapshot,
@@ -96,6 +98,36 @@ function recording(handle: PersistenceHandle, order: string[]): PersistenceHandl
   } as unknown as PersistenceHandle;
 }
 
+/**
+ * The REAL interaction strategy, with `settleAll("shutdown")` recorded.
+ *
+ * Only the `"shutdown"` reason is recorded: every `Worker.close` settles again with `"close"`,
+ * and the thing under test is §24.4 rule 5's FIRST RUNG — which review finding V11 found missing
+ * altogether, leaving `settleAll`'s `"shutdown"` arm unreachable in shipped code.
+ */
+function recordingInteractions(order: string[]): NonNullable<DaemonDeps["interactions"]> {
+  return (d): InteractionStrategy => {
+    const real = createInteractionStrategy(d);
+    return {
+      clientCapabilities: real.clientCapabilities,
+      permission: (req, ctx) => real.permission(req, ctx),
+      elicitation: (req, ctx) => real.elicitation(req, ctx),
+      answer: (id, a, who) => real.answer(id, a, who),
+      get: (id) => real.get(id),
+      get pending() {
+        return real.pending;
+      },
+      settleAll: async (reason) => {
+        if (reason === "shutdown") order.push("interactions settled");
+        await real.settleAll(reason);
+      },
+      close: () => {
+        real.close();
+      },
+    };
+  };
+}
+
 /** A dispatcher that records its lifecycle and delivers nothing. */
 function recordingDispatcher(order: string[]): WebhookDispatcher {
   return {
@@ -157,7 +189,7 @@ describe("createDaemon — M2's six defaults and the two orders (§24.4, accepta
     expect(daemon.url).not.toBeNull();
   });
 
-  it("stops dispatcher.drain → dispatcher.stop → workers → socket", async () => {
+  it("stops interactions.settleAll → drain → workers → drain → dispatcher.stop → socket", async () => {
     const dataDir = await tempDir("omni-m2-stop-");
     const workspace = await tempDir("omni-m2-ws-");
     const order: string[] = [];
@@ -172,6 +204,7 @@ describe("createDaemon — M2's six defaults and the two orders (§24.4, accepta
       persistence: recording(handle, order),
       supervisor: fakeSupervisor(),
       webhooks: recordingDispatcher(order),
+      interactions: recordingInteractions(order),
     });
     closers.push(() => Promise.resolve(handle.close()));
     await daemon.start();
@@ -185,9 +218,25 @@ describe("createDaemon — M2's six defaults and the two orders (§24.4, accepta
 
     await daemon.stop({ graceful: true });
 
-    // The DRAIN is bounded and comes first, the workers close after it, and the socket is the
-    // last thing to go — a `fetch` against the old url now fails to connect.
-    expect(order).toEqual(["dispatcher.drain", "dispatcher.stop", "worker closed"]);
+    /**
+     * §24.4 rule 5 / §19.8, in the order the CONTRACT states rather than the one the code
+     * happened to have (review finding V11).
+     *
+     * `interactions settled` first, because an agent blocked on our answer may never read the
+     * shutdown and a log that ends on a `pending` interaction is a log that lies. Then a bounded
+     * drain, then the workers, then a SECOND bounded drain — terminalizing those turns is what
+     * enqueues each run's own terminal `run.*` delivery, and under `eventLog.driver:"memory"`
+     * there is no next boot to recover one the dispatcher never attempted. `dispatcher.stop` is
+     * last of the dispatcher's three for exactly that reason: a stopped dispatcher's pump is a
+     * no-op.
+     */
+    expect(order).toEqual([
+      "interactions settled",
+      "dispatcher.drain",
+      "worker closed",
+      "dispatcher.drain",
+      "dispatcher.stop",
+    ]);
     expect(daemon.url).toBeNull();
     await expect(fetch(`${url}/v1/info`)).rejects.toThrow();
   });

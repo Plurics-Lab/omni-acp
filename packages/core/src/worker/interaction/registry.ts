@@ -11,6 +11,7 @@ import type {
   InteractionRequest,
   InteractionSnapshot,
   ParkTimeoutAction,
+  PolicyAction,
   TokenId,
   WorkerId,
   WorkerState,
@@ -91,6 +92,16 @@ export interface HeldInteraction {
   readonly parkedAtMs: number;
   readonly expiresAtMs: number | null;
   readonly onTimeout: ParkTimeoutAction;
+  /**
+   * The CLAMP that made this a park, carried from the verdict that produced it.
+   *
+   * Review finding V9: a verdict clamped from `allow` to `park` was recorded nowhere at all —
+   * `createPolicyEngine` returns `clamped:{from:"allow",…}`, `route()` then parks, and every
+   * settlement built afterwards hard-coded `clamped: null`. So the ONE clamp that turns an
+   * auto-allow into a human decision left no trace on `omni.policy_decision`, which is exactly
+   * the clamp §20.5 says must never be silent. `null` when nothing was clamped.
+   */
+  readonly clamped: { readonly from: PolicyAction; readonly by: string } | null;
   /** ms this request has spent parked, as of `nowMs`. `answer.parkedMs`'s only source. */
   parkedMs(nowMs: number): number;
 }
@@ -100,6 +111,8 @@ export interface HoldOptions {
   /** Absolute epoch-ms the park expires, or null for `parkTimeoutMs: 0` — parked forever. */
   readonly expiresAtMs: number | null;
   readonly onTimeout: ParkTimeoutAction;
+  /** The parking verdict's ceiling clamp, so the settlement can report it (review finding V9). */
+  readonly clamped?: { readonly from: PolicyAction; readonly by: string } | null;
   /** `InteractionContext.emit` for the context this request arrived on. */
   readonly emit: (inputs: readonly EventInput[]) => void;
   /**
@@ -249,6 +262,7 @@ export function createPendingInteractions(o: PendingInteractionsOptions): Pendin
         parkedAtMs,
         expiresAtMs: options.expiresAtMs,
         onTimeout: options.onTimeout,
+        clamped: options.clamped ?? null,
         parkedMs: (nowMs) => Math.max(0, nowMs - parkedAtMs),
       };
 

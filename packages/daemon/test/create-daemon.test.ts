@@ -39,6 +39,11 @@ const DAEMON_MEMBERS = [
   "workers",
   "catalog",
   "supervisor",
+  "runs",
+  "deliveries",
+  // M2-B (D9), and the object `POST …/redeliver` calls: the DISPATCHER is the only replay path
+  // that re-runs the SSRF gate (review finding V1).
+  "dispatcher",
   "authContextFor",
   "authenticate",
   "whoami",
@@ -353,6 +358,52 @@ describe("daemon.stop (acceptance 12)", () => {
   it("stops cleanly with no workers and no start()", async () => {
     const { daemon } = await build();
     await expect(daemon.stop()).resolves.toBeUndefined();
+  });
+
+  /**
+   * Review finding V6: after `stop()` the run and delivery read verbs threw RAW `node:sqlite`
+   * errors — `statement has been finalized`, `database is not open` — from below the
+   * error-classification layer, because `stop()` closes persistence last (correctly) and nothing
+   * marked the daemon as stopped. Under D15 ("the library IS the product") an embedder reading a
+   * run's terminal state after shutdown got an unclassified crash rather than a typed refusal,
+   * and the HTTP adapter mapped it to a bare 500 with no named code.
+   *
+   * `eventLog.driver: "sqlite"` on purpose: it is the driver that produces the raw error, so
+   * reverting the flag makes this test fail with the exact class it exists to replace.
+   */
+  it("refuses the run and delivery verbs with a TYPED error once it has stopped", async () => {
+    const { daemon } = await build({ eventLog: { driver: "sqlite" } });
+    const auth = daemon.authContextFor("local");
+    // Callable BEFORE the stop, so the refusal below is about the stop and nothing else.
+    expect(daemon.runs.list(auth)).toEqual([]);
+    expect(daemon.deliveries.list({ limit: 10 }).rows).toEqual([]);
+
+    await daemon.stop();
+
+    for (const read of [
+      () => daemon.runs.list(auth),
+      () => daemon.deliveries.list({ limit: 10 }),
+      () => daemon.dispatcher.drain(),
+    ]) {
+      let thrown: unknown;
+      try {
+        read();
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(OmniError);
+      expect((thrown as OmniError).code).toBe("internal");
+      expect((thrown as OmniError).message).toBe("the daemon has stopped");
+    }
+
+    // …and the HTTP adapter reports the NAMED code rather than an unclassified crash.
+    const res = await daemon.fetch(
+      new Request("http://daemon.invalid/v1/runs", {
+        headers: { [HEADER.auth]: `Bearer ${SECRET}` },
+      }),
+    );
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { code: string }).code).toBe("internal");
   });
 
   it("still answers a turn query for a worker closed by shutdown (the log outlives it)", async () => {

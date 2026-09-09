@@ -190,6 +190,9 @@ export function stubDaemon(
     list: () => [],
     delete: (id) => Promise.resolve(notFound(id)),
     closeAll: () => Promise.resolve(),
+    // A stub holds no worker, so there is no parked interaction to settle. It is a SHUTDOWN path
+    // and must be total: "nothing to settle" is the truth here, not a refusal (review V11).
+    settleAllInteractions: () => Promise.resolve(),
     snapshot: (id) => notFound(id),
     prompt: (id) => Promise.resolve(notFound(id)),
     cancel: (id) => Promise.resolve(notFound(id)),
@@ -287,6 +290,23 @@ export function stubDaemon(
         throw new OmniError("bad_request", `stubDaemon: runs are not enabled (${id})`);
       },
       recover: () => ({ abandoned: 0 }),
+    },
+    /**
+     * M2-B (D9). Present and refusing, exactly like `runs` and `deliveries` above — and it is
+     * the object `POST …/redeliver` calls, because the DISPATCHER is the only replay path that
+     * re-runs the SSRF gate (review finding V1).
+     */
+    dispatcher: {
+      start: () => {},
+      dispatch: () => {
+        throw new OmniError("bad_request", "stubDaemon: webhooks are not enabled");
+      },
+      redeliver: (id) =>
+        Promise.reject(
+          new OmniError("bad_request", `stubDaemon: webhooks are not enabled (${id})`),
+        ),
+      drain: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
     },
     deliveries: {
       enqueue: () => {

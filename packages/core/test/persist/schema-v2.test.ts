@@ -27,8 +27,12 @@ const chunk = (text: string): EventInput => ({
 const V2_TABLES = ["runs", "webhook_deliveries"];
 
 describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
-  it("is 2", () => {
-    expect(SCHEMA_VERSION).toBe(2);
+  it("is a step this daemon still knows how to take", () => {
+    // The FILE is about the 1 → 2 step, so every assertion below names `2` explicitly rather
+    // than reading `SCHEMA_VERSION` — which moved to 3 with review finding V2/V8's `m2_json`
+    // column and is pinned in `schema-v3.test.ts`. A test that tracked the constant would have
+    // silently stopped testing the step it is named after.
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(2);
   });
 
   describe("a v1 file opened by an M2 daemon", () => {
@@ -73,7 +77,7 @@ describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
     });
 
     it("migrates forward keeping EVERY M1 event, byte for byte", async () => {
-      const m2 = await rawStore({ dir, file });
+      const m2 = await rawStore({ dir, file, version: 2 });
       try {
         const w = workerId(1);
         const read = m2.events.read(w, 0, 1_000);
@@ -100,7 +104,7 @@ describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
     });
 
     it("adds exactly two tables and rewrites the version to 2", async () => {
-      const m2 = await rawStore({ dir, file });
+      const m2 = await rawStore({ dir, file, version: 2 });
       try {
         expect(
           Number(
@@ -132,7 +136,7 @@ describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
         const v1Ddl = ddlOf(v1Db, ["meta", "workers", "events", "payloads", "event_state"]);
         v1Db.close();
 
-        const m2 = await rawStore({ dir, file });
+        const m2 = await rawStore({ dir, file, version: 2 });
         const v2Ddl = ddlOf(m2.db, ["meta", "workers", "events", "payloads", "event_state"]);
         m2.db.close();
 
@@ -143,7 +147,7 @@ describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
     });
 
     it("is idempotent — opening it again is a no-op", async () => {
-      const again = await rawStore({ dir, file });
+      const again = await rawStore({ dir, file, version: 2 });
       try {
         expect(migrateTo(again.db, { warn: () => {} }, 2)).toBe(2);
         expect(migrateTo(again.db, { warn: () => {} }, 2)).toBe(2);
@@ -155,7 +159,7 @@ describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
   });
 
   it("a v2 file opened by an M1 daemon fails loudly, naming the version", async () => {
-    const store = await rawStore();
+    const store = await rawStore({ version: 2 });
     try {
       // `migrateTo(db, logger, 1)` IS an M1 daemon — the shipped code path, with the version that
       // daemon understands. Not a copy of the check in a test, which is the copy that keeps
@@ -191,7 +195,7 @@ describe("SCHEMA_VERSION 2 (§14.11, §24.2)", () => {
  * round-trip — runs against it unedited. If the migration had touched one M1 column, this would go
  * red without anybody having to think of the case.
  */
-runEventLogPersistenceConformance("sqlite(file), schema v2", makeTmpPersistence);
+runEventLogPersistenceConformance("sqlite(file), the current schema", makeTmpPersistence);
 
 function tablesOf(db: RawStore["db"]): string[] {
   return db

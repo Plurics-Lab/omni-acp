@@ -24,7 +24,6 @@ import type {
   CreateWorkerRequest,
   DaemonInfo,
   DeliveryRecord,
-  InteractionAnswerBody,
   InteractionAnswerResult,
   InteractionListResponse,
   LeaseRequestBody,
@@ -404,6 +403,17 @@ export interface WorkerRow {
   readonly parkTimeoutAction?: ParkTimeoutAction;
   readonly mcpNames?: readonly string[];
   readonly policyRef?: string | null;
+  /**
+   * The `PolicySelection` the worker was CREATED with (review finding V2/V8).
+   *
+   * `policyRef` is the engine's identity and is an audit trail; it cannot rebuild anything. A
+   * wake has to reconstruct the ENGINE — `policyFor(selection, auth, onUnresolved)`, exactly as
+   * `create()` runs it — or the woken worker enforces `DEFAULT_VERDICT[onUnresolved]` with no
+   * rules and no ceiling clamp while its snapshot still advertises the policy it no longer has.
+   * `null` is "this worker asked for no policy", which is not the same fact as an M1 row's absent
+   * key.
+   */
+  readonly policy?: PolicySelection | null;
   /** `null` when `env.persist:false` was requested — which forces `resume.method: null` (§23.3). */
   readonly env?: Readonly<Record<string, string>> | null;
   readonly watchdog?: { silentMs: number; toolMs: number; cancelTimeoutMs: number };
@@ -800,6 +810,17 @@ export interface PolicyEngine {
   decide(s: PolicySubject): PolicyVerdict;
   readonly id: string;
   readonly snapshot: PolicySnapshot;
+  /**
+   * §20.6's watch list, resolved (the UNION over every applied preset layer).
+   *
+   * It is on the engine because it has to reach the TURN and the engine is the only thing that
+   * resolved it: `worker.ts` stamps it on `state_update{idle}._meta["omni/policy"]`, and
+   * `reduceTurn` folds `unpoliced_tool_call` out of it over the tool calls and interactions it
+   * already has. That keeps D7 intact — the SDK's local `reduceTurn()` and `GET /turns/{id}` read
+   * the same key off the same envelope and cannot disagree — where a daemon-side post-pass could
+   * not. `[]` means nothing is watched, which is the default (review finding V9).
+   */
+  readonly alertOnUnpoliced: readonly string[];
 }
 
 /** One chosen option, and why. The ONE place D4 rules 1-6 pick an id (§5.8.9). */
@@ -885,8 +906,16 @@ export interface DiffProvider {
    * worker start. NEVER throws: `null` is D8's honest answer and a git failure is not a failed turn.
    */
   begin(o: { cwd: string; workerId: WorkerId; signal?: AbortSignal }): Promise<PatchHandle | null>;
-  /** After settle, BEFORE `idle` is emitted. NEVER throws: a failure is `text: null` + a warning. */
-  end(h: PatchHandle, o?: { signal?: AbortSignal }): Promise<PatchResult>;
+  /**
+   * After settle, BEFORE `idle` is emitted. NEVER throws: a failure is `text: null` + a warning.
+   *
+   * `wroteFiles` is §25.4's `on_write` input, and it is an OBSERVATION rather than an
+   * instruction: the worker reports whether this turn produced a write-ish tool call or a `diff`
+   * content block, and the provider — the only party that holds `diff.mode` — decides what to do
+   * with it. Absent ⇒ treated as `true`, which is `"always"`, which is what every caller written
+   * before review finding V12 already meant.
+   */
+  end(h: PatchHandle, o?: { signal?: AbortSignal; wroteFiles?: boolean }): Promise<PatchResult>;
   /** Best effort; deletes the temp index when a turn dies without an `end`. NEVER throws. */
   abandon(h: PatchHandle): void;
 }
@@ -989,7 +1018,20 @@ export interface WebhookDispatcher {
     target: WebhookTarget,
     tokenId: TokenId,
   ): DeliveryId;
-  redeliver(id: DeliveryId): Promise<DeliveryRecord>;
+  /**
+   * Replays one dead letter, RE-RUNNING the SSRF gate first (review finding V1).
+   *
+   * `tokenId` is the D13 scope and `undefined` means "no scope", which is admin — the same
+   * spelling `DeliveryStore.list` / `.redeliver` already take, so a row a token may not LIST is a
+   * row it may not REPLAY. It is a parameter here rather than a second method for exactly that
+   * reason: two verbs with one rule cannot drift.
+   *
+   * This is the ONLY redeliver a caller outside `core/webhook` may use. The store's own
+   * `redeliver` flips a row back to `pending` and nothing else, so a route that called it would
+   * re-POST hours later to a host whose name now resolves into `denyCidrs` — the create-time
+   * check being the only one that ever ran.
+   */
+  redeliver(id: DeliveryId, tokenId?: TokenId): Promise<DeliveryRecord>;
   /** Drains what is due right now and returns when the in-flight set is empty. Tests and `stop()`. */
   drain(o?: { timeoutMs?: number }): Promise<void>;
   stop(): Promise<void>;
@@ -1201,13 +1243,35 @@ export interface WorkerHandle {
 
   // ── M2 (§5.8.8) ────────────────────────────────────────────────────────────
 
-  /** H22. Lease-gated by the caller; the handle enforces state, not identity. */
+  /**
+   * H22, and §19.6's check ORDER is this method's contract (review finding V10):
+   * worker state → interaction existence → lease → body SHAPE → semantics.
+   *
+   * `a` is `unknown` for that last reason and no other: the shape is checked here, after the
+   * lease, so a malformed body from a non-holder is `423 lease_held` and not `400`. A route that
+   * parsed first — or a registry that did — inverts two rows of the table that §19.6 spells out.
+   * An in-process caller may pass an `InteractionAnswerBody`; it is parsed again and unchanged.
+   *
+   * Existence precedes the lease deliberately: the pending set is already public through the
+   * UNGATED `GET /interactions` (rule L2), so answering `404 interaction_not_found` for a stale
+   * request id leaks nothing and stops a stale id being reported as a lease problem it does not
+   * have.
+   */
   answerInteraction(
     id: InteractionId,
-    a: InteractionAnswer,
+    a: unknown,
     who: ClientRef & { tokenId: TokenId },
   ): InteractionAnswerResult;
   readonly interactions: readonly InteractionSnapshot[];
+  /**
+   * §19.8's FIRST rung, reachable from the registry (review finding V11).
+   *
+   * `daemon.stop()` settles every parked interaction BEFORE it drains the dispatcher and closes
+   * the workers: an agent blocked on our answer may never read the shutdown, and a JSON-RPC
+   * promise nobody resolved is a process that will not exit. Idempotent, and it never throws —
+   * `Worker.close` settles again with `"close"` and finds nothing left to do.
+   */
+  settleInteractions(reason: "shutdown"): Promise<void>;
   /** H24. `409 worker_busy` unless `ready`; auto-wakes a `hibernated` worker exactly as `prompt`
    *  does. */
   setConfig(body: SetConfigBody, who: ClientRef): Promise<SetConfigResponse>;
@@ -1268,6 +1332,12 @@ export interface WorkerRegistry {
   list(auth: AuthContext): readonly WorkerSnapshot[];
   delete(id: WorkerId, auth: AuthContext): Promise<CloseResult>;
   closeAll(reason: WorkerCloseReason, opts?: { timeoutMs?: number }): Promise<void>;
+  /**
+   * §19.8 / §24.4 rule 5's first rung: settle every LIVE worker's parked interactions, so
+   * `daemon.stop()` can run it before it drains the dispatcher (review finding V11). Best effort
+   * over the fleet — one worker that cannot settle must not hold the shutdown open.
+   */
+  settleAllInteractions(): Promise<void>;
 
   // ── result-returning façade (review R11) ──────────────────────────────────
   //
@@ -1307,12 +1377,18 @@ export interface WorkerRegistry {
 
   // ── M2 façade rows (H22-H24), same rule: parse -> ONE call -> serialize ────
 
-  /** H22: `200 InteractionAnswerResult`. */
+  /**
+   * H22: `200 InteractionAnswerResult`.
+   *
+   * `body` is `unknown` because §19.6 puts the body SHAPE after the lease (review finding V10):
+   * the route hands the raw JSON straight through and `Worker.answerInteraction` parses it at the
+   * one point in the order where a `400` is the right answer.
+   */
   answer(
     id: WorkerId,
     auth: AuthContext,
     reqId: InteractionId,
-    body: InteractionAnswerBody,
+    body: unknown,
   ): InteractionAnswerResult;
   /** H23: `200 InteractionListResponse`. UNGATED (rule L2) — reading the pending set is an
    *  observer's right. */
@@ -1357,6 +1433,13 @@ export interface Daemon {
    */
   readonly runs: RunRegistry;
   readonly deliveries: DeliveryStore;
+  /**
+   * M2-B (D9). Always present, beside `deliveries` and for the reason review finding V1 found:
+   * `POST /v1/webhooks/deliveries/{id}/redeliver` must go through the DISPATCHER, which re-runs
+   * `assertWebhookUrl` before a replay, and never through a bare store write. With no dispatcher
+   * wired every verb answers `bad_request` naming M2-B-WP-R — D29's honest "not implemented yet".
+   */
+  readonly dispatcher: WebhookDispatcher;
 
   /**
    * The in-process entry to everything `AuthContext` gates (D15's library-first path).

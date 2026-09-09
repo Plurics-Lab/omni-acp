@@ -5,7 +5,6 @@ import type {
   PolicySubject,
   PolicyVerdict,
   ResolvedPolicy,
-  TurnWarning,
 } from "@omni-acp/protocol";
 import { globHead, isAbsolutePattern, normalizeSeparators, withinRoot } from "./glob.js";
 
@@ -260,20 +259,13 @@ export function clampVerdict(
 }
 
 /**
- * The clamp's other half: it is announced on the TURN as well as on the decision.
+ * §20.5's other half, re-exported.
  *
- * A policy that is quietly narrower than it reads is how an operator plans around a rule that
- * never fires, so §20.5 requires both records and this is the one that reaches `TurnResult`.
- * `null` when nothing was clamped, so a caller can append it unconditionally.
- *
- * Owned by M2-B-WP-P.
+ * It USED to be implemented here, and review finding V9 is why it is not: it had unit tests and
+ * ZERO production callers, because the one caller that can put the warning on a turn without
+ * breaking D7 is `reduceTurn` — the fold the SDK runs locally and `GET /turns/{id}` runs
+ * server-side — and `@omni-acp/protocol` may not import `@omni-acp/core`. So it moved down a
+ * layer and takes `{clamped, action, rule}`, to which a `PolicyVerdict` is still structurally
+ * assignable; every caller here is unchanged.
  */
-export function policyClampWarning(v: PolicyVerdict): TurnWarning | null {
-  if (v.clamped === null) return null;
-  return {
-    code: "policy_clamped",
-    message: `"${v.clamped.from}" was narrowed to "${v.action}" by ${v.clamped.by}`,
-    source: "policy",
-    detail: { from: v.clamped.from, to: v.action, by: v.clamped.by, rule: v.rule },
-  };
-}
+export { policyClampWarning } from "@omni-acp/protocol";

@@ -555,9 +555,15 @@ const EXPECTED: Record<string, readonly string[]> = {
     "isTurnId",
     "isWorkerId",
     "parseWorkerRef",
+    // Both moved DOWN from `@omni-acp/core/policy` in review round 2 (finding V9): they had unit
+    // tests and no production caller, because the one caller that can put their warnings on a
+    // turn without breaking D7 is `reduceTurn` — and `protocol` may not import `core`. Core still
+    // re-exports each under its old name, so nothing that imported them has moved.
+    "policyClampWarning",
     "redactArgs",
     "reduceTurn",
     "turnStatus",
+    "unpolicedToolCalls",
     "verifySecret",
     "workerRef",
   ],

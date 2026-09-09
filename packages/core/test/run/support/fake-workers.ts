@@ -268,6 +268,10 @@ export function fakeWorkers(o: {
     closeAll: async () => {
       for (const h of handles) await h.close("shutdown");
     },
+    // §19.8's first rung, reachable from the registry (review finding V11). These handles hold no
+    // interaction strategy at all, so there is nothing to settle — and it is a SHUTDOWN path,
+    // which must be total.
+    settleAllInteractions: () => Promise.resolve(),
     snapshot: (id) => byId(id).snapshot(),
     prompt: async (id, _auth, body) =>
       await byId(id).prompt(body.content, { tokenId: "alice" as TokenId, clientId: null }),

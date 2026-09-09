@@ -130,6 +130,9 @@ describe("DaemonConfig", () => {
         allow: [],
         denyCidrs: [
           "127.0.0.0/8",
+          // `0.0.0.0` is a localhost alias on Linux; review V7 found it ALLOWED by a default
+          // that refused every other spelling of "this machine".
+          "0.0.0.0/8",
           "::1/128",
           "169.254.0.0/16",
           "fe80::/10",
