@@ -21,4 +21,13 @@ export type {
   SessionStrategy,
   WorkerRow,
   WorkerStore,
+  // ── M2 (CONTRACTS.md §5.8.8) ──────────────────────────────────────────────
+  DeliveryStore,
+  DiffProvider,
+  InteractionStrategy,
+  PolicyEngine,
+  RunRegistry,
+  RunStore,
+  Watchdog,
+  WebhookDispatcher,
 } from "@omni-acp/protocol";

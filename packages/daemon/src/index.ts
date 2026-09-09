@@ -22,3 +22,14 @@ export { recoverFromPreviousBoot } from "./boot-recovery.js";
 export { openDaemonPersistence } from "./event-store.js";
 export { registerLeaseRoutes } from "./http/routes/lease.js";
 export { registerAgentRoutes } from "./http/routes/agents.js";
+
+// ── M2 additions (CONTRACTS.md §5.8.10) ─────────────────────────────────────
+export { registerInteractionRoutes } from "./http/routes/interactions.js";
+export { registerConfigRoutes } from "./http/routes/config.js";
+export { registerRunRoutes } from "./http/routes/runs.js";
+export { registerWebhookRoutes } from "./http/routes/webhooks.js";
+export { resolvePolicyForRequest } from "./policy/resolve.js";
+export { ceilingFor } from "./policy/ceiling.js";
+export { resolveMcpForWorker } from "./mcp.js";
+export { createRunSubsystem } from "./runs.js";
+export type { DeliveryStore, RunRegistry } from "./types.js";

@@ -192,11 +192,16 @@ describe("WorkerRegistry.create (H5, H14)", () => {
 
   it("rejects a malformed request body the same way for an in-process caller (D15)", async () => {
     const h = await harness();
+    // M2 OPENS `mcp`, `onUnresolved` and `env` (§5.8.6), so what is still refused here is what a
+    // client may never express AT ALL: a missing `cwd`, an unknown key, a value outside an enum,
+    // and — the load-bearing one — an MCP entry that is anything but a preset NAME (DESIGN §8's
+    // 🔴, enforced by the TYPE rather than by a validator somebody could move).
     const bad: unknown[] = [
       { agent: "example" },
-      { agent: "example", cwd: root, mcp: ["preset"] },
-      { agent: "example", cwd: root, onUnresolved: "park" },
-      { agent: "example", cwd: root, env: { X: "1" } },
+      { agent: "example", cwd: root, mcp: [{ command: "npx", args: ["-y", "server"] }] },
+      { agent: "example", cwd: root, onUnresolved: "allow" },
+      { agent: "example", cwd: root, parkTimeoutAction: "allow" },
+      { agent: "example", cwd: root, nope: 1 },
       { agent: "example", cwd: root, timeoutMs: 10 },
     ];
     for (const body of bad) {
@@ -380,17 +385,31 @@ describe("WorkerRegistry façade (review R11)", () => {
     expect(running?.payload).toMatchObject({ sessionUpdate: "state_update", state: "running" });
   });
 
-  it("rejects a non-text content block with 400 — the M0 pre-check (§2.3)", async () => {
+  /**
+   * H28 (§5.8.6). The block-TYPE decision moved OUT of `PromptRequestBody` and into the worker's
+   * `assertPromptContent`, because zod holds no worker: it can enforce neither this agent's
+   * `promptCapabilities` nor this token's `cwdRoots`, and DESIGN §5.1 requires both.
+   *
+   * What the registry still owns is the SHAPE — an empty array, an over-long one, an unknown key
+   * — and this test asserts exactly that boundary. The type gate has its own coverage against a
+   * real `Worker` in `core/test/worker/prompt.test.ts`; this suite runs a fake one, so asserting
+   * it here would only be asserting the fake.
+   */
+  it("rejects a malformed prompt body, and leaves block TYPES to the worker (H28)", async () => {
     const h = await harness();
     const handle = await h.registry.create(request(), h.user);
     await expect(
-      h.registry.prompt(handle.id, h.user, {
-        content: [{ type: "resource_link", uri: "file:///etc/passwd" }],
-      } as never),
+      h.registry.prompt(handle.id, h.user, { content: [] } as never),
     ).rejects.toMatchObject({ code: "bad_request", status: 400 });
     await expect(
-      h.registry.prompt(handle.id, h.user, { content: [] } as never),
-    ).rejects.toMatchObject({ code: "bad_request" });
+      h.registry.prompt(handle.id, h.user, { content: [{ text: "no type" }] } as never),
+    ).rejects.toMatchObject({ code: "bad_request", status: 400 });
+    await expect(
+      h.registry.prompt(handle.id, h.user, {
+        content: [{ type: "text", text: "hi" }],
+        stream: true,
+      } as never),
+    ).rejects.toMatchObject({ code: "bad_request", status: 400 });
   });
 
   it("surfaces worker_busy and worker_closed from the handle without re-deciding them", async () => {

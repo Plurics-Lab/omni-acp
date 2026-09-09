@@ -23,6 +23,13 @@ describe("ERROR_STATUS", () => {
       agent_error: 502,
       agent_timeout: 504,
       internal: 500,
+      // ── M2's TWO additions, and the ONLY renegotiation of DESIGN §5.4's table (ruling M2-R2).
+      //
+      // They exist because two addressable resources share one path: a bare 404 on
+      // `/v1/workers/{wid}/interactions/{reqId}` cannot say WHICH is gone, and a client that
+      // retries a worker 404 by recreating its worker would do so over a stale reqId.
+      interaction_not_found: 404,
+      interaction_settled: 409,
     });
     expect(Object.keys(ERROR_STATUS).sort()).toEqual([...OMNI_ERROR_CODES].sort());
     for (const code of OMNI_ERROR_CODES) {

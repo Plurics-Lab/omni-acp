@@ -27,6 +27,14 @@ describe("DaemonConfig", () => {
           agents: "*",
           cwdRoots: [],
           maxWorkers: 16,
+          // ── M2 (§5.8.7). Both MCP and policy default FAIL CLOSED where it matters: a token
+          // gets `mcpPresets: []` (an MCP server is arbitrary code on this machine, DESIGN §8's
+          // 🔴) and `envAllow: []`, while `policyPresets` stays `"*"` because a preset is only
+          // ever a NARROWING of what `policyCeiling: null` already permits.
+          policyCeiling: null,
+          policyPresets: "*",
+          mcpPresets: [],
+          envAllow: [],
         },
       ],
       agents: [],
@@ -83,6 +91,57 @@ describe("DaemonConfig", () => {
       },
       resume: { replay: "mark_all" },
       logLevel: "info",
+      // ── M2 (§5.8.7). Every block DEFAULTS, which is Land exit criterion 2: an unmodified M1
+      // config file still parses, and it parses into exactly this.
+      policy: { presets: {}, default: "deny-all" },
+      mcpServers: {},
+      watchdog: {
+        enabled: true,
+        // DESIGN §7's two budgets. `toolMs` is the LARGER because F36 says an open tool call can
+        // be a permanent condition — `npm install` silent for 20 minutes is normal.
+        silentMs: 300_000,
+        toolMs: 1_800_000,
+        cancelTimeoutMs: 60_000,
+        action: "cancel",
+      },
+      interaction: {
+        parkTimeoutMs: 600_000,
+        // Never `"allow"`: an auto-allow on a timer is a remote-execution primitive whose only
+        // guard is a clock (ruling M2-R7).
+        parkTimeoutAction: "deny",
+        // D4 rule 3 is absolute for the daemon unless an operator says otherwise (F26).
+        allowAlways: "never",
+        maxParked: 8,
+        // D10, narrowed: no `url` elicitation — there is no browser here (§5.8.7).
+        declareUrlElicitation: false,
+      },
+      diff: { provider: "none", mode: "on_write", timeoutMs: 15_000, maxBytes: 4 * 1024 * 1024 },
+      webhooks: {
+        // FAIL CLOSED on the daemon's first OUTBOUND surface: disabled, and `allowlist` with an
+        // empty `allow` even once it is enabled.
+        enabled: false,
+        backoffMs: [0, 30_000, 120_000, 600_000, 1_800_000, 7_200_000],
+        jitter: 0.1,
+        timeoutMs: 10_000,
+        maxConcurrent: 4,
+        retentionDays: 30,
+        secrets: {},
+        mode: "allowlist",
+        allow: [],
+        denyCidrs: [
+          "127.0.0.0/8",
+          "::1/128",
+          "169.254.0.0/16",
+          "fe80::/10",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "fc00::/7",
+        ],
+        maxBodyBytes: 64 * 1024,
+      },
+      run: { maxConcurrent: 16, maxDurationMs: 3_600_000, retentionDays: 30 },
+      envDeny: [],
     });
   });
 
@@ -183,16 +242,38 @@ describe("CreateWorkerRequest", () => {
     });
   });
 
-  it('rejects an unknown key, a non-empty mcp, and onUnresolved:"park"', () => {
+  /**
+   * M2 OPENS the three fields M0 shut (§5.8.6). What is still refused is what a client may never
+   * express at all: an unknown key, and — the load-bearing one — anything that would let a body
+   * name an MCP *command* rather than a preset NAME (DESIGN §8's 🔴, enforced by the TYPE).
+   */
+  it("rejects an unknown key, and accepts M2's mcp names / policy / env / park", () => {
     const base = { agent: "example", cwd: "/tmp/x" };
-    expect(CreateWorkerRequest.safeParse({ ...base, env: { A: "1" } }).success).toBe(false);
-    expect(CreateWorkerRequest.safeParse({ ...base, policy: {} }).success).toBe(false);
-    expect(CreateWorkerRequest.safeParse({ ...base, mcp: ["fs"] }).success).toBe(false);
-    expect(CreateWorkerRequest.safeParse({ ...base, onUnresolved: "park" }).success).toBe(false);
-    expect(CreateWorkerRequest.safeParse({ ...base, onUnresolved: "fail" }).success).toBe(false);
+    expect(CreateWorkerRequest.safeParse({ ...base, env: { A: "1" } }).success).toBe(true);
+    expect(CreateWorkerRequest.safeParse({ ...base, policy: "readonly" }).success).toBe(true);
+    expect(CreateWorkerRequest.safeParse({ ...base, mcp: ["fs"] }).success).toBe(true);
+    expect(CreateWorkerRequest.safeParse({ ...base, onUnresolved: "park" }).success).toBe(true);
+    expect(CreateWorkerRequest.safeParse({ ...base, onUnresolved: "fail" }).success).toBe(true);
+    // A preset NAME is a string. A command is not expressible, at any depth.
+    expect(
+      CreateWorkerRequest.safeParse({ ...base, mcp: [{ command: "npx", args: [] }] }).success,
+    ).toBe(false);
+    expect(CreateWorkerRequest.safeParse({ ...base, nope: 1 }).success).toBe(false);
+    expect(CreateWorkerRequest.safeParse({ ...base, onUnresolved: "allow" }).success).toBe(false);
+    // Ruling M2-R7: `parkTimeoutAction` has no `"allow"` — an auto-allow on a timer is a
+    // remote-execution primitive whose only guard is a clock.
+    expect(CreateWorkerRequest.safeParse({ ...base, parkTimeoutAction: "allow" }).success).toBe(
+      false,
+    );
     expect(CreateWorkerRequest.safeParse({ ...base, timeoutMs: 999 }).success).toBe(false);
     expect(CreateWorkerRequest.safeParse({ ...base, timeoutMs: 600_001 }).success).toBe(false);
     expect(CreateWorkerRequest.safeParse({ agent: "", cwd: "/tmp" }).success).toBe(false);
+  });
+
+  it('defaults onUnresolved to "deny" — M1\'s behaviour, and the only fail-closed value', () => {
+    expect(CreateWorkerRequest.parse({ agent: "example", cwd: "/tmp/x" }).onUnresolved).toBe(
+      "deny",
+    );
   });
 });
 
@@ -208,16 +289,33 @@ describe("PromptRequestBody", () => {
     });
   });
 
-  it("rejects every non-text block, an empty array and unknown keys (H8 -> 400)", () => {
+  /**
+   * H28 (§5.8.6). The text-only `.refine` is DELETED, not widened, and the check MOVED into
+   * `WorkerRegistry.prompt()` → `assertPromptContent()` — the only layer that holds this agent's
+   * `promptCapabilities` and this token's `cwdRoots`, both of which DESIGN §5.1 requires.
+   *
+   * So the SCHEMA now accepts a `resource_link`, and the 400 still comes back: from the worker.
+   * `assert-prompt-content-is-called` is the guard that keeps the move honest, because a schema
+   * that silently stopped enforcing containment looks exactly like one that got more capable.
+   */
+  it("no longer decides block TYPES — that moved to assertPromptContent (H28)", () => {
     expect(
       PromptRequestBody.safeParse({
         content: [{ type: "resource_link", uri: "file:///etc/passwd" }],
       }).success,
-    ).toBe(false);
+    ).toBe(true);
     expect(PromptRequestBody.safeParse({ content: [{ type: "image", data: "…" }] }).success).toBe(
-      false,
+      true,
     );
+  });
+
+  it("still rejects an empty array, an over-long one and unknown keys (H8 -> 400)", () => {
     expect(PromptRequestBody.safeParse({ content: [] }).success).toBe(false);
+    expect(
+      PromptRequestBody.safeParse({
+        content: Array.from({ length: 65 }, () => ({ type: "text", text: "x" })),
+      }).success,
+    ).toBe(false);
     expect(
       PromptRequestBody.safeParse({ content: [{ type: "text", text: "hi" }], stream: true })
         .success,

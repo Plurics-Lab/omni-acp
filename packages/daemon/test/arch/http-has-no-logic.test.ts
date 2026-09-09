@@ -167,8 +167,15 @@ describe("guard: http-has-no-logic", () => {
       "auth-middleware.ts",
       "errors.ts",
       "routes/agents.ts",
+      // M2's four route modules (H22-H26). Each feature adds its OWN file beside `workers.ts`,
+      // which is M1's routes split reused unchanged — and every one of them is covered by the
+      // same guard, recursively, which is what this list exists to keep true.
+      "routes/config.ts",
       "routes/index.ts",
+      "routes/interactions.ts",
       "routes/lease.ts",
+      "routes/runs.ts",
+      "routes/webhooks.ts",
       "routes/workers.ts",
       "sse.ts",
     ]);

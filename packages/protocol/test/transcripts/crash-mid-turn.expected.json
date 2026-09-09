@@ -8,12 +8,15 @@
     "toolCalls": [],
     "changes": [],
     "patch": null,
+    "patchInfo": null,
     "vendorPatch": null,
     "interactions": [],
     "verdict": "failed",
     "warnings": [],
     "failedToolCalls": [],
     "deniedToolCalls": [],
+    "strandedToolCalls": [],
+    "pendingInteractions": [],
     "error": {
       "code": "agent_error",
       "message": "agent exited during a turn"

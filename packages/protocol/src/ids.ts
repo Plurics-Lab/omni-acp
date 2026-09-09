@@ -5,6 +5,17 @@ import type { IdGen } from "./contracts.js";
 export type DaemonId = `d_${string}`;
 export type WorkerId = `w_${string}`;
 export type TurnId = `t_${string}`;
+/**
+ * One InteractionRequest (M2).
+ *
+ * DAEMON-MINTED, and that is the whole point: F33 — `elicitation/create` and
+ * `session/request_permission` share ONE agent→client JSON-RPC id counter, so the transport id
+ * is not an identity a route may address. The `interaction-id-is-daemon-minted` guard forbids
+ * reading a JSON-RPC id as one.
+ */
+export type InteractionId = `x_${string}`;
+export type RunId = `r_${string}`;
+export type DeliveryId = `dl_${string}`;
 export type TokenId = string;
 export type ClientId = string;
 /** Agent-assigned. Opaque. NEVER parsed, NEVER pattern-matched. */
@@ -22,10 +33,16 @@ export const ID_PATTERN: {
   readonly daemon: RegExp;
   readonly worker: RegExp;
   readonly turn: RegExp;
+  readonly interaction: RegExp;
+  readonly run: RegExp;
+  readonly delivery: RegExp;
 } = {
   daemon: /^d_[0-9A-HJKMNP-TV-Z]{26}$/,
   worker: /^w_[0-9A-HJKMNP-TV-Z]{26}$/,
   turn: /^t_[0-9A-HJKMNP-TV-Z]{26}$/,
+  interaction: /^x_[0-9A-HJKMNP-TV-Z]{26}$/,
+  run: /^r_[0-9A-HJKMNP-TV-Z]{26}$/,
+  delivery: /^dl_[0-9A-HJKMNP-TV-Z]{26}$/,
 };
 
 export function isDaemonId(s: string): s is DaemonId {
@@ -38,6 +55,18 @@ export function isWorkerId(s: string): s is WorkerId {
 
 export function isTurnId(s: string): s is TurnId {
   return ID_PATTERN.turn.test(s);
+}
+
+export function isInteractionId(s: string): s is InteractionId {
+  return ID_PATTERN.interaction.test(s);
+}
+
+export function isRunId(s: string): s is RunId {
+  return ID_PATTERN.run.test(s);
+}
+
+export function isDeliveryId(s: string): s is DeliveryId {
+  return ID_PATTERN.delivery.test(s);
 }
 
 /**
@@ -53,6 +82,29 @@ export function assertWorkerId(s: string): WorkerId {
 export function assertTurnId(s: string): TurnId {
   if (isTurnId(s)) return s;
   throw new OmniError("bad_request", "malformed turn id", { detail: { value: s } });
+}
+
+/**
+ * M2. Same elision rule as `assertWorkerId`: the value arrives from the wire and is kept in
+ * `detail`, which never crosses it.
+ *
+ * MIGRATION. `InteractionPayload.requestId` becomes an `InteractionId` at the TYPE level, but
+ * `eventEnvelopeSchema` keeps `z.string()` for that field so an M1-era persisted envelope
+ * carrying `perm_1757…_3` still parses. Only NEWLY minted ids are `x_<ULID>` (§5.8.1).
+ */
+export function assertInteractionId(s: string): InteractionId {
+  if (isInteractionId(s)) return s;
+  throw new OmniError("bad_request", "malformed interaction id", { detail: { value: s } });
+}
+
+export function assertRunId(s: string): RunId {
+  if (isRunId(s)) return s;
+  throw new OmniError("bad_request", "malformed run id", { detail: { value: s } });
+}
+
+export function assertDeliveryId(s: string): DeliveryId {
+  if (isDeliveryId(s)) return s;
+  throw new OmniError("bad_request", "malformed delivery id", { detail: { value: s } });
 }
 
 export function workerRef(d: DaemonId, w: WorkerId): WorkerRef {
@@ -149,5 +201,10 @@ export function createIdGen(opts?: { now?: () => number; random?: () => number }
     worker: () => `w_${next()}`,
     turn: () => `t_${next()}`,
     request: () => next(),
+    // M2 (§5.8.1). Same monotonic body, three more prefixes — a `DeliveryId` is not assignable
+    // to a `RunId` with no brand ceremony (D12).
+    interaction: () => `x_${next()}`,
+    run: () => `r_${next()}`,
+    delivery: () => `dl_${next()}`,
   };
 }

@@ -40,6 +40,11 @@ describe("createWorker — the successful handshake (WP-4 acceptance 1)", () => 
       configOptions: null,
       modes: null,
       extensions: [],
+      // M2 (§5.8.4): D10's gate, recorded AS SENT. `{}` here is D3 and byte-for-byte M1 — this
+      // worker was created with no `clientCapabilities` dep, so nothing was declared. F28 is why
+      // it is recorded at all: `initialize`'s `agentCapabilities` never mentions elicitation
+      // either way, so OUR declaration is the only record of why an agent asked in prose.
+      clientCapabilities: {},
     });
     expect(snap.process?.pid).toBeGreaterThan(0);
     expect(snap.closeReason).toBeNull();

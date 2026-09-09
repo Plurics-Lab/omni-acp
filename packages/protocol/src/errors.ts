@@ -1,8 +1,16 @@
 import { AcpRequestError } from "./acp.js";
 import type { LeaseSnapshot } from "./lease.js";
 import type { ResumeReport } from "./resume.js";
+import type { InteractionSnapshot } from "./worker.js";
 
-/** Exactly DESIGN §5.4. No additions — see CONTRACTS.md §11 D29. */
+/**
+ * DESIGN §5.4, plus M2's TWO additions and nothing else (ruling M2-R2).
+ *
+ * M2 is the only renegotiation of the table, and it buys exactly one thing: two addressable
+ * resources share one path. A bare 404 on `/v1/workers/{wid}/interactions/{reqId}` cannot say
+ * WHICH of the two is gone, and a client that retries a worker 404 by recreating its worker
+ * would then do so over a stale reqId.
+ */
 export const OMNI_ERROR_CODES = [
   "bad_request",
   "unauthorized",
@@ -17,6 +25,9 @@ export const OMNI_ERROR_CODES = [
   "agent_error",
   "agent_timeout",
   "internal",
+  // ── M2 (§5.8.2) ───────────────────────────────────────────────────────────
+  "interaction_not_found",
+  "interaction_settled",
 ] as const;
 export type OmniErrorCode = (typeof OMNI_ERROR_CODES)[number];
 
@@ -40,6 +51,8 @@ export const ERROR_STATUS: { readonly [C in OmniErrorCode]: number } = {
   agent_error: 502,
   agent_timeout: 504,
   internal: 500,
+  interaction_not_found: 404,
+  interaction_settled: 409,
 };
 
 /** The agent's JSON-RPC error, passed through verbatim and never reshaped. */
@@ -60,6 +73,13 @@ export interface OmniErrorBody {
   lease?: LeaseSnapshot;
   /** ONLY on `not_resumable` (422). Which of D2's four states fired, and on what evidence. */
   resume?: ResumeReport;
+  /**
+   * ONLY on `interaction_settled` (409) — the same courtesy `lease` pays on a 423: WHO settled
+   * it, WHEN and HOW, without a second round trip that may already be stale (§5.8.2).
+   */
+  interaction?: InteractionSnapshot;
+  /** ONLY on `policy_exceeds_ceiling` (403). Which ceiling, and which rules it refused. */
+  policy?: { ceiling: string; offending: readonly string[] };
 }
 
 /** True for the AbortController / AbortSignal.timeout families, cross-realm. */
@@ -94,6 +114,10 @@ export class OmniError extends Error {
   readonly lease?: LeaseSnapshot;
   /** Present only on `not_resumable`; the evidence behind D2's four-state verdict (§15). */
   readonly resume?: ResumeReport;
+  /** Present only on `interaction_settled`; who settled it and how (M2, §19.6). */
+  readonly interaction?: InteractionSnapshot;
+  /** Present only on `policy_exceeds_ceiling`; which ceiling refused which rules (M2, §20.5). */
+  readonly policy?: { ceiling: string; offending: readonly string[] };
   /** Machine-readable extras that never cross the wire (pid, exit code, path...). */
   readonly detail?: Readonly<Record<string, unknown>>;
 
@@ -106,6 +130,8 @@ export class OmniError extends Error {
       detail?: Record<string, unknown>;
       lease?: LeaseSnapshot;
       resume?: ResumeReport;
+      interaction?: InteractionSnapshot;
+      policy?: { ceiling: string; offending: readonly string[] };
     },
   ) {
     super(message, opts?.cause === undefined ? undefined : { cause: opts.cause });
@@ -115,6 +141,8 @@ export class OmniError extends Error {
     this.acp = opts?.acp;
     this.lease = opts?.lease;
     this.resume = opts?.resume;
+    this.interaction = opts?.interaction;
+    this.policy = opts?.policy;
     this.detail = opts?.detail;
   }
 
@@ -132,6 +160,8 @@ export class OmniError extends Error {
       ...(this.acp === undefined ? {} : { acp: this.acp }),
       ...(this.lease === undefined ? {} : { lease: this.lease }),
       ...(this.resume === undefined ? {} : { resume: this.resume }),
+      ...(this.interaction === undefined ? {} : { interaction: this.interaction }),
+      ...(this.policy === undefined ? {} : { policy: this.policy }),
     };
   }
 

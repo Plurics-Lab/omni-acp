@@ -1,7 +1,14 @@
 import type { StopReason, ToolCallContent, ToolCallStatus } from "./acp.js";
 import type { OmniErrorBody, OmniErrorCode } from "./errors.js";
-import type { EventEnvelope, WorkerCloseReason, WorkerStatePayload } from "./events.js";
-import type { Seq, TurnId, WorkerId } from "./ids.js";
+import type {
+  EventEnvelope,
+  InteractionActor,
+  InteractionKind,
+  InteractionMethod,
+  WorkerCloseReason,
+  WorkerStatePayload,
+} from "./events.js";
+import type { InteractionId, Seq, TurnId, WorkerId } from "./ids.js";
 
 export interface FileChange {
   readonly path: string;
@@ -29,8 +36,9 @@ export interface TurnWarning {
   /** "rate_limit" | "tool_denied" | "tool_failed" | "permission_not_offered" | … */
   readonly code: string;
   readonly message: string;
-  /** Where it came from, so a consumer can weigh it. `stderr` is the weakest and is descriptor-gated. */
-  readonly source: "usage_meta" | "stderr" | "policy" | "tool_status";
+  /** Where it came from, so a consumer can weigh it. `stderr` is the weakest and is descriptor-gated.
+   *  M2 adds `patch` (D8's honest nulls, §25) and `watchdog` (DESIGN §7's dual budget, §21). */
+  readonly source: "usage_meta" | "stderr" | "policy" | "tool_status" | "patch" | "watchdog";
   readonly detail?: Readonly<Record<string, unknown>>;
 }
 
@@ -46,9 +54,20 @@ export interface ToolCallView {
 }
 
 export interface InteractionRecord {
-  readonly requestId: string;
+  readonly requestId: InteractionId;
+  /** M2. `permission` for every M1-written decision — an M1 daemon knew no other kind. */
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
   readonly title: string;
-  readonly decision: "allow" | "deny" | "error";
+  /** M2 widens this: `answer` / `cancel` are the elicitation arms, and an accepted elicitation is
+   *  not a granted permission (§5.8.3). */
+  readonly decision: "allow" | "deny" | "answer" | "cancel" | "error";
+  readonly by: InteractionActor;
+  /** ms spent parked. 0 for an auto-resolved interaction, which is every M1 one. */
+  readonly parkedMs: number;
+  /** F32's join: the same interaction is ALSO a `tool_call` in the stream. `toolCalls` keeps the
+   *  tool call, `interactions` keeps the decision, neither duplicates the other. */
+  readonly toolCallId: string | null;
   readonly optionId: string | null;
   readonly rule: string;
   readonly at: string;
@@ -64,9 +83,26 @@ export interface TurnResult {
   readonly toolCalls: readonly ToolCallView[];
   /** From ToolCallContent{type:"diff"} (CONTRACTS.md F5). */
   readonly changes: readonly FileChange[];
-  /** STILL `null` in M1 (D8, ruling M1-R11). The git provider is M2 and is the only thing that
-   *  may fill it, because only it can compare against the actual disk. */
+  /**
+   * D8's disk truth, filled by the git provider (§25) and by nothing else. `null` outside a repo,
+   * when no provider is wired, when `patchMode` skipped this turn, when git failed, or over
+   * `diff.maxBytes` — and **every one of those nulls carries a `TurnWarning{source:"patch"}`
+   * saying which**.
+   *
+   * It rides on `state_update{idle}._meta["omni/patch"]`, exactly as `vendorPatch` and `warnings`
+   * already do, so this fold stays PURE and cannot spawn `git` — and the SDK's local
+   * `reduceTurn()` and the daemon's `GET /turns/{id}` still cannot disagree (D7, DESIGN §5.5).
+   */
   readonly patch: string | null;
+  /** Present when a provider ran; `null` when no `omni/patch` key was on `idle` — which is every
+   *  M1 turn, so every M1 golden asserting `patch: null` passes unchanged. */
+  readonly patchInfo: {
+    readonly source: "git" | null;
+    readonly truncated: boolean;
+    /** "shared_worktree" ⇒ another live worker shares this repo, so the patch may contain ITS
+     *  edits and can even contain a half-written file. We report rather than misattribute (§25.4). */
+    readonly quality: "exact" | "shared_worktree" | "unavailable";
+  } | null;
   /**
    * A patch reconstructed from a descriptor-registered VENDOR `_meta` extension, clearly labelled
    * as such. For claude-acp that is `_meta.claudeCode.toolResponse.{structuredPatch, originalFile,
@@ -96,8 +132,26 @@ export interface TurnResult {
   readonly warnings: readonly TurnWarning[];
   /** Tool calls whose FINAL status is "failed", in stream order. */
   readonly failedToolCalls: readonly string[];
-  /** Tool calls THIS daemon denied, from our own `omni.policy_decision` — never from prose. */
+  /**
+   * PERMISSION denials only. F31: a declined elicitation leaves its tool call `completed`, so
+   * joining it here would report a tool we blocked that in fact ran. The join is gated on
+   * `method === "session/request_permission"` and there is a named table test for exactly that.
+   */
   readonly deniedToolCalls: readonly string[];
+  /**
+   * M2. Tool calls whose LAST observed status is neither `completed` nor `failed` when the turn
+   * ended — `null` counts, because "we were never told" is exactly the condition this reports.
+   *
+   * F36 is the same fact on both real agents: cancelling with a tool in flight produces **no
+   * terminal `tool_call_update` at all**. Synthesizing `failed` would be a lie (the tool may well
+   * have completed agent-side); blocking for a terminal update would hang forever. So we report,
+   * and the turn is `partial` (ruling M2-R8). Computed only when the turn is TERMINAL — a running
+   * turn strands nothing.
+   */
+  readonly strandedToolCalls: readonly string[];
+  /** M2. requestIds that were `pending` when this fold ended. For a running turn this is "waiting
+   *  for you"; for a finished one it is a bug report. */
+  readonly pendingInteractions: readonly InteractionId[];
   readonly error: OmniErrorBody | null;
 }
 
@@ -134,6 +188,13 @@ export interface TurnStatus {
 const V1_DIFF_META = "omni/v1Diff";
 const VENDOR_PATCH_META = "omni/vendorPatch";
 const WARNINGS_META = "omni/warnings";
+/**
+ * M2, seam D (M2-PLAN §1.3). The git provider hands `PatchResult` to the WORKER, which puts it on
+ * `TurnInput.prompt_result.meta`; `turn-lifecycle.ts` merges that record into `idle._meta`
+ * without reading a single key of it, and this is the one place that knows what the key means.
+ * That is what lets M2-WP-J's provider land with ZERO edits to the reducer (ruling M2-R9).
+ */
+const PATCH_META = "omni/patch";
 
 /** Only reachable when `reduceTurn` is asked about a turn no envelope mentions. */
 const UNKNOWN_WORKER_ID = "w_unknown" as WorkerId;
@@ -197,6 +258,14 @@ interface Fold {
   /** Tool calls THIS daemon denied, from our OWN `omni.policy_decision` — never from prose. */
   denied: string[];
   deniedTitles: Map<string, string>;
+  /** M2 (§5.8.5). Read off `state_update{idle}._meta["omni/patch"]`; absent ⇒ M1's null. */
+  patch: { text: string | null; info: NonNullable<TurnResult["patchInfo"]> } | null;
+  /**
+   * M2. The pending SET, keyed on `requestId`, so `InteractionRecord` is still built from ONE
+   * envelope kind (review R9) and the fold gains no second source of truth: `acp.interaction` is
+   * folded ONLY to add and remove members here.
+   */
+  pending: Set<InteractionId>;
 }
 
 function record(v: unknown): Record<string, unknown> | null {
@@ -250,7 +319,29 @@ const WARNING_SOURCES: ReadonlySet<string> = new Set([
   "stderr",
   "policy",
   "tool_status",
+  // M2 (§5.8.5).
+  "patch",
+  "watchdog",
 ]);
+
+/**
+ * `_meta["omni/patch"]` — a `PatchResult` as the provider produced it, read defensively because
+ * this fold is pure over envelopes and the key arrives through a generic channel.
+ *
+ * A malformed block is `null`, never a throw and never a half-built `patchInfo`: D8's rule is
+ * "never wrong", and a patch we cannot read is a patch we do not have.
+ */
+function readPatch(raw: unknown): Fold["patch"] {
+  const p = record(raw);
+  if (p === null) return null;
+  const quality = str(p["quality"]);
+  if (quality !== "exact" && quality !== "shared_worktree" && quality !== "unavailable") {
+    return null;
+  }
+  const source = p["source"] === "git" ? "git" : null;
+  const text = str(p["text"]);
+  return { text, info: { source, truncated: p["truncated"] === true, quality } };
+}
 
 function readWarnings(raw: unknown): TurnWarning[] {
   if (!Array.isArray(raw)) return [];
@@ -345,6 +436,9 @@ function applySessionUpdate(f: Fold, seq: Seq, payload: Record<string, unknown>)
         if (meta !== null) {
           f.vendorPatch = readVendorPatch(meta[VENDOR_PATCH_META]) ?? f.vendorPatch;
           f.streamWarnings.push(...readWarnings(meta[WARNINGS_META]));
+          // M2, seam D. The reducer that stamped this key does not know what it means; this
+          // does, and it is the only place that does (ruling M2-R9).
+          if (PATCH_META in meta) f.patch = readPatch(meta[PATCH_META]);
         }
       }
       return;
@@ -407,6 +501,8 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
     streamWarnings: [],
     denied: [],
     deniedTitles: new Map(),
+    patch: null,
+    pending: new Set<InteractionId>(),
   };
 
   // Identity first, then order.
@@ -472,10 +568,20 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
       case "omni.policy_decision": {
         // ONE envelope kind carries the whole record: `title` rides on the policy decision
         // (review R9) and `at` is the envelope's `ts`.
+        // M2 widens the row. Every added field has an M1 reading that is the truth rather than a
+        // guess: an M1 daemon knew exactly one kind, answered inline, and parked nothing.
         f.interactions.push({
           requestId: e.payload.requestId,
+          kind: e.payload.kind ?? "permission",
+          method: e.payload.method ?? "session/request_permission",
           title: e.payload.title,
           decision: e.payload.decision,
+          by: e.payload.by ?? "baseline",
+          parkedMs: e.payload.parkedMs ?? 0,
+          // `?? null` rather than the field: an M1-era envelope written before the mapper filled
+          // `toolCallId` in has no key at all, and `undefined` on a record typed `string | null`
+          // is the kind of hole a `toStrictEqual` golden is exactly right to refuse.
+          toolCallId: e.payload.toolCallId ?? null,
           optionId: e.payload.optionId,
           rule: e.payload.rule,
           at: e.ts,
@@ -483,8 +589,19 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
         // §13.4's FIRST signal, and the one we trust totally: we are the party that denied. The
         // join is by `toolCallId`, which the mapper lifted off the request — never from the
         // agent's English `rawOutput`, which is what `no-agent-prose` exists to forbid.
+        //
+        // M2 gates the join on the METHOD (F31): a DECLINED elicitation leaves its tool call
+        // `completed`, so joining it here would report a tool we blocked that in fact ran. An
+        // M1-written decision carries no `method` and is a permission by construction.
         const toolCallId = e.payload.toolCallId;
-        if (e.payload.decision === "deny" && toolCallId !== null && toolCallId !== undefined) {
+        const isPermission =
+          (e.payload.method ?? "session/request_permission") === "session/request_permission";
+        if (
+          isPermission &&
+          e.payload.decision === "deny" &&
+          toolCallId !== null &&
+          toolCallId !== undefined
+        ) {
           if (!f.denied.includes(toolCallId)) f.denied.push(toolCallId);
         }
         // D4 rule 4: nothing acceptable was offered, so the daemon answered `-32603`. That is a
@@ -502,7 +619,14 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
         f.error = errorBody(e.payload);
         break;
       case "acp.interaction":
+        // Folded ONLY for the pending set (§5.8.5): `pending` MEANS parked (ruling M2-R5), so a
+        // `pending` envelope adds and any other status removes. The RECORD still comes from
+        // `omni.policy_decision` alone, so this fold keeps one source of truth per field.
+        if (e.payload.status === "pending") f.pending.add(e.payload.requestId);
+        else f.pending.delete(e.payload.requestId);
+        break;
       case "omni.worker_state":
+      case "omni.run":
         break;
     }
 
@@ -549,6 +673,17 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
   // still a real denial, so it is kept — dropping it would under-report what we refused.
   const deniedToolCalls = f.denied;
 
+  // STILL EMPTY at the M2 Land step, exactly as `patch` was "STILL null in M1" — the field is
+  // declared here so `TurnResult`'s shape is settled once and every M1 golden gains its key
+  // additively, and M2-A-WP-W computes it (that package owns this file from the Land commit on).
+  //
+  // The rule it will implement, so the reader knows what the empty array is standing in for
+  // (ruling M2-R8): tool calls whose LAST observed status is neither `completed` nor `failed`
+  // when the turn ENDED — `null` counts, because "we were never told" is exactly the condition
+  // this reports — and only for a TERMINAL turn, because a running turn strands nothing.
+  const strandedToolCalls: readonly string[] = [];
+  const pendingInteractions = [...f.pending];
+
   const warnings: TurnWarning[] = [...f.streamWarnings];
   for (const id of deniedToolCalls) {
     warnings.push({
@@ -574,9 +709,10 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
     text: f.text,
     toolCalls,
     changes,
-    // STILL null in M1 (D8, ruling M1-R11): only a provider that can compare against the actual
-    // disk may fill it, and that is M2's git provider.
-    patch: null,
+    // D8. `null` unless a provider stamped `_meta["omni/patch"]` on this turn's `idle`, which is
+    // every M1 turn — so every M1 golden asserting `patch: null` passes unchanged (§5.8.5).
+    patch: f.patch?.text ?? null,
+    patchInfo: f.patch?.info ?? null,
     vendorPatch: f.vendorPatch,
     ...(f.usage === null ? {} : { usage: f.usage }),
     ...(f.tokens === null ? {} : { tokens: f.tokens }),
@@ -585,15 +721,22 @@ function materialize(turnId: TurnId, f: Fold): TurnResult {
     // is a schema'd enum, and an error is an envelope we wrote. `end_turn` is not consulted, and
     // could not be: corpus findings 6 and 7 show a denied tool call and an invented `optionId`
     // both ending `stopReason: "end_turn"`.
+    // M2 adds two arms to the ladder and reorders nothing: `failed` still outranks `partial`,
+    // and a turn with a stranded tool call or an unanswered interaction is honestly incomplete.
     verdict:
       f.error !== null
         ? "failed"
-        : failedToolCalls.length > 0 || deniedToolCalls.length > 0
+        : failedToolCalls.length > 0 ||
+            deniedToolCalls.length > 0 ||
+            strandedToolCalls.length > 0 ||
+            pendingInteractions.length > 0
           ? "partial"
           : "ok",
     warnings,
     failedToolCalls,
     deniedToolCalls,
+    strandedToolCalls,
+    pendingInteractions,
     error: f.error,
   };
 }

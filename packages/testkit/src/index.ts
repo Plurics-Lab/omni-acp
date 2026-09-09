@@ -23,3 +23,15 @@ export * from "./wire-agent.js";
 export * from "./fake-runtime.js";
 export * from "./tmp-persistence.js";
 export * from "./lease-conformance.js";
+
+// ── M2 additions (CONTRACTS.md §5.8.10) ─────────────────────────────────────
+//
+// `exports-are-stable` pins this surface exactly, so every name below is a deliberate published
+// addition rather than a test convenience that leaked (see `corpus-facts.ts`'s note).
+export * from "./interaction-conformance.js";
+export * from "./policy-conformance.js";
+export * from "./fake-diff-provider.js";
+export * from "./webhook-receiver.js";
+export * from "./git-fixture.js";
+export * from "./scripts/elicitation.js";
+export * from "./scripts/permission.js";

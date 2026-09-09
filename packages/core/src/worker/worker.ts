@@ -38,6 +38,21 @@ import {
   type MappedPermissionRequest,
   type PermissionDecision,
   type AcpLinkLike,
+  // ── M2's seams (§5.8.8) ────────────────────────────────────────────────────
+  type DiffProvider,
+  type InteractionAnswer,
+  type InteractionAnswerResult,
+  type InteractionContext,
+  type InteractionId,
+  type InteractionSnapshot,
+  type InteractionStrategy,
+  type MappedElicitationRequest,
+  type PatchHandle,
+  type SetConfigBody,
+  type SetConfigResponse,
+  type TokenId,
+  type Watchdog,
+  type WatchdogSignal,
   type OrphanRecord,
   type ResumeReport,
   type RuntimeDescriptor,
@@ -100,6 +115,12 @@ export interface CreateWorkerDeps {
      * the M0 slice never enters the ladder at all.
      */
     closeOutMs?: number;
+    /**
+     * M2-A. How long a parked interaction may wait for a human before `parkTimeoutAction` fires.
+     * `0` ⇒ a park never expires (a human is genuinely expected). Absent ⇒
+     * `interaction.parkTimeoutMs`'s own default, resolved by the registry.
+     */
+    parkTimeoutMs?: number;
   };
   /**
    * Optional, and the ONLY addition to CONTRACTS.md §5.3's `CreateWorkerDeps`.
@@ -135,16 +156,56 @@ export interface CreateWorkerDeps {
    * rather than a hex string that would look authoritative (see `runtime/known.ts`).
    */
   readonly runtimeId?: string;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // M2's SIX SEAMS (M2-PLAN §1.2, the nine named hunks). Every one is OPTIONAL,
+  // and with all of them ABSENT this file compiles and `core/test/worker/**`
+  // passes unedited — Land exit criterion 8, and the proof that M1 behaviour is
+  // the default rather than a migration.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * SEAM A (M2-A-WP-I). The ONE interaction lifecycle, which SUPERSEDES `responder` by wrapping
+   * it: `baselineInteractions(responder, clock)` is byte-for-byte M1 (§19.10). Absent ⇒ hunk 2's
+   * inline baseline below, which is M1's code moved nowhere at all.
+   */
+  readonly interactions?: InteractionStrategy;
+  /** SEAM B (M2-A-WP-W). Absent ⇒ disarmed, which is M1: no watchdog existed. */
+  readonly watchdog?: Watchdog;
+  /** SEAM C (M2-WP-J, D8). Absent ⇒ no `omni/patch` key on `idle`, so `TurnResult.patch` stays
+   *  `null` — M1 exactly (ruling M1-R11). */
+  readonly diff?: DiffProvider;
+  /**
+   * M2-B-WP-S. Absent ⇒ `assertPromptContent`, M0's text-only whitelist, unchanged. The gate
+   * MOVED here from `PromptRequestBody`'s deleted `.refine` (§5.8.6): zod holds no worker, so it
+   * can enforce neither this agent's `promptCapabilities` nor this token's `cwdRoots`.
+   */
+  readonly validateContent?: (content: readonly unknown[]) => void | Promise<void>;
+  /**
+   * M2-A, D10. Computed ONCE by `clientCapabilitiesFor()` and threaded through to BOTH `open`
+   * and `reopen` — F42 is that `handshake.ts` and `session-open.ts` currently hard-code `{}` in
+   * two different files, so a woken `park` worker silently stops declaring elicitation. Absent ⇒
+   * the literal `{}` both files hard-code today.
+   */
+  readonly clientCapabilities?: Readonly<Record<string, unknown>>;
+  /**
+   * M2-B, DESIGN §8. The RESOLVED MCP preset objects for this worker — a strategy never sees a
+   * preset NAME, and a client can never put a `command` on the wire at all (the type of
+   * `CreateWorkerRequest.mcp` is `string[]`). Absent ⇒ `[]`, which is M1.
+   */
+  readonly mcpServers?: readonly unknown[];
 }
 
 /**
- * The states an M1 worker can actually occupy (`events.ts` M1_WORKER_STATES).
+ * The states this kernel can actually occupy (`events.ts` `M2_WORKER_STATES`).
  *
- * `hibernated` is reachable from M1 on; `requires_action` stays wire-stable and unemitted until
- * M2's policy engine, so it is deliberately NOT in this union — a state the kernel cannot enter
- * must not typecheck as one it can.
+ * M2 admits `requires_action`, which stopped being wire-stable-and-unemitted the moment
+ * `onUnresolved:"park"` had somewhere to park (F43, hunk 4). The rule the M1 comment stated is
+ * unchanged and still the reason this union exists: a state the kernel cannot enter must not
+ * typecheck as one it can — and `requires_action` is only reachable through `#park`, which is
+ * only reachable through an injected strategy.
  */
-type M1State = "starting" | "ready" | "running" | "hibernated" | "closed";
+type M1State = "starting" | "ready" | "running" | "requires_action" | "hibernated" | "closed";
 
 /**
  * `hibernate.maxWakeFailures`'s own default (`config.ts`), restated for a `createWorker` caller
@@ -160,6 +221,51 @@ const DEFAULT_MAX_WAKE_FAILURES = 3;
  * ladder that was working.
  */
 const DEFAULT_CLOSE_OUT_MS = 10_000;
+
+/**
+ * M2, seam D (M2-PLAN §1.3). The one key the diff provider's result rides under, on
+ * `TurnInput.prompt_result.meta` → `state_update{idle}._meta` → `TurnResult.patch`.
+ *
+ * It is spelled in `protocol/src/turn.ts` (the reader) and here (the writer) and nowhere else;
+ * `turn-lifecycle.ts` in between merges the record without reading a single key of it, which is
+ * exactly what lets the git provider land with zero edits to the reducer (ruling M2-R9).
+ */
+const PATCH_META = "omni/patch";
+
+/**
+ * The `elicitation/create` mapper's Land-step stand-in.
+ *
+ * `Normalizer.mapElicitation` is M2-A-WP-I's (§5.8.9) and does the real work — the FLAT scope
+ * (F29), `oneOf[].const` ∪ `enum` (F30), the `_custom` pairing. Until it exists, an unparseable
+ * schema's honest shape is exactly what this returns: `fields: []` with every property in
+ * `unmodelled`, which makes `answer` impossible and `deny`/`cancel` still possible, instead of a
+ * form that lies about itself.
+ */
+function mapElicitationFallback(params: unknown): MappedElicitationRequest {
+  const p =
+    typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {};
+  const schema =
+    typeof p["requestedSchema"] === "object" && p["requestedSchema"] !== null
+      ? (p["requestedSchema"] as Record<string, unknown>)
+      : {};
+  const properties =
+    typeof schema["properties"] === "object" && schema["properties"] !== null
+      ? (schema["properties"] as Record<string, unknown>)
+      : {};
+  return {
+    mode: "form",
+    // F29: the scope fields are FLAT in `params`, not nested under `scope`.
+    sessionId: typeof p["sessionId"] === "string" ? p["sessionId"] : "",
+    toolCallId: typeof p["toolCallId"] === "string" ? p["toolCallId"] : null,
+    requestId: typeof p["requestId"] === "string" ? p["requestId"] : null,
+    message: typeof p["message"] === "string" ? p["message"] : "",
+    fields: [],
+    unmodelled: Object.keys(properties),
+    ...(typeof p["_meta"] === "object" && p["_meta"] !== null
+      ? { _meta: p["_meta"] as Record<string, unknown> }
+      : {}),
+  };
+}
 
 /** Close reasons whose meaning is "the agent process is gone", as opposed to "we asked". */
 const DEATH_REASONS: ReadonlySet<WorkerCloseReason> = new Set<WorkerCloseReason>([
@@ -227,6 +333,27 @@ function assertPromptContent(content: readonly unknown[]): void {
   }
 }
 
+/**
+ * `WorkerSnapshot.watchdog` (§5.8.4): the RESOLVED budgets plus the deadline in force.
+ *
+ * `null` for a worker with no watchdog and for one whose watchdog is disabled, because those are
+ * the same fact — nothing will cancel this turn on a timer — and reporting numbers for a
+ * disarmed timer is exactly the kind of snapshot that reads true and is not.
+ */
+function watchdogViewOf(
+  watchdog: Watchdog | undefined,
+  armedAtMs: number | null,
+): WorkerSnapshot["watchdog"] {
+  if (watchdog === undefined || !watchdog.config.enabled) return null;
+  return {
+    silentMs: watchdog.config.silentMs,
+    toolMs: watchdog.config.toolMs,
+    cancelTimeoutMs: watchdog.config.cancelTimeoutMs,
+    armedAt: armedAtMs === null ? null : new Date(armedAtMs).toISOString(),
+    budget: watchdog.verdict.budget,
+  };
+}
+
 function isRunningStateUpdate(e: EventInput): boolean {
   if (e.kind !== "acp.session_update") return false;
   const p = e.payload as unknown as Record<string, unknown>;
@@ -257,6 +384,11 @@ function restoredState(state: WorkerState): M1State {
     case "hibernated":
     case "closed":
       return state;
+    case "requires_action":
+      // Interactions are deliberately NOT persisted (ruling M2-R10), so a row that says
+      // `requires_action` describes a park whose JSON-RPC promise died with its boot. There is
+      // nothing left to answer, so it is restored as the state the answer would have produced.
+      return "ready";
     default:
       throw new OmniError("internal", `cannot restore a worker in state "${state}"`);
   }
@@ -298,6 +430,15 @@ export class Worker implements WorkerHandle {
 
   /** The authoritative state. `prompt()` flips it during its synchronous admission check. */
   #state: M1State = "starting";
+
+  /**
+   * M2, hunk 4. The parked interaction ids, REFCOUNTED: `interactions.length > 0 ⟺ state ===
+   * "requires_action"` is the invariant (§19.5), and this set is the left-hand side of it.
+   */
+  readonly #parked = new Set<InteractionId>();
+
+  /** M2, hunk 7. The watchdog's current deadline, for `WorkerSnapshot.watchdog.armedAt`. */
+  #watchdogArmedAt: number | null = null;
   /**
    * The last state actually WRITTEN to the log, which is what `previous` means to a reader.
    * It is a separate field because `prompt()` claims "running" before the envelope that
@@ -502,6 +643,16 @@ export class Worker implements WorkerHandle {
       // The log knows whether it has a durable side; the worker must not restate the answer.
       // "degraded" — a durable write FAILED — is M1-WP-A's, reported through the log it owns.
       persistence: persistenceOf(this.#deps.log),
+      // ── M2 (§5.8.4) ────────────────────────────────────────────────────────
+      //
+      // The invariant §19.5 names is visible right here: `interactions` is the strategy's pending
+      // set, and `#park` is the ONLY thing that can make it non-empty — which is also the only
+      // thing that can put this worker in `requires_action`.
+      interactions: this.#deps.interactions?.pending ?? [],
+      // `null` when nothing is injected AND when `watchdog.enabled:false` — the two cases a
+      // client cannot tell apart and does not need to: neither will ever cancel a turn. When one
+      // IS armed, `armedAt` is the deadline it will actually fire at, never a re-derivation.
+      watchdog: watchdogViewOf(this.#deps.watchdog, this.#watchdogArmedAt),
     };
   }
 
@@ -560,7 +711,6 @@ export class Worker implements WorkerHandle {
         `worker ${this.#deps.workerId} is ${this.#hibernating ? "hibernating" : this.#state}`,
       );
     }
-    assertPromptContent(content);
 
     const link = this.#link;
     const sessionId = this.#sessionId;
@@ -575,6 +725,29 @@ export class Worker implements WorkerHandle {
     // that can throw: a pin held over an aborted admission is released by the catch below, but a
     // pin taken after one would leave the window this exists to close.
     this.#leasePin = this.#deps.lease.pinExpiry();
+
+    // HUNK 9 (M2-PLAN §1.2). The content gate is INJECTED; absent it is M0's text-only
+    // whitelist, unchanged and still in this file's `assertPromptContent` below. M2-B-WP-S
+    // replaces it with the containment check DESIGN §5.1 requires — realpath FIRST, then contain
+    // — which needs this worker's `promptCapabilities` and the token's `cwdRoots` and therefore
+    // cannot live in a zod schema (§5.8.6's deleted `.refine`).
+    //
+    // It runs AFTER the check-and-set and BEFORE anything reaches the wire, and that placement is
+    // the whole of it. `prompt()` yields exactly one acceptance out of 50 concurrent callers only
+    // because nothing awaits BETWEEN the state read and `#state = "running"`; the injected
+    // validator may be async (a realpath is I/O), so awaiting it above that line would reopen
+    // exactly that race. Awaiting it here cannot: a second caller already sees `running`. A
+    // rejection rolls the admission back the same way the `#step` failure below does, so the
+    // caller still gets its `400` FROM `prompt()` — H8's status, unmoved — and F37/F38's "the
+    // fixture agent recorded ZERO `session/prompt` calls" holds by construction.
+    try {
+      await (this.#deps.validateContent ?? assertPromptContent)(content);
+    } catch (e) {
+      this.#state = "ready";
+      this.#currentTurnId = null;
+      this.#unpinLease();
+      throw OmniError.from(e, "bad_request");
+    }
 
     // §7.1: the running marker is appended BEFORE the prompt bytes reach stdin, and `append` is
     // synchronous while the write is not — so appending first is sufficient, and it is what
@@ -605,6 +778,10 @@ export class Worker implements WorkerHandle {
     }
     this.#setState("running", "prompt", { turnId });
 
+    // HUNK 7 (M2-PLAN §1.2). The watchdog is fed at prompt admission, at every append, at turn
+    // end and at park/unpark. Absent ⇒ every call is a no-op and this file behaves as M1.
+    this.#feedWatchdog({ kind: "turn_start", at: this.#deps.clock.now() });
+
     void this.#drivePrompt(link, sessionId, turnId, content);
 
     return { turnId, seq: running.seq };
@@ -616,15 +793,37 @@ export class Worker implements WorkerHandle {
     turnId: TurnId,
     content: readonly unknown[],
   ): Promise<void> {
+    // HUNK 8 (M2-PLAN §1.2), the ADMISSION half. `begin` is called PER TURN, never once per
+    // worker: F39 says codex-acp creates `.git/` in its own cwd mid-session, so "outside a repo
+    // ⇒ null" cannot be decided at worker start. It NEVER throws, and a `null` handle is D8's
+    // honest "no patch for this turn".
+    let patch: PatchHandle | null = null;
+    try {
+      patch =
+        (await this.#deps.diff?.begin({ cwd: this.#deps.cwd, workerId: this.#deps.workerId })) ??
+        null;
+    } catch (e) {
+      // `begin` is contracted NEVER to throw, and a provider that does anyway must not fail the
+      // turn: D8's answer to "we could not diff" is `patch: null`, not a broken prompt.
+      this.#logger.warn("the diff provider failed to open a patch handle", { error: String(e) });
+    }
     try {
       const res = await link.request<unknown>("session/prompt", {
         sessionId,
         prompt: content,
       });
-      if (this.#currentTurnId !== turnId || this.#closing) return;
+      if (this.#currentTurnId !== turnId || this.#closing) {
+        this.#abandonPatch(patch);
+        return;
+      }
+      // HUNK 8, the SETTLE half: `end` runs IMMEDIATELY BEFORE `prompt_result` is fed, because
+      // that is the input whose `meta` the reducer merges into `state_update{idle}._meta` (seam
+      // D). Any later and the key would miss the envelope `reduceTurn` reads it from.
+      const meta = await this.#endPatch(patch);
       this.#feed({
         type: "prompt_result",
         stopReason: stopReasonOf(res),
+        ...(meta === null ? {} : { meta }),
         // F21. `PromptResponse.usage` is the ONLY place a per-turn token count is reported —
         // `usage_update` is a context-window gauge (`{used, size}`), not a cost. Forwarded raw:
         // the reducer decides whether it is the v2 `Usage` shape and drops it when it is not
@@ -634,7 +833,11 @@ export class Worker implements WorkerHandle {
         at: this.#deps.clock.now(),
       });
     } catch (e) {
-      if (this.#currentTurnId !== turnId || this.#closing) return;
+      if (this.#currentTurnId !== turnId || this.#closing) {
+        this.#abandonPatch(patch);
+        return;
+      }
+      this.#abandonPatch(patch);
 
       // §6.7: an in-flight RPC that rejects with a plain `Error("ACP connection closed")` carries
       // NO JSON-RPC code and is not evidence of anything. The authoritative signals are
@@ -672,6 +875,12 @@ export class Worker implements WorkerHandle {
     // A failed send is not a failed cancel: `POST /cancel` is a 202 whatever the transport did
     // (H9), and a transport that will not take the notification is a dying process the crash
     // classifier is already watching. The escalation timer below is armed either way.
+    // §19.8: every parked request is settled with a REAL answer on the wire, and this RETURNS
+    // once every held JSON-RPC promise has resolved — BEFORE `session/cancel` reaches stdin. An
+    // agent blocked on our answer may never read the cancel, and a log that ends on a `pending`
+    // interaction is a log that lies.
+    this.#settleInteractions("cancel");
+
     try {
       await this.#link.notify("session/cancel", { sessionId: this.#sessionId });
     } catch (e) {
@@ -761,6 +970,7 @@ export class Worker implements WorkerHandle {
 
   /** §15.2's four steps, in the order that IS the correctness argument. */
   async #doHibernate(reason: "idle_timeout" | "client_request"): Promise<WorkerSnapshot> {
+    this.#settleInteractions("hibernate");
     this.#logger.info("hibernating", { reason });
     this.#tickTimer?.cancel();
     this.#tickTimer = null;
@@ -1044,6 +1254,14 @@ export class Worker implements WorkerHandle {
   } {
     const out: TurnOutput = this.#deps.normalizer.step(input);
     const envelopes = this.#deps.log.appendAll(out.emit);
+    // HUNK 7. The quiet window is anchored on the LAST ENVELOPE APPENDED, never on the prompt
+    // response — F25 makes that 7/7 on claude-acp (a `session_info_update` arrives ~20 ms AFTER
+    // the response), and codex emits `threadStatus:idle` BEFORE its response. Feeding here, at
+    // the one place envelopes are written, is what makes that anchoring automatic. Replayed
+    // envelopes are NOT activity, and the pure fold is where that is decided.
+    for (const envelope of envelopes) {
+      this.#feedWatchdog({ kind: "envelope", at: this.#deps.clock.now(), envelope });
+    }
     this.#rescheduleTick(out.scheduleTickAt);
     this.#afterStep(out);
     return { out, envelopes };
@@ -1185,6 +1403,7 @@ export class Worker implements WorkerHandle {
     // `#hibernating` joins `#closing` here for the same reason it exists in `prompt()`: a worker
     // already on its way to `hibernated` (§15.1's `running -> hibernated, agent_crashed` row)
     // must not announce `ready` on the way past.
+    this.#feedWatchdog({ kind: "turn_end", at: this.#deps.clock.now() });
     if (this.#state === "running" && !this.#closing && !this.#hibernating) {
       this.#setState("ready", "turn_end", { turnId: settledTurn });
     }
@@ -1229,13 +1448,238 @@ export class Worker implements WorkerHandle {
   }
 
   async #onPermissionRequest(req: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    // Ruling M1-R14: the responder sees the V2-MAPPED request, never the raw v1 one. D4's rule
-    // set is written against v2's tagged `subject`, and mapping FIRST is what lets M2's rule
-    // engine match `kind` / `path` / `cmd` with no per-agent branch.
+    // HUNK 2 (M2-PLAN §1.2). The permission arm is now ONE arm of ONE lifecycle (D10), and the
+    // strategy is INJECTED. Absent, `#baselineInteractions` below is M1's body moved nowhere —
+    // the same two envelopes, in the same order, with the same `-32603` on D4 rule 4 — so a
+    // worker with no strategy is byte-for-byte M1 and the whole M1 permission suite proves it
+    // (M2-PLAN §1.3 seam A, WP-I acceptance 1).
     //
-    // The envelope below still carries the RAW request verbatim — `acp.interaction` is the audit
-    // record, and an audit of a reshaped object audits our reshaping (§7.5).
+    // Ruling M1-R14 is unchanged and load-bearing: the strategy sees the V2-MAPPED request,
+    // never the raw v1 one, because D4's rule set is written against v2's tagged `subject` and
+    // mapping FIRST is what lets M2-B's rule engine match `kind` / `path` / `cmd` with no
+    // per-agent branch. The envelope still carries the RAW request verbatim (§7.5).
     const mapped: MappedPermissionRequest = this.#deps.normalizer.mapPermissionRequest(req);
+    const strategy = this.#deps.interactions;
+    if (strategy === undefined) return await this.#baselinePermission(req, mapped);
+    return await strategy.permission(mapped, this.#interactionContext());
+  }
+
+  /**
+   * HUNK 3 (M2-PLAN §1.2). `elicitation/create`, D10's second arm.
+   *
+   * It is registered on the link UNCONDITIONALLY and gated by the CAPABILITY, not by the
+   * registration: D10 says we declare `elicitation.form` only under `onUnresolved:"park"`, so an
+   * agent that calls this without having been offered it is answering a question nobody asked —
+   * and `{action:"decline"}` is the only honest reply. With no strategy injected the capability
+   * is never declared and this is never reached.
+   */
+  async #onElicitation(params: unknown): Promise<unknown> {
+    const strategy = this.#deps.interactions;
+    if (strategy === undefined) {
+      this.#logger.warn("elicitation/create arrived with no interaction strategy; declining");
+      return { action: "decline" };
+    }
+    // `mapElicitation` is a FREE function on `@omni-acp/core` (§5.8.9) rather than a `Normalizer`
+    // member, because it is PURE, TOTAL and idempotent over the params and holds no descriptor —
+    // there is nothing per-runtime to branch on. M2-A-WP-I lands the real one and injects it as
+    // part of the strategy; until then the fallback below is the honest "I could not parse this
+    // schema" shape: `fields: []`, every property in `unmodelled`.
+    return await strategy.elicitation(mapElicitationFallback(params), this.#interactionContext());
+  }
+
+  /**
+   * HUNK 4 (M2-PLAN §1.2). `running ⇄ requires_action`, REFCOUNTED exactly like
+   * `Lease.pinExpiry()`.
+   *
+   * Three things are deliberately TRUE for the whole park window and each of them is a bug if it
+   * is not: the lease pin is HELD (a parked turn is still this holder's turn), the hibernate
+   * timer stays PAUSED (an idle timer that fired on a worker waiting for a human would reclaim
+   * the process out from under the answer), and the watchdog is DISARMED (a human is not a
+   * stalled agent). The LAST un-park emits `interaction_resolved`; the first park emits
+   * `interaction_parked`.
+   */
+  #park(id: InteractionId): () => void {
+    const first = this.#parked.size === 0;
+    this.#parked.add(id);
+    if (first && this.#state === "running") {
+      this.#feedWatchdog({ kind: "parked", at: this.#deps.clock.now() });
+      this.#setState("requires_action", "interaction_parked", {
+        turnId: this.#currentTurnId,
+        interactions: [...this.#parked],
+      });
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#unpark(id);
+    };
+  }
+
+  #unpark(id: InteractionId): void {
+    if (!this.#parked.delete(id)) return;
+    if (this.#parked.size > 0) return;
+    if (this.#state !== "requires_action") return;
+    // RE-BASED from the unpark instant, never from the park (ruling M2-R21): a twenty-minute
+    // park followed by one update must not immediately cancel.
+    this.#feedWatchdog({ kind: "unparked", at: this.#deps.clock.now() });
+    this.#setState("running", "interaction_resolved", {
+      turnId: this.#currentTurnId,
+      interactions: [],
+    });
+  }
+
+  /** The three verbs a strategy may use on this Worker, and no others (§5.8.8). */
+  #interactionContext(): InteractionContext {
+    return {
+      turnId: this.#currentTurnId,
+      emit: (inputs) => {
+        this.#deps.log.appendAll(inputs);
+      },
+      park: (id) => this.#park(id),
+      failTurn: (reason) => {
+        // `onUnresolved:"fail"` and `parkTimeoutAction:"fail"`: cancel the TURN, do not close the
+        // worker. `cancelInternal` is the daemon-side cancel that is deliberately not lease-gated.
+        void this.#cancelInternalFor(reason).catch((e: unknown) => {
+          this.#logger.error("failTurn could not cancel the turn", { error: String(e) });
+        });
+      },
+    };
+  }
+
+  /**
+   * HUNK 5 (M2-PLAN §1.2). `lease.assertHolder(who)` FIRST, exactly as `prompt` / `cancel` /
+   * `wake` do — F22's payoff, again: identity is the lease's business and this handle enforces
+   * state, not identity.
+   */
+  answerInteraction(
+    id: InteractionId,
+    a: InteractionAnswer,
+    who: ClientRef & { tokenId: TokenId },
+  ): InteractionAnswerResult {
+    this.#deps.lease.assertHolder(who);
+    const strategy = this.#deps.interactions;
+    if (strategy === undefined) {
+      // No strategy ⇒ nothing was ever parked, so there is nothing this id could name. The
+      // 404 is the honest answer and it names the RESOURCE, which is exactly why
+      // `interaction_not_found` exists beside `worker_not_found` (ruling M2-R2).
+      throw new OmniError("interaction_not_found", `no interaction ${id} is awaiting an answer`);
+    }
+    return strategy.answer(id, a, who);
+  }
+
+  get interactions(): readonly InteractionSnapshot[] {
+    return this.#deps.interactions?.pending ?? [];
+  }
+
+  /**
+   * HUNK 6 (M2-PLAN §1.2). `session/set_config_option`, lease-gated, `worker_busy` while a turn
+   * runs, auto-waking exactly as `prompt` does.
+   *
+   * The METHOD's own result replaces `#configOptions` WHOLESALE (F34: the returned list is a full
+   * replacement whose membership can SHRINK four → two; F35: another agent's does not) — never
+   * the event stream, because neither real agent emits `config_option_update` for a set.
+   *
+   * With no implementation injected this is `agent_error` carrying `-32601`, which is the shape a
+   * client already knows how to read for "this agent cannot do that" (D29, the M1 Land precedent).
+   */
+  setConfig(_body: SetConfigBody, who: ClientRef): Promise<SetConfigResponse> {
+    this.#deps.lease.assertHolder(who);
+    if (this.#state === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
+    if (this.#state === "running" || this.#state === "requires_action") {
+      throw new OmniError("worker_busy", `worker ${this.#deps.workerId} is ${this.#state}`);
+    }
+    throw new OmniError("internal", "unimplemented: M2-A-WP-C (session/set_config_option)");
+  }
+
+  /**
+   * DAEMON-initiated cancel, deliberately NOT lease-gated: the lease governs CLIENTS, and the
+   * idle watchdog is not one. Without this the daemon's own timer `423`s itself the moment a real
+   * `createLease` replaces `alwaysGrantedLease` — the kind of thing discovered in production
+   * (§5.8.8).
+   */
+  async cancelInternal(reason: "watchdog_silent" | "watchdog_tool"): Promise<void> {
+    await this.#cancelInternalFor(reason);
+  }
+
+  /**
+   * `cancel()`'s body with the lease check removed and nothing else changed: the notification
+   * goes first, the process stays alive, and the SAME `cancelGraceMs` escalation into M1's
+   * existing `cancel_timeout` close is armed. The watchdog adds no close reason (§5.8.3).
+   */
+  async #cancelInternalFor(reason: string): Promise<void> {
+    if (this.#state === "closed") return;
+    if (this.#state !== "running" || this.#link === null || this.#sessionId === null) return;
+    this.#logger.warn("cancelling the turn on the daemon's own initiative", { reason });
+    this.#feedWatchdog({ kind: "cancel_sent", at: this.#deps.clock.now() });
+    await this.cancel(this.#deps.lease.holder ?? this.#deps.owner);
+  }
+
+  // ── seams B and C, as no-ops when nothing is injected ──────────────────────
+
+  /**
+   * §19.8's settle, as a no-op when nothing is injected. Idempotent by the strategy's own
+   * contract, so every teardown path may call it blindly.
+   */
+  #settleInteractions(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): void {
+    const strategy = this.#deps.interactions;
+    if (strategy === undefined) return;
+    try {
+      strategy.settleAll(reason);
+    } catch (e) {
+      this.#logger.error("settling parked interactions failed", { reason, error: String(e) });
+    }
+    this.#parked.clear();
+  }
+
+  /** HUNK 7's one call site shape. Absent watchdog ⇒ disarmed, which is M1. */
+  #feedWatchdog(signal: WatchdogSignal): void {
+    const watchdog = this.#deps.watchdog;
+    if (watchdog === undefined) return;
+    try {
+      const verdict = watchdog.observe(signal);
+      this.#watchdogArmedAt = verdict.deadlineAt;
+    } catch (e) {
+      // A watchdog that throws must never fail a turn: its whole job is to be a backstop.
+      this.#logger.error("watchdog step threw", { signal: signal.kind, error: String(e) });
+    }
+  }
+
+  /** HUNK 8's settle half. NEVER throws: a git failure is `text: null` and not a failed turn. */
+  async #endPatch(handle: PatchHandle | null): Promise<Record<string, unknown> | null> {
+    const provider = this.#deps.diff;
+    if (provider === undefined || handle === null) return null;
+    try {
+      return { [PATCH_META]: await provider.end(handle) };
+    } catch (e) {
+      this.#logger.warn("the diff provider failed to produce a patch", { error: String(e) });
+      return null;
+    }
+  }
+
+  #abandonPatch(handle: PatchHandle | null): void {
+    if (handle === null) return;
+    try {
+      this.#deps.diff?.abandon(handle);
+    } catch (e) {
+      this.#logger.debug("abandoning a patch handle failed", { error: String(e) });
+    }
+  }
+
+  /**
+   * M1's permission path, UNCHANGED, reached only when no strategy is injected.
+   *
+   * It is `baselineInteractions`'s body in situ (M2-PLAN §1.3 seam A): WP-I lifts it into
+   * `worker/interaction/baseline.ts` and wraps it in the strategy interface, and the golden that
+   * proves the two are byte-identical is that acceptance bullet. Nothing below this line changed
+   * in the M2 Land step.
+   */
+  async #baselinePermission(
+    req: RequestPermissionRequest,
+    mapped: MappedPermissionRequest,
+  ): Promise<RequestPermissionResponse> {
     const decided = this.#deps.responder.decide(mapped);
     const turnId = this.#currentTurnId;
 
@@ -1504,6 +1948,7 @@ export class Worker implements WorkerHandle {
   }
 
   async #doClose(reason: WorkerCloseReason, extras: CloseExtras): Promise<CloseResult> {
+    this.#settleInteractions("close");
     const previous = this.#state;
     this.#closeReason = reason;
     // A close is an exit from `running` too, and the ladder below can await for seconds: a pin
@@ -1660,6 +2105,9 @@ export class Worker implements WorkerHandle {
       orphan?: OrphanRecord;
       crashed?: boolean;
       generation?: number;
+      // ── M2 (§5.8.3): present on the rows §19/§21 name, and on no others ──
+      watchdog?: { budget: "silent" | "tool"; idleMs: number; openToolCalls: number };
+      interactions?: readonly InteractionId[];
     },
   ): void {
     const previous = this.#emittedState;
@@ -1678,6 +2126,8 @@ export class Worker implements WorkerHandle {
       ...(o.treeGone === undefined ? {} : { treeGone: o.treeGone }),
       ...(o.error === undefined ? {} : { error: o.error }),
       ...(o.resume === undefined ? {} : { resume: o.resume }),
+      ...(o.watchdog === undefined ? {} : { watchdog: o.watchdog }),
+      ...(o.interactions === undefined ? {} : { interactions: o.interactions }),
       ...(o.orphan === undefined ? {} : { orphan: o.orphan }),
       ...(o.crashed === undefined ? {} : { crashed: o.crashed }),
       ...(o.generation === undefined ? {} : { generation: o.generation }),
@@ -1723,6 +2173,11 @@ export class Worker implements WorkerHandle {
           this.#onSessionUpdate(n);
         },
         onPermissionRequest: (req) => this.#onPermissionRequest(req),
+        // HUNK 3's other half. The registration is unconditional; the CAPABILITY is the gate
+        // (D10), and `link.ts` parses the params with `verbatim` — a `z.object` there would
+        // strip `_meta._askUserQuestionCustomAnswer` and the FLAT `sessionId`/`toolCallId`,
+        // which are the two fields the whole feature turns on (F29, F30).
+        onElicitation: (params) => this.#onElicitation(params),
         onClosed: (err) => {
           this.#onLinkClosed(err);
         },
@@ -1814,12 +2269,20 @@ export class Worker implements WorkerHandle {
               cwd: this.#deps.cwd,
               timeoutMs: this.#deps.limits.handshakeTimeoutMs,
               clock: this.#deps.clock,
+              // D10, threaded rather than hard-coded: ONE producer for both paths, which is what
+              // F42 is about (see `CreateWorkerDeps.clientCapabilities`). Absent ⇒ `{}` = M1.
+              ...(this.#deps.clientCapabilities === undefined
+                ? {}
+                : { clientCapabilities: this.#deps.clientCapabilities }),
               ...(signal === undefined ? {} : { signal }),
             })
           : await strategy.open(this.#asLinkLike(link), {
               cwd: this.#deps.cwd,
               descriptor: this.#runtime(),
-              mcpServers: [],
+              mcpServers: this.#deps.mcpServers ?? [],
+              ...(this.#deps.clientCapabilities === undefined
+                ? {}
+                : { clientCapabilities: this.#deps.clientCapabilities }),
               budgetMs: this.#deps.limits.handshakeTimeoutMs,
               ...(signal === undefined ? {} : { signal }),
             });

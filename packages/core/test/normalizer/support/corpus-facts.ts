@@ -18,13 +18,41 @@ interface WireMessage {
   readonly error?: unknown;
 }
 
-/** Every recorded update across every transcript, tagged with the scenario it came from. */
+/**
+ * The M1 GROUND TRUTH: the eleven claude-acp scenarios CONTRACTS.md §12.7(b) states its eight
+ * properties over, named rather than globbed.
+ *
+ * The corpus DIRECTORY grew for M2 — `11-permission-allow-with-updates` through
+ * `17-resource-link-in-and-outside-cwd` were recorded for the interaction, config-option,
+ * watchdog and prompt-containment work packages — and the M1 conformance suite must not silently
+ * change what it asserts when it does. §12.7(b)'s counts (216 updates, 86 chunks, the kind
+ * distribution) are statements about THESE eleven files; a `readdir` here would have quietly
+ * restated them about whatever the directory happens to hold, which is the opposite of a golden.
+ *
+ * `transcriptNames()` still reports the whole directory, and `corpus.test.ts` asserts BOTH
+ * numbers, so a transcript that is added and then never used by anybody is still visible.
+ */
+export const M1_TRANSCRIPTS: readonly string[] = [
+  "01-plain-answer",
+  "02-tool-read",
+  "03-tool-write-allowed",
+  "04-tool-write-denied",
+  "05-plan",
+  "05b-plan-natural-phrasing",
+  "06-cancel-mid-turn",
+  "07-session-load",
+  "08-set-model-extension",
+  "09-permission-bad-option-id",
+  "10-tool-edit-existing",
+];
+
+/** Every recorded update across the M1 corpus, tagged with the scenario it came from. */
 export function allTranscriptUpdates(): readonly {
   readonly name: string;
   readonly index: number;
   readonly update: Record<string, unknown>;
 }[] {
-  return transcriptNames().flatMap((name) =>
+  return M1_TRANSCRIPTS.flatMap((name) =>
     transcriptUpdates(name).map((update, index) => ({ name, index, update })),
   );
 }

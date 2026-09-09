@@ -17,12 +17,18 @@
     ],
     "changes": [],
     "patch": null,
+    "patchInfo": null,
     "vendorPatch": null,
     "interactions": [
       {
         "requestId": "req-1",
+        "kind": "permission",
+        "method": "session/request_permission",
         "title": "Modifying critical configuration file",
         "decision": "deny",
+        "by": "baseline",
+        "parkedMs": 0,
+        "toolCallId": null,
         "optionId": "reject",
         "rule": "m0:auto-deny",
         "at": "2026-09-03T12:00:00.800Z"
@@ -32,6 +38,8 @@
     "warnings": [],
     "failedToolCalls": [],
     "deniedToolCalls": [],
+    "strandedToolCalls": [],
+    "pendingInteractions": [],
     "error": null
   },
   "status": {

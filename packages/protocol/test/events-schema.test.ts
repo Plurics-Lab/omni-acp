@@ -93,12 +93,111 @@ describe("eventEnvelopeSchema", () => {
         kind: "omni.error",
         payload: { code: "agent_error", message: "boom", stderrTail: "Error: boom\n" },
       },
+      {
+        // M2-B (§5.8.3). One per Run state change, appended to the RUN'S WORKER'S log so
+        // `?since=` covers it and `sse.ts` stays frozen (Land exit criterion 6).
+        ...meta,
+        payloadVersion: 2,
+        turnId: null,
+        kind: "omni.run",
+        payload: {
+          runId: `r_${"0".repeat(26)}`,
+          state: "failed",
+          previous: "running",
+          reason: "abandoned by a previous boot",
+          error: { code: "worker_closed", message: "the worker died with its boot" },
+        },
+      },
     ];
     const kinds = envelopes.map((e) => {
       const parsed: EventEnvelope = eventEnvelopeSchema.parse(e);
       return parsed.kind;
     });
     expect(kinds).toEqual([...EVENT_KINDS]);
+  });
+
+  /**
+   * Land exit criterion 3, the half that matters most: an M1-ERA envelope still parses.
+   *
+   * `requestId` is an `InteractionId` at the TYPE level from M2 on, and every id the daemon MINTS
+   * is now `x_<ULID>` — but a persisted M1 log is full of `perm_1757…_3`, and it must keep
+   * parsing. The migration lives in the type; the schema stays permissive (§5.8.1). Nor does an
+   * M1 envelope carry `kind`, `raw`, `toolCallId` or `answer.parkedMs`.
+   */
+  it("parses an M1-era acp.interaction / omni.policy_decision unchanged", () => {
+    const interaction = eventEnvelopeSchema.parse({
+      ...meta,
+      kind: "acp.interaction",
+      payload: {
+        requestId: "perm_1757000000000_3",
+        method: "session/request_permission",
+        request: { sessionId: "sess-abc", options: [] },
+        status: "answered",
+        answer: { optionId: "reject", by: "baseline" },
+      },
+    });
+    expect(interaction.kind).toBe("acp.interaction");
+
+    const decision = eventEnvelopeSchema.parse({
+      ...meta,
+      payloadVersion: 2,
+      kind: "omni.policy_decision",
+      payload: {
+        requestId: "perm_1757000000000_3",
+        title: "t",
+        decision: "deny",
+        rule: "m0:auto-deny",
+        optionId: "reject",
+        offered: [],
+        toolCallId: null,
+      },
+    });
+    expect(decision.kind).toBe("omni.policy_decision");
+  });
+
+  it("parses M2's widened interaction arms — park, elicitation, the five statuses", () => {
+    const parked = eventEnvelopeSchema.parse({
+      ...meta,
+      payloadVersion: 2,
+      kind: "acp.interaction",
+      payload: {
+        requestId: `x_${"0".repeat(26)}`,
+        kind: "elicitation",
+        method: "elicitation/create",
+        // M2's `request` is the MAPPED view; `raw` beside it is the agent's bytes, `_meta`
+        // included, because an audit of a reshaped object audits our reshaping (§7.5, F30).
+        request: { message: "which file?", fields: [] },
+        raw: { sessionId: "sess-abc", _meta: { _askUserQuestionCustomAnswer: {} } },
+        status: "pending",
+        park: { parkedAt: meta.ts, expiresAt: null, onTimeout: "deny" },
+        toolCallId: "call_1",
+      },
+    });
+    expect(parked.kind).toBe("acp.interaction");
+
+    const answered = eventEnvelopeSchema.parse({
+      ...meta,
+      payloadVersion: 2,
+      kind: "omni.policy_decision",
+      payload: {
+        requestId: `x_${"0".repeat(26)}`,
+        kind: "elicitation",
+        method: "elicitation/create",
+        title: "which file?",
+        // `answer` is the ELICITATION arm: an accepted elicitation is not a granted permission
+        // and must never be counted as one (§5.8.3).
+        decision: "answer",
+        by: "human",
+        rule: "m2:onUnresolved",
+        ruleSource: "default",
+        clamped: { from: "allow", by: "ceiling:maxAction" },
+        parkedMs: 4_200,
+        optionId: null,
+        offered: [],
+        toolCallId: "call_1",
+      },
+    });
+    expect(answered.kind).toBe("omni.policy_decision");
   });
 
   it("forwards an agent payload by identity, so `_meta` and unknown fields survive", () => {

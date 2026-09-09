@@ -10,6 +10,14 @@ export interface AcpLinkHandlers {
   onSessionUpdate(n: { sessionId: string; update: Record<string, unknown> }): void;
   /** MUST resolve or throw acp.RequestError. Throwing anything else maps to -32603. */
   onPermissionRequest(req: RequestPermissionRequest): Promise<RequestPermissionResponse>;
+  /**
+   * M2, D10's second arm. Same rule as `onPermissionRequest`: resolve, or throw
+   * `acp.RequestError`. The params arrive VERBATIM — see the registration below.
+   *
+   * OPTIONAL, so every M1 caller of `openAcpLink` compiles unedited; absent, the method falls
+   * through to the SDK's `-32601`, which is exactly M1's behaviour.
+   */
+  onElicitation?(params: unknown): Promise<unknown>;
   /** Fires exactly once, before `closed` resolves. */
   onClosed(err: Error | null): void;
 }
@@ -23,6 +31,7 @@ export interface AcpLink {
 
 const SESSION_UPDATE = "session/update";
 const REQUEST_PERMISSION = "session/request_permission";
+const ELICITATION_CREATE = "elicitation/create";
 
 /**
  * The identity params parser.
@@ -93,6 +102,25 @@ export function openAcpLink(stream: AcpStream, h: AcpLinkHandlers, o: { logger: 
       // of the two happened.
       h.onPermissionRequest(ctx.params as RequestPermissionRequest),
     );
+
+  // M2, ONE registration (M2-PLAN §1.2, hunk 3) — and `verbatim` is the single most important
+  // word in it.
+  //
+  // A `z.object` parse would strip `_meta._askUserQuestionCustomAnswer`, the marker that decides
+  // WHICH of two schema properties the agent will actually read (F30: our accept filled both and
+  // the agent created `omni-choice.txt` instead of `notes.md`), and it would strip the FLAT
+  // `sessionId` / `toolCallId`, which are the only scope this request carries (F29). The same
+  // choice is already made for `session/request_permission` (F43), so this is a registration and
+  // not a mechanism; the `no-elicitation-schema-parse` guard fails the build on any regression.
+  //
+  // It is registered UNCONDITIONALLY and gated by the CAPABILITY instead (D10): a handler that
+  // appeared and disappeared with a config flag would make "the agent asked anyway" unobservable.
+  // With no `onElicitation` supplied the method falls through to the SDK's `-32601`, which is
+  // M1's behaviour exactly.
+  const onElicitation = h.onElicitation?.bind(h);
+  if (onElicitation !== undefined) {
+    app.onRequest(ELICITATION_CREATE, verbatim, (ctx) => onElicitation(ctx.params));
+  }
 
   const connection = app.connect(stream);
 

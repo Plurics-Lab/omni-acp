@@ -71,8 +71,19 @@ describe("permission handling (WP-4 acceptance 7, §7.4)", () => {
     expect(result?.interactions).toEqual([
       {
         requestId: dp.requestId,
+        // M2 widens `InteractionRecord` (§5.8.5). Every added field has an M1 reading that is the
+        // TRUTH rather than a guess, which is exactly why this row can be written out in full: an
+        // M1 daemon knew one kind, answered inline through the baseline responder, and parked
+        // nothing — so `kind`, `method`, `by` and `parkedMs` are what they are here, forever.
+        kind: "permission",
+        method: "session/request_permission",
         title: "scripted permission 1",
         decision: "deny",
+        by: "baseline",
+        parkedMs: 0,
+        // F32's join: the same interaction is ALSO a `tool_call` in the stream. `toolCalls` keeps
+        // the tool call, `interactions` keeps the decision, neither duplicates the other.
+        toolCallId: "call_1",
         optionId: "reject",
         rule: "m0:auto-deny",
         at: decision?.ts,

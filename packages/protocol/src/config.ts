@@ -1,6 +1,100 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
+// ── D4's policy language (M2-B, §5.8.7) ──────────────────────────────────────
+
+export const POLICY_ACTIONS = ["allow", "deny", "park", "fail"] as const;
+export type PolicyAction = (typeof POLICY_ACTIONS)[number];
+
+/**
+ * D4's match arm.
+ *
+ * `strictObject`: an unknown key in a security rule is a typo that would silently WIDEN the rule,
+ * so it is a config LOAD failure rather than a clause nobody notices was never applied.
+ */
+export const PolicyMatch = z.strictObject({
+  /** v2's tagged subject arm. `"any"` is the default. */
+  subject: z.enum(["tool_call", "command", "any"]).default("any"),
+  method: z.enum(["session/request_permission", "elicitation/create", "any"]).default("any"),
+  /** v2 `ToolKind` values plus any vendor string, matched case-sensitively. An UNKNOWN kind
+   *  matches NOTHING but the literal `["*"]` — D4 rule 6 lifted from the responder to the matcher. */
+  kind: z.array(z.string().min(1).max(64)).min(1).max(32).optional(),
+  /** Globs over REALPATH'd absolute `subject.toolCall.locations[].path`. `**` crosses separators.
+   *  A relative pattern is a load error. F38: this clause NARROWS and never AUTHORISES (§20.3). */
+  path: z.array(z.string().min(1).max(512)).min(1).max(64).optional(),
+  /** ANCHORED (`^(?:…)$` is applied for you), length-capped, no backreferences, compiled once at
+   *  create. Only meaningful with `subject: "command"` — a `cmd` clause on a `tool_call` subject
+   *  is rejected at COMPILE, because F38 leaves it nothing to match on. */
+  cmd: z.string().min(1).max(512).optional(),
+  agent: z.array(z.string().min(1)).max(32).optional(),
+  // NOTE: there is deliberately NO `title` / `name` matcher (F27). `no-agent-prose` forbids
+  // adding one: an agent's prose is not a security predicate.
+});
+export type PolicyMatch = z.output<typeof PolicyMatch>;
+
+export const PolicyRule = z.strictObject({
+  id: z.string().min(1).max(64),
+  match: PolicyMatch,
+  action: z.enum(POLICY_ACTIONS),
+});
+export type PolicyRule = z.output<typeof PolicyRule>;
+
+export const PolicyPreset = z.strictObject({
+  extends: z.string().min(1).max(64).optional(),
+  default: z.enum(POLICY_ACTIONS).default("deny"),
+  rules: z.array(PolicyRule).max(200).default([]),
+  /**
+   * F40: a read-only `ls -A` ran with NO permission request while `python3 -c …` in the same cwd
+   * raised one, and the split is invisible in the frame. So "no permission request" may never be
+   * read as "no tool ran": a tool call of a listed kind that never reached the engine becomes
+   * `TurnWarning{code:"unpoliced_tool_call"}` (§20.6).
+   */
+  alertOnUnpoliced: z.array(z.string().min(1)).max(32).default([]),
+});
+export type PolicyPreset = z.output<typeof PolicyPreset>;
+
+export const PolicyConfig = z.object({
+  presets: z.record(z.string().max(64), PolicyPreset).default({}),
+  /** The preset a worker gets when the request names none. */
+  default: z.string().min(1).default("deny-all"),
+});
+export type ResolvedPolicyConfig = z.output<typeof PolicyConfig>;
+
+/**
+ * A ceiling is written in a DELIBERATELY COARSER language than a rule, because glob∩glob and
+ * regex∩regex containment is undecidable and a ceiling that LOOKS precise while being checked
+ * approximately is worse than one that is honestly coarse (§20.5, ruling M2-R11).
+ */
+export const PolicyCeiling = z.strictObject({
+  /** The widest action any rule may resolve to. `deny` and `fail` rank EQUAL: neither grants. */
+  maxAction: z.enum(POLICY_ACTIONS).default("allow"),
+  /** Kinds that may reach `allow`. Absent ⇒ any. */
+  allowKinds: z.array(z.string()).optional(),
+  /** Kinds that may never exceed `deny`, whatever a rule says. */
+  denyKinds: z.array(z.string()).default([]),
+  /** Every `path` glob in every rule must be lexically contained in one of these — a literal
+   *  prefix test on the pattern's non-wildcard head, which is decidable and total. */
+  pathRoots: z.array(z.string()).optional(),
+  /** May this token's rules match `subject: command` at all? */
+  commands: z.boolean().default(true),
+  /** May this token's workers use `onUnresolved:"park"` (⇒ declare elicitation)? */
+  park: z.boolean().default(true),
+});
+export type PolicyCeiling = z.output<typeof PolicyCeiling>;
+
+// NOTE: `PolicySelection` — the REQUEST-side union (a preset name, a list, or an inline rule
+// set) — lives in `control-plane.ts` beside `CreateWorkerRequest`, because it is a wire body and
+// not a config block. It is built from `PolicyRule` / `POLICY_ACTIONS` above (§5.8.6).
+
+/** The merged, ceiling-checked document a `PolicyEngine` is built from (§5.8.9). */
+export interface ResolvedPolicy {
+  readonly id: string;
+  readonly sources: readonly string[];
+  readonly default: PolicyAction;
+  readonly rules: readonly PolicyRule[];
+  readonly alertOnUnpoliced: readonly string[];
+}
+
 export const TokenConfig = z
   .object({
     id: z.string().min(1),
@@ -15,9 +109,28 @@ export const TokenConfig = z
     /** Every cwd must realpath into one of these. Defaults to [os.homedir()] at load. */
     cwdRoots: z.array(z.string()).default([]),
     maxWorkers: z.number().int().positive().default(16),
+    // ── M2 (§5.8.7) ─────────────────────────────────────────────────────────
+    /** D4. A named preset or an inline document; the MERGE of preset ⊕ inline may never exceed it. */
+    policyCeiling: PolicyCeiling.nullable().default(null),
+    policyPresets: z.union([z.literal("*"), z.array(z.string())]).default("*"),
+    /** FAIL CLOSED: default `[]`, not `"*"` (DESIGN §8's 🔴). An MCP server is arbitrary code on
+     *  this machine, so a token gets none until an operator names one. */
+    mcpPresets: z.union([z.literal("*"), z.array(z.string())]).default([]),
+    /** Env var NAMES this token may set per worker, ON TOP of the hard blacklist. Default: none. */
+    envAllow: z.array(z.string().min(1)).default([]),
+    /**
+     * D9's HMAC key. Unlike `secret` this CANNOT be stored hashed — signing needs the plaintext.
+     * It is never returned by any route and never logged; `webhookSecretFile` (0600, read at
+     * load) is the recommended spelling and at most one of the two may be set.
+     */
+    webhookSecret: z.string().min(32).optional(),
+    webhookSecretFile: z.string().optional(),
   })
   .refine((t) => (t.secret == null) !== (t.secretSha256 == null), {
     message: "exactly one of secret / secretSha256",
+  })
+  .refine((t) => !(t.webhookSecret != null && t.webhookSecretFile != null), {
+    message: "at most one of webhookSecret / webhookSecretFile",
   });
 export type TokenConfig = z.infer<typeof TokenConfig>;
 
@@ -289,26 +402,229 @@ export const EventLogConfig = z.object({
 });
 export type ResolvedEventLogConfig = z.output<typeof EventLogConfig>;
 
-export const DaemonConfig = z.strictObject({
-  /** Else generated + persisted to dataDir. */
-  daemonId: z.string().optional(),
-  dataDir: z.string().default("~/.omni-acp"),
-  /** null => no socket, in-process only (D15 constraint 1). */
-  listen: ListenConfig.nullable().default(null),
-  tokens: z.array(TokenConfig).min(1),
-  /** M0: explicit list only. `"auto"` discovery is M1/M4. */
-  agents: z.array(AgentDescriptor).default([]),
-  maxWorkers: z.number().int().positive().default(64),
-  eventLog: EventLogConfig.prefault({}),
-  handshakeTimeoutMs: z.number().int().positive().default(60_000),
-  supervisor: SupervisorConfig.prefault({}),
-  turn: TurnConfig.prefault({}),
-  hibernate: HibernateConfig.prefault({}),
-  lease: LeaseConfig.prefault({}),
-  probe: ProbeConfig.prefault({}),
-  resume: ResumeReplayConfig.prefault({}),
-  logLevel: z.enum(["silent", "error", "warn", "info", "debug"]).default("info"),
+/**
+ * DESIGN §8: the ONLY place a stdio MCP command may appear (§5.8.7).
+ *
+ * A client names a PRESET; it can never put a `command` on the wire, and that is enforced by the
+ * TYPE of `CreateWorkerRequest.mcp` rather than by a validator somebody could move.
+ */
+export const McpServerPreset = z.strictObject({
+  type: z.enum(["stdio", "http", "sse"]).default("stdio"),
+  /** stdio only. NEVER a shell string — the same rule as `AgentDescriptor.command` (§6.3). */
+  command: z.string().min(1).optional(),
+  args: z.array(z.string()).default([]),
+  url: z.string().url().optional(), // http/sse only
+  headers: z.record(z.string(), z.string()).default({}),
+  /** Preset-owned and operator-supplied. A client can NEVER contribute to it. */
+  env: z.record(z.string(), z.string()).default({}),
 });
+export type McpServerPreset = z.output<typeof McpServerPreset>;
+
+export const WatchdogConfig = z.object({
+  enabled: z.boolean().default(true),
+  /**
+   * Budget A (DESIGN §7's 无消息 N 分钟杀): nothing at all appended since the last update while a
+   * turn runs. 0 disables this half only. The clock starts at the LAST UPDATE, never at the
+   * prompt response — F25 makes that 7/7 on claude-acp, and codex emits `threadStatus:idle`
+   * BEFORE its response.
+   */
+  silentMs: z.number().int().nonnegative().max(86_400_000).default(300_000),
+  /**
+   * Budget B (DESIGN §7's npm install 沉默 20 分钟是正常的): at least one tool call is OPEN. F36
+   * says an open call can be a PERMANENT condition, which is why this is a budget and not a
+   * suspension, and why it must be the larger of the two.
+   */
+  toolMs: z.number().int().nonnegative().max(86_400_000).default(1_800_000),
+  /** After the watchdog's `session/cancel`, how long the turn has to settle before the worker is
+   *  closed with `cancel_timeout`. MUST exceed `turn.cancelGraceMs` — enforced by `superRefine`
+   *  on `DaemonConfig`, because a watchdog that closed first would report a fake agent timeout
+   *  for a turn that was settling. */
+  cancelTimeoutMs: z.number().int().positive().default(60_000),
+  /** "cancel" (default) ⇒ `session/cancel` then M1's existing escalation; "close" skips to it. */
+  action: z.enum(["cancel", "close"]).default("cancel"),
+});
+export type ResolvedWatchdogConfig = z.output<typeof WatchdogConfig>;
+
+export const InteractionConfig = z.object({
+  /** Default `CreateWorkerRequest.parkTimeoutMs`. 0 ⇒ a park waits forever. */
+  parkTimeoutMs: z.number().int().nonnegative().max(86_400_000).default(600_000),
+  parkTimeoutAction: z.enum(["deny", "fail"]).default("deny"),
+  /**
+   * D4 rule 3 is ABSOLUTE for the daemon. This decides whether a HUMAN may pick an `allow_always`
+   * option through `POST …/interactions/{reqId}`.
+   *
+   * "never" (default) — a human answer naming one is `400` quoting rule 3 and citing F26.
+   * "human" — permitted, and the daemon then does what the wire does not: `blindsPolicy:true` on
+   *   the decision, sticky `WorkerSnapshot.policyBlinded`, and a `TurnWarning{code:"policy_blinded"}`
+   *   on every subsequent turn of that worker.
+   */
+  allowAlways: z.enum(["never", "human"]).default("never"),
+  /** Max simultaneously parked interactions per worker. Over it the newest is DENIED with
+   *  `rule:"limit:max_parked"` and never dropped — an unanswered agent request hangs a turn forever. */
+  maxParked: z.number().int().positive().default(8),
+  /** D10, narrowed: we declare `elicitation.form` under `park`. We do NOT declare `url` — there is
+   *  no browser here and `elicitation/complete` is unobserved. Flip only with a real url handler. */
+  declareUrlElicitation: z.boolean().default(false),
+});
+export type ResolvedInteractionConfig = z.output<typeof InteractionConfig>;
+
+export const DiffConfig = z.object({
+  provider: z.enum(["none", "git"]).default("none"),
+  /** "on_write" runs git only when the turn had a write-ish tool call or any `changes`. */
+  mode: z.enum(["off", "on_write", "always"]).default("on_write"),
+  timeoutMs: z.number().int().positive().default(15_000),
+  maxBytes: z
+    .number()
+    .int()
+    .positive()
+    .default(4 * 1024 * 1024),
+  /** Absolute path for the temp index files. MUST be outside every worktree (§25.2). */
+  tmpDir: z.string().optional(),
+});
+export type ResolvedDiffConfig = z.output<typeof DiffConfig>;
+
+export const WebhookConfig = z.object({
+  enabled: z.boolean().default(false),
+  /** D9: 0s / 30s / 2m / 10m / 30m / 2h. Six attempts, then `failed`. */
+  backoffMs: z
+    .array(z.number().int().nonnegative())
+    .default([0, 30_000, 120_000, 600_000, 1_800_000, 7_200_000]),
+  /** Full jitter fraction on every rung after the first (§24.3). Without it a restart makes
+   *  hundreds of deliveries due in one tick, the receiver 429s the lot, and they all retry
+   *  together 30 s later. */
+  jitter: z.number().min(0).max(1).default(0.1),
+  timeoutMs: z.number().int().positive().default(10_000),
+  maxConcurrent: z.number().int().positive().default(4),
+  retentionDays: z.number().int().nonnegative().default(30),
+  /** name → secret. A client names one; the VALUE never crosses the wire in either direction. */
+  secrets: z.record(z.string().min(1), z.string().min(32)).default({}),
+  /**
+   * FAIL CLOSED. This is the daemon's first OUTBOUND surface and the URL comes from a client:
+   * "allowlist" with an empty `allow` makes a webhook run `403` until an operator names an
+   * origin. `"any"` exists for a closed network and says so out loud.
+   */
+  mode: z.enum(["allowlist", "any"]).default("allowlist"),
+  /** Exact scheme+host+port, no wildcards. */
+  allow: z.array(z.string().url()).default([]),
+  /** CIDRs the RESOLVED address may never be in. Blocks DNS rebinding to cloud metadata. */
+  denyCidrs: z
+    .array(z.string())
+    .default([
+      "127.0.0.0/8",
+      "::1/128",
+      "169.254.0.0/16",
+      "fe80::/10",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16",
+      "fc00::/7",
+    ]),
+  maxBodyBytes: z
+    .number()
+    .int()
+    .positive()
+    .default(64 * 1024),
+});
+export type ResolvedWebhookConfig = z.output<typeof WebhookConfig>;
+
+export const RunConfig = z.object({
+  maxConcurrent: z.number().int().positive().default(16),
+  /** Hard ceiling on one run, independent of the watchdog. 0 = none. */
+  maxDurationMs: z.number().int().nonnegative().default(3_600_000),
+  retentionDays: z.number().int().nonnegative().default(30),
+});
+export type ResolvedRunConfig = z.output<typeof RunConfig>;
+
+/**
+ * DESIGN §5.1's list, plus the ones that are arbitrary code execution rather than a preference.
+ *
+ * ONE table, in ONE module — a second copy is how one of two callers quietly stops enforcing it
+ * (`redactArgs`'s argument, §5.1). `envDeny` in config EXTENDS it; nothing shrinks it.
+ */
+export const ENV_DENY_EXACT: readonly string[] = [
+  "HOME",
+  "PATH",
+  "USER",
+  "USERNAME",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "PWD",
+  "OLDPWD",
+  "SYSTEMROOT",
+  "COMSPEC",
+  "WINDIR",
+  "PATHEXT",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "NODE_OPTIONS",
+  "BASH_ENV",
+  "ENV",
+  "IFS",
+  "CLASSPATH",
+  "JAVA_TOOL_OPTIONS",
+  "RUBYOPT",
+  "PERL5OPT",
+];
+
+export const ENV_DENY_PREFIX: readonly string[] = [
+  "OMNI_",
+  "LD_",
+  "DYLD_",
+  "GIT_",
+  "NODE_",
+  "npm_",
+  "PYTHON",
+];
+
+export const DaemonConfig = z
+  .strictObject({
+    /** Else generated + persisted to dataDir. */
+    daemonId: z.string().optional(),
+    dataDir: z.string().default("~/.omni-acp"),
+    /** null => no socket, in-process only (D15 constraint 1). */
+    listen: ListenConfig.nullable().default(null),
+    tokens: z.array(TokenConfig).min(1),
+    /** M0: explicit list only. `"auto"` discovery is M1/M4. */
+    agents: z.array(AgentDescriptor).default([]),
+    maxWorkers: z.number().int().positive().default(64),
+    eventLog: EventLogConfig.prefault({}),
+    handshakeTimeoutMs: z.number().int().positive().default(60_000),
+    supervisor: SupervisorConfig.prefault({}),
+    turn: TurnConfig.prefault({}),
+    hibernate: HibernateConfig.prefault({}),
+    lease: LeaseConfig.prefault({}),
+    probe: ProbeConfig.prefault({}),
+    resume: ResumeReplayConfig.prefault({}),
+    logLevel: z.enum(["silent", "error", "warn", "info", "debug"]).default("info"),
+    // ── M2 (§5.8.7). Every block DEFAULTS, so an unmodified M1 config file still parses — that
+    // is a Land exit criterion (M2-PLAN §1.5 item 2).
+    policy: PolicyConfig.prefault({}),
+    /** DESIGN §8: the ONLY place a stdio MCP command may appear. */
+    mcpServers: z.record(z.string().max(64), McpServerPreset).default({}),
+    watchdog: WatchdogConfig.prefault({}),
+    interaction: InteractionConfig.prefault({}),
+    diff: DiffConfig.prefault({}),
+    webhooks: WebhookConfig.prefault({}),
+    run: RunConfig.prefault({}),
+    /** Extra keys the operator forbids in `CreateWorkerRequest.env`. Extends the hard list; can
+     *  never shrink it. */
+    envDeny: z.array(z.string().max(256)).default([]),
+  })
+  .superRefine((c, ctx) => {
+    // A watchdog that closed FIRST would report a fake agent timeout for a turn that was settling,
+    // so the ordering is a config LOAD error rather than a runtime surprise (§5.8.7, WP-W bullet 5).
+    if (c.watchdog.cancelTimeoutMs <= c.turn.cancelGraceMs) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["watchdog", "cancelTimeoutMs"],
+        message: "watchdog.cancelTimeoutMs must exceed turn.cancelGraceMs",
+      });
+    }
+  });
 export type DaemonConfig = z.input<typeof DaemonConfig>;
 export type ResolvedDaemonConfig = z.output<typeof DaemonConfig>;
 

@@ -257,7 +257,14 @@ describe("daemon.authenticate / whoami (H3, H13, acceptance 5)", () => {
       agents: "*",
       cwdRoots: viaHeader.cwdRoots,
       maxWorkers: 16,
+      // ── M2-B (§5.8.6). `policyCeiling`'s TYPE widened; the field itself never appeared or
+      // disappeared, which is the whole reason it was present-and-null in M1. The three beside
+      // it are REPORTING fields read off the token's own config row, and `mcpPresets` defaults
+      // to `[]` rather than `"*"` because an MCP server is arbitrary code on this machine.
       policyCeiling: null,
+      policyPresets: "*",
+      mcpPresets: [],
+      webhooks: false,
     });
     await daemon.stop();
   });

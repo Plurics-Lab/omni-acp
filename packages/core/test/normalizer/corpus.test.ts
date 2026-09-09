@@ -1,7 +1,7 @@
 import { SessionUpdate } from "@agentclientprotocol/sdk/experimental/v2";
 import { describe, expect, it } from "vitest";
 import { transcriptNames, transcriptUpdates } from "@omni-acp/testkit";
-import { allTranscriptUpdates } from "./support/corpus-facts.js";
+import { M1_TRANSCRIPTS, allTranscriptUpdates } from "./support/corpus-facts.js";
 import type { MappedUpdate } from "@omni-acp/protocol";
 import { mapUpdate } from "../../src/normalizer/map/update.js";
 import { claudeAcpDescriptor, claudeAcpModes, countingIds } from "./support/claude-acp.js";
@@ -62,8 +62,14 @@ function v1DiffsIn(payload: unknown): unknown[] {
 }
 
 describe("the corpus is the corpus (a guard on the guard)", () => {
-  it("loads 11 transcripts and exactly 216 recorded session/update payloads", () => {
-    expect(transcriptNames()).toHaveLength(11);
+  it("loads 11 M1 transcripts and exactly 216 recorded session/update payloads", () => {
+    // The eleven §12.7(b) is written about, and the directory they live in — which grew to 18
+    // when M2's corpus landed (11-17). Both numbers are asserted so that a transcript added and
+    // then used by nobody is visible here, and so that adding one can never silently restate the
+    // counts below about a different set of files.
+    expect(M1_TRANSCRIPTS).toHaveLength(11);
+    expect(transcriptNames()).toHaveLength(18);
+    expect(transcriptNames()).toEqual(expect.arrayContaining([...M1_TRANSCRIPTS]));
     expect(ALL).toHaveLength(216);
     // The per-file counts the research README records, so a silently truncated file is caught
     // here rather than by a property that would still hold over the remainder.

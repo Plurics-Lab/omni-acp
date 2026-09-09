@@ -628,8 +628,32 @@ function persistenceOf(log: EventLog): "memory" | "durable" | "degraded" {
 }
 
 /**
- * Every `available_commands_update` the recorded claude-acp corpus contains, read straight from
- * `docs/research/transcripts/claude-acp-0.73.0/*.jsonl`.
+ * The eleven claude-acp scenarios F13 was derived from, NAMED rather than globbed.
+ *
+ * The corpus directory grew to 18 files when M2's transcripts (11-17) landed, and F13's numbers —
+ * 23 notifications, 2 distinct payloads — are a statement about THESE eleven. A `readdir` would
+ * have quietly restated them about whatever the directory happens to hold, which is what a
+ * golden exists to prevent. Kept in step with `normalizer/support/corpus-facts.ts`'s
+ * `M1_TRANSCRIPTS`; it is not imported from there because this file deliberately reads the raw
+ * bytes rather than another package's transcript model (see below).
+ */
+const M1_CORPUS_FILES: readonly string[] = [
+  "01-plain-answer.jsonl",
+  "02-tool-read.jsonl",
+  "03-tool-write-allowed.jsonl",
+  "04-tool-write-denied.jsonl",
+  "05-plan.jsonl",
+  "05b-plan-natural-phrasing.jsonl",
+  "06-cancel-mid-turn.jsonl",
+  "07-session-load.jsonl",
+  "08-set-model-extension.jsonl",
+  "09-permission-bad-option-id.jsonl",
+  "10-tool-edit-existing.jsonl",
+];
+
+/**
+ * Every `available_commands_update` the recorded M1 claude-acp corpus contains, read straight
+ * from `docs/research/transcripts/claude-acp-0.73.0/*.jsonl`.
  *
  * Read here with `fs` rather than through testkit's `loadTranscript`, which is M1-WP-B's file:
  * this test needs the raw bytes of one update kind, not the parsed transcript model, and taking
@@ -648,10 +672,14 @@ function corpusAvailableCommands(): Record<string, unknown>[] {
     "transcripts",
     "claude-acp-0.73.0",
   );
+  // Every M1 file must still be present: a corpus that lost one would otherwise make this test
+  // pass with a smaller number and no complaint.
+  const present = new Set(readdirSync(dir).filter((f) => f.endsWith(".jsonl")));
+  for (const name of M1_CORPUS_FILES) {
+    if (!present.has(name)) throw new Error(`the M1 corpus is missing ${name}`);
+  }
   const out: Record<string, unknown>[] = [];
-  for (const name of readdirSync(dir)
-    .filter((f) => f.endsWith(".jsonl"))
-    .sort()) {
+  for (const name of M1_CORPUS_FILES) {
     for (const line of readFileSync(join(dir, name), "utf8").split("\n")) {
       if (line.trim() === "") continue;
       let parsed: unknown;

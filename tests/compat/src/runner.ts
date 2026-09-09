@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { OmniError, type ProbeSummary } from "@omni-acp/protocol";
 import type { Worker } from "@omni-acp/client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { compatCases, type CompatCase, type CompatContext } from "./cases.js";
+import { compatCases, type CompatCase, type CompatContext } from "./cases/index.js";
 import { compatDir, type CompatAgentConfig, type CompatSelection } from "./config.js";
 import { startCompatHarness, type CompatHarness } from "./harness.js";
 

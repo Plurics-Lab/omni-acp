@@ -306,13 +306,16 @@ describe("request parsing (acceptance 9)", () => {
     });
     expect(wrongType.status).toBe(400);
 
+    // `policy` became a REAL field in M2 (§5.8.6), so the unknown-key case needs a key that is
+    // still unknown — the assertion is about `strictObject` refusing what it does not model, not
+    // about any particular word.
     const unknownKey = await send(daemon, "POST", "/v1/workers", {
       agent: "example",
       cwd: "/work",
-      policy: "readonly",
+      nope: "surprise",
     });
     expect(unknownKey.status).toBe(400);
-    expect(((await unknownKey.json()) as { message: string }).message).toMatch(/policy/);
+    expect(((await unknownKey.json()) as { message: string }).message).toMatch(/nope/);
 
     const noBody = await get(daemon, "/v1/workers", { method: "POST" });
     expect(noBody.status).toBe(400);
@@ -345,13 +348,32 @@ describe("request parsing (acceptance 9)", () => {
     expect(((await badTurn.json()) as { message: string }).message).toBe("malformed turn id");
   });
 
-  it("rejects a non-text content block with 400 before the registry sees it (§2.3)", async () => {
+  /**
+   * H28 (§5.8.6): the block-TYPE decision moved out of the schema and into
+   * `assertPromptContent`, which is the only layer holding this agent's `promptCapabilities` and
+   * this token's `cwdRoots`.
+   *
+   * So the ROUTE now forwards a `resource_link` to the registry — that is the change — while the
+   * SHAPE checks it still owns (an empty array, an unknown key) are still refused before the
+   * registry sees anything. The route did not gain a decision; it lost one.
+   */
+  it("forwards block types to the registry and still refuses a malformed body (H28)", async () => {
     const daemon = fixture(answering());
-    const res = await send(daemon, "POST", `/v1/workers/${WID}/prompt`, {
+    const forwarded = await send(daemon, "POST", `/v1/workers/${WID}/prompt`, {
       content: [{ type: "image", data: "…", mimeType: "image/png" }],
     });
-    expect(res.status).toBe(400);
-    expect(daemon.calls.filter((c) => c.method === "workers.prompt")).toEqual([]);
+    expect(forwarded.status).toBe(202);
+    expect(daemon.calls.filter((c) => c.method === "workers.prompt")).toHaveLength(1);
+
+    const empty = await send(daemon, "POST", `/v1/workers/${WID}/prompt`, { content: [] });
+    expect(empty.status).toBe(400);
+    const unknownKey = await send(daemon, "POST", `/v1/workers/${WID}/prompt`, {
+      content: [{ type: "text", text: "hi" }],
+      stream: true,
+    });
+    expect(unknownKey.status).toBe(400);
+    // Still exactly ONE registry call across all three: the two malformed bodies never reached it.
+    expect(daemon.calls.filter((c) => c.method === "workers.prompt")).toHaveLength(1);
   });
 
   it("answers an unknown route with a 400 body in the standard shape", async () => {

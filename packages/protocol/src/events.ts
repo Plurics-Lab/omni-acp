@@ -2,9 +2,19 @@ import { z } from "zod";
 import type { NormalizedSessionUpdate, PermissionOption } from "./acp.js";
 import { OMNI_ERROR_CODES, type OmniErrorBody } from "./errors.js";
 import { ID_PATTERN } from "./ids.js";
-import type { DaemonId, SessionId, Seq, TurnId, WorkerId } from "./ids.js";
+import type {
+  DaemonId,
+  InteractionId,
+  RunId,
+  SessionId,
+  Seq,
+  TokenId,
+  TurnId,
+  WorkerId,
+} from "./ids.js";
 import type { LeaseEventPayload } from "./lease.js";
 import { RESUME_OUTCOMES, type ResumeReport } from "./resume.js";
+import { POLICY_ACTIONS, type PolicyAction } from "./config.js";
 
 export const WORKER_STATES = [
   "starting",
@@ -22,6 +32,12 @@ export const M0_WORKER_STATES = ["starting", "ready", "running", "closed"] as co
 /** Reachable in M1. `requires_action` stays wire-stable and unemitted until M2's policy engine. */
 export const M1_WORKER_STATES = ["starting", "ready", "running", "hibernated", "closed"] as const;
 
+/**
+ * M2-A: the full six. `requires_action` stops being wire-stable-and-unemitted (F43) the moment
+ * `onUnresolved:"park"` has somewhere to park.
+ */
+export const M2_WORKER_STATES = WORKER_STATES;
+
 export const EVENT_KINDS = [
   "acp.session_update",
   "acp.interaction",
@@ -30,6 +46,12 @@ export const EVENT_KINDS = [
   /** D5's audit trail: acquire / release / steal / expire. M1 has no separate audit log (M2). */
   "omni.lease",
   "omni.error",
+  /**
+   * M2-B. One per Run state change, appended to the RUN'S WORKER'S log so `?since=` covers it
+   * and `sse.ts` stays frozen — the Run API proxies the worker log rather than adding a second
+   * stream writer (Land exit criterion 6).
+   */
+  "omni.run",
 ] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
 
@@ -104,6 +126,27 @@ export interface OrphanRecord {
   readonly reapSkipped: string | null;
 }
 
+export type InteractionMethod = "session/request_permission" | "elicitation/create";
+export type InteractionKind = "permission" | "elicitation";
+/**
+ * `pending` MEANS parked: an auto-resolved interaction is emitted once, already terminal, so
+ * there is no second word for the same state (ruling M2-R5). M1's three are a strict prefix.
+ */
+export type InteractionStatus = "pending" | "answered" | "failed" | "expired" | "cancelled";
+export type InteractionActor = "baseline" | "policy" | "human" | "timeout" | "daemon";
+export type ParkTimeoutAction = "deny" | "fail";
+
+export const INTERACTION_STATUSES = [
+  "pending",
+  "answered",
+  "failed",
+  "expired",
+  "cancelled",
+] as const;
+export const INTERACTION_ACTORS = ["baseline", "policy", "human", "timeout", "daemon"] as const;
+export const INTERACTION_METHODS = ["session/request_permission", "elicitation/create"] as const;
+export const INTERACTION_KINDS = ["permission", "elicitation"] as const;
+
 export type WorkerStateReason =
   | WorkerCloseReason
   | "created"
@@ -119,7 +162,16 @@ export type WorkerStateReason =
   /** starting -> hibernated; transient failure, pointer KEPT. */
   | "wake_retry"
   /** a previous boot owned this row; `orphan` is present. */
-  | "daemon_restart";
+  | "daemon_restart"
+  // ── M2 (§5.8.3) ────────────────────────────────────────────────────────────
+  /** running → requires_action: an interaction could not be auto-decided and `onUnresolved:"park"`. */
+  | "interaction_parked"
+  /** requires_action → running: the LAST parked interaction settled. */
+  | "interaction_resolved"
+  /** requires_action → running: `parkTimeoutAction` fired instead of a human. */
+  | "park_timeout"
+  /** The idle watchdog sent `session/cancel`. NOT a close — the escalation into `cancel_timeout` is. */
+  | "watchdog_idle";
 
 export interface WorkerStatePayload {
   readonly state: WorkerState;
@@ -138,24 +190,82 @@ export interface WorkerStatePayload {
   readonly crashed?: boolean;
   /** Processes this worker has had. 0 = it has never run. Increments on every wake. */
   readonly generation?: number;
+  /**
+   * M2. Present on `watchdog_idle` and on a `cancel_timeout` close the watchdog started, so an
+   * operator can tell a silent stall from a stuck tool without reading the log.
+   */
+  readonly watchdog?: { budget: "silent" | "tool"; idleMs: number; openToolCalls: number };
+  /** M2. Present on `interaction_parked` / `interaction_resolved` / `park_timeout`. */
+  readonly interactions?: readonly InteractionId[];
 }
 
 export interface InteractionPayload {
-  readonly requestId: string;
-  /** M2 adds "elicitation/create". */
-  readonly method: "session/request_permission";
-  /** Verbatim v1 shape in M0. */
+  /**
+   * DAEMON-MINTED (F33): `elicitation/create` and `session/request_permission` share ONE
+   * agent→client JSON-RPC id counter, so the transport id is not an identity a route may
+   * address. `eventEnvelopeSchema` keeps `z.string()` here so an M1-era persisted envelope
+   * carrying `perm_1757…_3` still parses; new ids are always `x_<ULID>` (§5.8.1).
+   */
+  readonly requestId: InteractionId;
+  /** M2. OPTIONAL for the M1-envelope reason `raw` is: an M1 daemon knew exactly one kind and
+   *  never wrote the field, and a checked-in M1 `events.db` must still parse (Land criterion 3).
+   *  Absent reads as `"permission"`. */
+  readonly kind?: InteractionKind;
+  readonly method: InteractionMethod;
+  /**
+   * M2: the NORMALIZED view — `{title, subject, options}` for a permission, `{message, fields}`
+   * for an elicitation — and the reason `payloadVersion` flips 1 → 2 on this kind. `worker.ts`
+   * pre-announced exactly this (F45). An M1-written envelope carries the verbatim v1
+   * `RequestPermissionRequest` at `payloadVersion: 1`, and that flag is what tells the two
+   * shapes apart (ruling M1-R10).
+   */
   readonly request: Readonly<Record<string, unknown>>;
-  readonly status: "pending" | "answered" | "failed";
-  /** M0: always present and immediate — the baseline responder answers inline. */
+  /**
+   * The agent's bytes, untouched, `_meta` included (§7.5). Kept BESIDE the mapped form rather
+   * than replaced by it, because an audit of a reshaped object audits our reshaping — and
+   * because `_meta._askUserQuestionCustomAnswer` (F30) is the field that decides which of two
+   * properties the agent will actually read, and it exists nowhere else.
+   *
+   * OPTIONAL at the Land step: an M1-written `acp.interaction` has no `raw` (its `request` IS
+   * the raw), so a required field would fail the golden that parses a checked-in M1 `events.db`.
+   */
+  readonly raw?: Readonly<Record<string, unknown>>;
+  readonly status: InteractionStatus;
+  /** Present exactly while `status === "pending"`. `expiresAt: null` = parked forever. */
+  readonly park?: {
+    readonly parkedAt: string;
+    readonly expiresAt: string | null;
+    readonly onTimeout: ParkTimeoutAction;
+  };
+  /**
+   * `subject.toolCall.toolCallId`, or the elicitation's FLAT `params.toolCallId` (F29). The join
+   * to the `AskUserQuestion` tool-call mirror (F32) — without it the same interaction counts
+   * twice. Optional for the M1-envelope reason above.
+   */
+  readonly toolCallId?: string | null;
   readonly answer?: {
+    /** permission only; null for every elicitation and for a `-32603`. */
     readonly optionId: string | null;
-    readonly by: "baseline" | "policy" | "human";
+    readonly by: InteractionActor;
+    /** elicitation only. F31: accept and decline are indistinguishable in the agent's stream, so
+     *  this is the ONLY record the outcome has. */
+    readonly action?: "accept" | "decline" | "cancel";
+    /** elicitation only. **KEYS ONLY** — a free-text answer is user content and never enters the
+     *  log. */
+    readonly contentKeys?: readonly string[];
+    /** The answering token, when `by === "human"`. DESIGN §8's audit. */
+    readonly byToken?: TokenId;
+    /** ms spent parked. 0 for an auto-resolved interaction. Optional: an M1 envelope has none. */
+    readonly parkedMs?: number;
   };
 }
 
 export interface PolicyDecisionPayload {
-  readonly requestId: string;
+  readonly requestId: InteractionId;
+  /** M2. Optional at the Land step: an M1-written decision names neither, and both are
+   *  recoverable from `method`'s M1 default (`session/request_permission`). */
+  readonly kind?: InteractionKind;
+  readonly method?: InteractionMethod;
   /**
    * The human-readable title of what was asked, taken from
    * `request.toolCall.title ?? ""` when the decision is recorded. It is carried here — and not
@@ -165,10 +275,26 @@ export interface PolicyDecisionPayload {
    * recoverable, and the responder already holds the request when it decides.
    */
   readonly title: string;
-  readonly decision: "allow" | "deny" | "error";
+  /**
+   * WIDENED, and there is exactly ONE of these per interaction, emitted at SETTLEMENT (ruling
+   * M2-R4). `answer` / `cancel` are the elicitation arms: an accepted elicitation is not a
+   * granted permission and must never be counted as one. There is deliberately no `"park"` arm —
+   * a park is not a decision, and a row that must later be corrected is a fold row that was never
+   * true.
+   */
+  readonly decision: "allow" | "deny" | "answer" | "cancel" | "error";
+  /** M2. Optional at the Land step; an M1-written decision is always `"baseline"`. */
+  readonly by?: InteractionActor;
   /** M0 is always "m0:auto-deny". */
   readonly rule: string;
+  /** M2. Where `rule` came from, so an operator tells a ceiling clamp from an author's intent. */
+  readonly ruleSource?: "baseline" | "default" | "preset" | "inline" | "ceiling";
+  /** M2. Set when the token's `policyCeiling` narrowed the resolved action. NEVER silent (§20.5). */
+  readonly clamped?: { readonly from: PolicyAction; readonly by: string };
+  /** M2. ms spent parked; 0 for an auto-resolved interaction. */
+  readonly parkedMs?: number;
   readonly optionId: string | null;
+  /** `[]` for an elicitation — an empty array is not a null. */
   readonly offered: readonly PermissionOption[];
   /**
    * `subject.toolCall.toolCallId` when the subject is a tool call, else null.
@@ -179,6 +305,42 @@ export interface PolicyDecisionPayload {
    * tool call and reports it in `TurnResult.deniedToolCalls` (§13.4).
    */
   readonly toolCallId: string | null;
+  /**
+   * M2. F26: after ONE `allow_always` the engine is never consulted again for that session and
+   * nothing on the wire says so. Only reachable under `interaction.allowAlways:"human"`; it is
+   * how WE announce what the agent will not, and it makes `WorkerSnapshot.policyBlinded` sticky.
+   */
+  readonly blindsPolicy?: true;
+}
+
+export type RunState =
+  | "queued"
+  | "starting"
+  | "running"
+  | "requires_action"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  /** A previous boot owned this run; its worker died with that boot (§24.4). */
+  | "abandoned";
+
+export const RUN_STATES = [
+  "queued",
+  "starting",
+  "running",
+  "requires_action",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "abandoned",
+] as const;
+
+export interface RunEventPayload {
+  readonly runId: RunId;
+  readonly state: RunState;
+  readonly previous: RunState | null;
+  readonly reason: string;
+  readonly error?: OmniErrorBody;
 }
 
 export type EventBody =
@@ -187,7 +349,8 @@ export type EventBody =
   | { readonly kind: "omni.policy_decision"; readonly payload: PolicyDecisionPayload }
   | { readonly kind: "omni.worker_state"; readonly payload: WorkerStatePayload }
   | { readonly kind: "omni.lease"; readonly payload: LeaseEventPayload }
-  | { readonly kind: "omni.error"; readonly payload: OmniErrorBody & { stderrTail?: string } };
+  | { readonly kind: "omni.error"; readonly payload: OmniErrorBody & { stderrTail?: string } }
+  | { readonly kind: "omni.run"; readonly payload: RunEventPayload };
 
 export type EventEnvelope = EnvelopeMeta & EventBody;
 
@@ -219,6 +382,17 @@ export type EventInput = EventBody & {
 
 const id = <T extends string>(pattern: RegExp, what: string) =>
   z.custom<T>((v) => typeof v === "string" && pattern.test(v), { message: `invalid ${what}` });
+
+/**
+ * An id field that is TYPED as a branded id but PARSED as a bare string.
+ *
+ * `InteractionPayload.requestId` is an `InteractionId` from M2 on, and every id this daemon mints
+ * from now on is `x_<ULID>` — but an M1-era persisted envelope carries `perm_1757…_3`, and Land
+ * exit criterion 3 requires a checked-in M1 `events.db` to parse under the M2 schema. Narrowing
+ * the pattern here would fail exactly that golden, so the migration lives in the TYPE and the
+ * schema stays permissive (§5.8.1's migration note).
+ */
+const looseId = <T extends string>(): z.ZodType<T> => z.string() as unknown as z.ZodType<T>;
 
 const envelopeMetaShape = {
   seq: z.number().int().positive(),
@@ -291,6 +465,11 @@ const WORKER_STATE_REASONS = [
   "resumed",
   "wake_retry",
   "daemon_restart",
+  // ── M2 (§5.8.3) ───────────────────────────────────────────────────────────
+  "interaction_parked",
+  "interaction_resolved",
+  "park_timeout",
+  "watchdog_idle",
 ] as const;
 
 /**
@@ -357,15 +536,34 @@ export const eventEnvelopeSchema: z.ZodType<EventEnvelope> = z.discriminatedUnio
   z.object({
     ...envelopeMetaShape,
     kind: z.literal("acp.interaction"),
+    // `requestId` stays a bare `z.string()`: the TYPE is `InteractionId` from M2 on, but an
+    // M1-era persisted envelope carries `perm_1757…_3` and must still parse (§5.8.1's migration
+    // note). `request` stays a shallow `z.record` for the reason §5.8.3 gives — `payloadVersion`
+    // (1 vs 2) is what tells the v1-verbatim shape from M2's mapped view apart, and that is the
+    // field's entire job (ruling M1-R10).
     payload: z.object({
-      requestId: z.string(),
-      method: z.literal("session/request_permission"),
+      requestId: looseId<InteractionId>(),
+      kind: z.enum(INTERACTION_KINDS).optional(),
+      method: z.enum(INTERACTION_METHODS),
       request: z.record(z.string(), z.unknown()),
-      status: z.enum(["pending", "answered", "failed"]),
+      raw: z.record(z.string(), z.unknown()).optional(),
+      status: z.enum(INTERACTION_STATUSES),
+      park: z
+        .object({
+          parkedAt: z.string(),
+          expiresAt: z.string().nullable(),
+          onTimeout: z.enum(["deny", "fail"]),
+        })
+        .optional(),
+      toolCallId: z.string().nullable().optional(),
       answer: z
         .object({
           optionId: z.string().nullable(),
-          by: z.enum(["baseline", "policy", "human"]),
+          by: z.enum(INTERACTION_ACTORS),
+          action: z.enum(["accept", "decline", "cancel"]).optional(),
+          contentKeys: z.array(z.string()).optional(),
+          byToken: z.string().optional(),
+          parkedMs: z.number().nonnegative().optional(),
         })
         .optional(),
     }),
@@ -374,13 +572,20 @@ export const eventEnvelopeSchema: z.ZodType<EventEnvelope> = z.discriminatedUnio
     ...envelopeMetaShape,
     kind: z.literal("omni.policy_decision"),
     payload: z.object({
-      requestId: z.string(),
+      requestId: looseId<InteractionId>(),
+      kind: z.enum(INTERACTION_KINDS).optional(),
+      method: z.enum(INTERACTION_METHODS).optional(),
       title: z.string(),
-      decision: z.enum(["allow", "deny", "error"]),
+      decision: z.enum(["allow", "deny", "answer", "cancel", "error"]),
+      by: z.enum(INTERACTION_ACTORS).optional(),
       rule: z.string(),
+      ruleSource: z.enum(["baseline", "default", "preset", "inline", "ceiling"]).optional(),
+      clamped: z.object({ from: z.enum(POLICY_ACTIONS), by: z.string() }).optional(),
+      parkedMs: z.number().nonnegative().optional(),
       optionId: z.string().nullable(),
       offered: z.array(permissionOptionSchema),
       toolCallId: z.string().nullable(),
+      blindsPolicy: z.literal(true).optional(),
     }),
   }),
   z.object({
@@ -398,6 +603,14 @@ export const eventEnvelopeSchema: z.ZodType<EventEnvelope> = z.discriminatedUnio
       orphan: orphanRecordSchema.optional(),
       crashed: z.boolean().optional(),
       generation: z.number().int().nonnegative().optional(),
+      watchdog: z
+        .object({
+          budget: z.enum(["silent", "tool"]),
+          idleMs: z.number().nonnegative(),
+          openToolCalls: z.number().int().nonnegative(),
+        })
+        .optional(),
+      interactions: z.array(looseId<InteractionId>()).optional(),
     }),
   }),
   z.object({
@@ -424,5 +637,16 @@ export const eventEnvelopeSchema: z.ZodType<EventEnvelope> = z.discriminatedUnio
     ...envelopeMetaShape,
     kind: z.literal("omni.error"),
     payload: z.object({ ...omniErrorBodyShape, stderrTail: z.string().optional() }),
+  }),
+  z.object({
+    ...envelopeMetaShape,
+    kind: z.literal("omni.run"),
+    payload: z.object({
+      runId: id<RunId>(ID_PATTERN.run, "runId"),
+      state: z.enum(RUN_STATES),
+      previous: z.enum(RUN_STATES).nullable(),
+      reason: z.string(),
+      error: z.object(omniErrorBodyShape).optional(),
+    }),
   }),
 ]);

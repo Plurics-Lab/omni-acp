@@ -7,6 +7,8 @@ import {
   isDaemonId,
   type ClientId,
   type DaemonId,
+  type DeliveryStore,
+  type RunRegistry,
   type DaemonInfo,
   type EventEnvelope,
   type IdGen,
@@ -369,6 +371,12 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     workers,
     catalog,
     supervisor,
+    // M2-B (D9). Always PRESENT — a `Daemon` that grew and lost a member between milestones is
+    // the shape §5.8.6 spends a comment forbidding for `policyCeiling` — and every verb answers
+    // `bad_request` naming its work package until `deps.runs` / `deps.webhooks` are wired. That
+    // is D29's honest "not implemented yet", and it is the M1 Land precedent S8 exactly.
+    runs: deps?.runs ?? unimplementedRuns(),
+    deliveries: unimplementedDeliveries(),
 
     authContextFor(tokenId: TokenId, clientId?: ClientId | null): AuthContext {
       return tokens.contextFor(tokenId, clientId ?? null);
@@ -386,8 +394,20 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
         agents: auth.agents,
         cwdRoots: auth.cwdRoots,
         maxWorkers: auth.maxWorkers,
-        // Present and null, so the field never appears and disappears between milestones (M2).
-        policyCeiling: null,
+        // M2-B (§5.8.6). The field never appeared or disappeared — only its TYPE widened, which
+        // is the one compile break in M2 (§11.9). The three beside it are read from the token's
+        // own config row rather than from `AuthContext`, because they are REPORTING fields: the
+        // context carries what it can ENFORCE (`policyCeiling`, `assertPolicy`, `assertMcp`), and
+        // widening it with two lists nothing checks would invite a second enforcement site.
+        policyCeiling: auth.policyCeiling,
+        policyPresets: tokenRow(resolved, auth.tokenId)?.policyPresets ?? [],
+        mcpPresets: tokenRow(resolved, auth.tokenId)?.mcpPresets ?? [],
+        // A token may create webhook runs when it has a signing secret AND the operator has
+        // enabled the outbound surface. FAIL CLOSED: the default is `false` on both counts.
+        webhooks:
+          resolved.webhooks.enabled &&
+          (tokenRow(resolved, auth.tokenId)?.webhookSecret !== undefined ||
+            tokenRow(resolved, auth.tokenId)?.webhookSecretFile !== undefined),
       };
     },
 
@@ -572,4 +592,54 @@ function packageVersion(): string {
   } catch {
     return "0.0.0";
   }
+}
+
+/**
+ * The token's own config row, for `whoami`'s three REPORTING fields (§5.8.6).
+ *
+ * `AuthContext` deliberately does not carry them: it carries what it can ENFORCE, and a list
+ * nothing checks sitting beside `assertMcp` is an invitation to a second enforcement site.
+ */
+function tokenRow(
+  config: ResolvedDaemonConfig,
+  tokenId: TokenId,
+): ResolvedDaemonConfig["tokens"][number] | undefined {
+  return config.tokens.find((t) => t.id === tokenId);
+}
+
+/**
+ * `Daemon.runs` with no `RunRegistry` injected (M2-B-WP-R).
+ *
+ * Every verb is `bad_request` naming the work package, which is D29's honest "not implemented
+ * yet" and the M1 Land precedent S8 — a 500 would say the daemon broke, and a silent empty list
+ * would say there are no runs, which is a different and worse lie.
+ */
+function unimplementedRuns(): RunRegistry {
+  const no = (): never => {
+    throw new OmniError("bad_request", "runs are not enabled on this daemon (M2-B-WP-R)");
+  };
+  return {
+    create: () => Promise.reject(new OmniError("bad_request", "runs are not enabled (M2-B-WP-R)")),
+    get: no,
+    list: () => [],
+    cancel: () => Promise.reject(new OmniError("bad_request", "runs are not enabled (M2-B-WP-R)")),
+    logFor: no,
+    recover: () => ({ abandoned: 0 }),
+  };
+}
+
+/** `Daemon.deliveries` with no dispatcher wired. Same rule as `unimplementedRuns`. */
+function unimplementedDeliveries(): DeliveryStore {
+  const no = (): never => {
+    throw new OmniError("bad_request", "webhooks are not enabled on this daemon (M2-B-WP-R)");
+  };
+  return {
+    enqueue: no,
+    due: () => [],
+    claim: () => false,
+    settle: no,
+    requeueStale: () => 0,
+    list: () => ({ rows: [], cursor: null }),
+    redeliver: no,
+  };
 }

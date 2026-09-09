@@ -1,5 +1,6 @@
 import {
   type Clock,
+  type InteractionId,
   type MappedPermissionRequest,
   type PermissionDecision,
   type PermissionOption,
@@ -107,7 +108,13 @@ export function createBaselineResponder(mode: "allow" | "deny", clock: Clock): P
   return {
     decide(req: MappedPermissionRequest): PermissionDecision {
       counter += 1;
-      const requestId = `perm_${String(clock.now())}_${String(counter)}`;
+      // M2 (§5.8.1): the FIELD is an `InteractionId` from now on and every id the daemon MINTS
+      // is `x_<ULID>` from `IdGen.interaction()`. This spelling is kept, and cast, on purpose:
+      // `baselineInteractions` must produce envelopes BYTE-IDENTICAL to M1's (M2-PLAN §1.3 seam
+      // A, WP-I acceptance 1), and `eventEnvelopeSchema` keeps `z.string()` for the field so an
+      // M1-era persisted `perm_1757…_3` still parses. M2-A-WP-I mints the real ids in the
+      // strategy that WRAPS this responder; this file stays M1.
+      const requestId = `perm_${String(clock.now())}_${String(counter)}` as InteractionId;
       const offered = offeredOptions(req);
       const title = titleOf(req);
 

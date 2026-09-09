@@ -157,6 +157,10 @@ describe("stubDaemon", () => {
       cwdRoots: [],
       maxWorkers: 16,
       policyCeiling: null,
+      // ── M2-B (§5.8.6). FAIL CLOSED where it matters: `mcpPresets` is `[]`, never `"*"`. ──
+      policyPresets: [],
+      mcpPresets: [],
+      webhooks: false,
     });
   });
 

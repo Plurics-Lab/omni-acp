@@ -175,6 +175,8 @@ export function resolveResumeMethod(
 export function capabilitiesFromInitialize(
   init: Record<string, unknown>,
   descriptor: RuntimeDescriptor,
+  /** D10's gate AS SENT (§5.8.4). Absent ⇒ `{}`, which is D3 and byte-for-byte M1. */
+  clientCapabilities?: Readonly<Record<string, unknown>>,
 ): AgentCapabilitiesSnapshot {
   const raw = record(init["agentCapabilities"]) ?? {};
   const sessionCaps = record(raw["sessionCapabilities"]);
@@ -208,6 +210,7 @@ export function capabilitiesFromInitialize(
     // `SessionCapabilities.close` is an OBJECT capability: present-and-non-null means yes,
     // `{}` included. `=== true` would read every advertising agent as not advertising.
     supportsSessionClose: advertises(sessionCaps, "close"),
+    clientCapabilities: clientCapabilities ?? {},
   };
 }
 
@@ -255,8 +258,18 @@ export interface HandshakeOptions {
    * preference order is `["session/resume", "session/load"]`.
    */
   readonly descriptor?: RuntimeDescriptor;
-  /** Always `[]` in M1 (DESIGN §8 — MCP presets are M2). */
+  /** Always `[]` in M1 (DESIGN §8 — MCP presets are M2); RESOLVED preset objects from M2 on. */
   readonly mcpServers?: readonly unknown[];
+  /**
+   * M2-A, D10. What we DECLARE to the agent, computed once by `clientCapabilitiesFor()` and
+   * passed in — a PARAMETER rather than the literal below, because F42 is that this file and the
+   * WAKE path in `session-open.ts` each hard-code `{}` in their own copy. A `park` worker that
+   * hibernated and woke would silently stop declaring elicitation; F28 says the agent then asks
+   * in PROSE, and the park never happens again.
+   *
+   * Absent ⇒ `{}`, which is D3 and is byte-for-byte M1.
+   */
+  readonly clientCapabilities?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -279,10 +292,11 @@ export async function performHandshake(
   const descriptor = o.descriptor ?? DEFAULT_V1_PROFILE;
   const window = handshakeBudget(o);
   try {
+    const clientCapabilities = o.clientCapabilities ?? {};
     const initRaw = await window.race(
       request<unknown>("initialize", {
         protocolVersion: ACP_V1_VERSION,
-        clientCapabilities: {},
+        clientCapabilities,
       }),
     );
 
@@ -293,7 +307,10 @@ export async function performHandshake(
 
     assertNegotiated(init["protocolVersion"], descriptor);
 
-    const capabilities = capabilitiesFromInitialize(init, descriptor);
+    // Recorded AS SENT, verbatim (§5.8.4). F28: `initialize`'s `agentCapabilities` never mentions
+    // elicitation either way, so our own declaration is the ONLY record of why an agent asked in
+    // prose instead of calling `elicitation/create`. Not recording it makes D10 unauditable.
+    const capabilities = capabilitiesFromInitialize(init, descriptor, clientCapabilities);
 
     const created = record(
       await window.race(
@@ -348,7 +365,13 @@ export function assertNegotiated(negotiated: unknown, descriptor: RuntimeDescrip
  */
 export function runHandshake(
   link: AcpLink,
-  o: { cwd: string; timeoutMs: number; clock: Clock; signal?: AbortSignal },
+  o: {
+    cwd: string;
+    timeoutMs: number;
+    clock: Clock;
+    signal?: AbortSignal;
+    clientCapabilities?: Readonly<Record<string, unknown>>;
+  },
 ): Promise<HandshakeResult> {
   return performHandshake((method, params) => link.request(method, params), o);
 }

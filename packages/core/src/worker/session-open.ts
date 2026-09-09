@@ -195,6 +195,15 @@ export function createSessionStrategy(o: SessionStrategyOptions): SessionStrateg
         clock: o.clock,
         descriptor: descriptorFor(call),
         mcpServers: call.mcpServers,
+        // M2-A, D10 (§5.8.8). One value, computed by `clientCapabilitiesFor()` and threaded
+        // through — the CREATE half. The WAKE half below still hard-codes `{}`, and that is
+        // F42: the two copies drift, a `park` worker that hibernates and wakes silently stops
+        // declaring elicitation, and F28 says the agent then asks in prose instead. M2-A-WP-I
+        // owns this file from the Land commit on, and its acceptance bullet 2 is a named
+        // regression test written FIRST, against the literal on line 251 below.
+        ...(call.clientCapabilities === undefined
+          ? {}
+          : { clientCapabilities: call.clientCapabilities }),
         ...(call.signal === undefined ? {} : { signal: call.signal }),
       });
       // `resume: null`, never a fabricated `landed`: D2's four states describe a RESUME, and a
@@ -248,6 +257,10 @@ export function createSessionStrategy(o: SessionStrategyOptions): SessionStrateg
           await budget.race(
             request(link)<unknown>("initialize", {
               protocolVersion: descriptor.protocolVersion,
+              // F42, UNFIXED at the Land step and deliberately so: `SessionReopenOptions` now
+              // carries `clientCapabilities` and this literal ignores it, which is exactly the
+              // line M2-A-WP-I's first test must fail against (M2-PLAN §2, WP-I acceptance 2).
+              // Landing the fix here would leave that test passing on arrival and prove nothing.
               clientCapabilities: {},
             }),
           ),

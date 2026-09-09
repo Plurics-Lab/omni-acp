@@ -37,6 +37,26 @@ function stubAuthContext(tokenId: string, clientId: string | null): AuthContext 
     assertCwd: (cwd: string) => Promise.resolve(cwd),
     canSee: () => true,
     asClientRef: (): ClientRef => ({ tokenId, clientId }),
+    // ── M2-B (§5.8.8) ────────────────────────────────────────────────────────
+    //
+    // Same discipline as `catalog.probe` below: a route test that reaches one of these without
+    // overriding it must fail LOUDLY rather than pass against a default that quietly admits an
+    // env map or an MCP preset nobody checked. The two ABSENT-request cases answer honestly,
+    // because "the request asked for none" is not a policy question.
+    policyCeiling: null,
+    assertPolicy: () => {
+      throw new OmniError("internal", "stubDaemon: override `assertPolicy` to use it");
+    },
+    assertEnv: (env) => {
+      if (env === undefined || Object.keys(env).length === 0) {
+        return { env: {}, keys: [], persist: true };
+      }
+      throw new OmniError("internal", "stubDaemon: override `assertEnv` to use it");
+    },
+    assertMcp: (names) => {
+      if (names === undefined || names.length === 0) return [];
+      throw new OmniError("internal", "stubDaemon: override `assertMcp` to use it");
+    },
   };
 }
 
@@ -186,6 +206,14 @@ export function stubDaemon(
     hibernate: (id) => Promise.resolve(notFound(id)),
     wake: (id) => Promise.resolve(notFound(id)),
     adopt: () => Promise.resolve({ hibernated: 0, closed: 0, orphans: [] }),
+
+    // ── M2 façade rows (H22-H24) ────────────────────────────────────────────
+    //
+    // Same discipline again, and the same `notFound` default: with no worker in this stub there
+    // is nothing to answer, list or configure, and a route test that forgot to override says so.
+    answer: (id) => notFound(id),
+    interactions: (id) => notFound(id),
+    setConfig: (id) => Promise.resolve(notFound(id)),
   };
 
   const catalog: Catalog = {
@@ -244,6 +272,37 @@ export function stubDaemon(
     workers,
     catalog,
     supervisor,
+    // M2-B (D9). Present, and every verb refuses out loud — the same rule the registry rows
+    // above follow, and the same shape `create-daemon.ts` installs when nothing is wired.
+    runs: {
+      create: () =>
+        Promise.reject(new OmniError("bad_request", "stubDaemon: runs are not enabled")),
+      get: (id) => {
+        throw new OmniError("bad_request", `stubDaemon: runs are not enabled (${id})`);
+      },
+      list: () => [],
+      cancel: () =>
+        Promise.reject(new OmniError("bad_request", "stubDaemon: runs are not enabled")),
+      logFor: (id) => {
+        throw new OmniError("bad_request", `stubDaemon: runs are not enabled (${id})`);
+      },
+      recover: () => ({ abandoned: 0 }),
+    },
+    deliveries: {
+      enqueue: () => {
+        throw new OmniError("bad_request", "stubDaemon: webhooks are not enabled");
+      },
+      due: () => [],
+      claim: () => false,
+      settle: () => {
+        throw new OmniError("bad_request", "stubDaemon: webhooks are not enabled");
+      },
+      requeueStale: () => 0,
+      list: () => ({ rows: [], cursor: null }),
+      redeliver: (id) => {
+        throw new OmniError("bad_request", `stubDaemon: webhooks are not enabled (${id})`);
+      },
+    },
     authContextFor: (tokenId, clientId) => stubAuthContext(tokenId, clientId ?? null),
     authenticate: (headers: Headers) => {
       const header = headers.get(HEADER.auth);
@@ -258,7 +317,11 @@ export function stubDaemon(
       agents: auth.agents,
       cwdRoots: auth.cwdRoots,
       maxWorkers: auth.maxWorkers,
-      policyCeiling: null,
+      policyCeiling: auth.policyCeiling,
+      policyPresets: [],
+      // FAIL CLOSED, and the stub says so too: `[]` rather than `"*"` (DESIGN §8's 🔴).
+      mcpPresets: [],
+      webhooks: false,
     }),
     fetch: () =>
       Promise.resolve(

@@ -25,8 +25,8 @@ describe("seqIds", () => {
 
   it("gives request ids their own visibly non-addressable prefix", () => {
     const ids = seqIds();
-    expect(ids.request()).toBe(`r_${"0".repeat(23)}001`);
-    expect(ids.request()).toBe(`r_${"0".repeat(23)}002`);
+    expect(ids.request()).toBe(`q_${"0".repeat(23)}001`);
+    expect(ids.request()).toBe(`q_${"0".repeat(23)}002`);
   });
 
   it("makes two generators independent", () => {

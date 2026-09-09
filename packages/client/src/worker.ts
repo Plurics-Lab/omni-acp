@@ -4,8 +4,10 @@ import {
   assertTurnId,
   reduceTurn,
   type CloseResult,
+  type ConfigOptionView,
   type ContentBlock,
   type DaemonId,
+  type InteractionSnapshot,
   type EventEnvelope,
   type LeaseSnapshot,
   type OmniError as OmniErrorType,
@@ -24,6 +26,8 @@ import {
   type WorkerSnapshot,
   type WorkerState,
 } from "@omni-acp/protocol";
+import { createConfigChannel } from "./config.js";
+import { createInteractionChannel, type InteractionRequestHandle } from "./interactions.js";
 import { createWorkerLease, type WorkerLease } from "./lease.js";
 import { isMalformedFrame, parseSseStream } from "./sse-parse.js";
 import type { Transport } from "./transport.js";
@@ -51,6 +55,9 @@ export interface PromptOptions {
 
 export type StreamEvent =
   | { readonly type: "text"; readonly delta: string }
+  /** M2-A. Fires only for a PARKED interaction — an auto-resolved one asks nothing of anybody. */
+  | { readonly type: "interaction"; readonly req: InteractionRequestHandle }
+  | { readonly type: "interaction_settled"; readonly interaction: InteractionSnapshot }
   | { readonly type: "thought"; readonly delta: string }
   | { readonly type: "tool_call"; readonly toolCall: ToolCallView }
   | { readonly type: "state"; readonly state: "running" | "idle"; readonly stopReason?: StopReason }
@@ -62,6 +69,14 @@ export interface WorkerEventMap {
   event: (e: EventEnvelope) => void;
   error: (e: OmniErrorType) => void;
   closed: (s: WorkerSnapshot) => void;
+  /**
+   * M2-A, D10 / DESIGN §9.1. Fires for every `acp.interaction{status:"pending"}` on this
+   * worker's tail — i.e. ONLY for a parked one. An auto-resolved interaction never fires it:
+   * nothing is being asked of the user, and an event that fired for both would train a UI to
+   * ignore the one that matters.
+   */
+  interaction: (req: InteractionRequestHandle) => void;
+  settled: (s: InteractionSnapshot) => void;
 }
 
 export interface Worker {
@@ -90,7 +105,10 @@ export interface Worker {
    * and no possible disagreement (DESIGN §5.5, D7). `accepted.seq - 1` is what removes the
    * subscribe/prompt race without a pre-existing subscription.
    */
-  prompt(input: PromptInput, opts?: PromptOptions): Promise<TurnResult>;
+  prompt(
+    input: PromptInput,
+    opts?: PromptOptions & { onInteraction?: (r: InteractionRequestHandle) => void },
+  ): Promise<TurnResult>;
   /**
    * Default filters `replay: true` envelopes — a replayed history is not this turn's stream
    * (CONTRACTS.md §5.7, ruling M1-R5).
@@ -122,6 +140,19 @@ export interface Worker {
   wake(): Promise<WorkerSnapshot>;
   /** D5's single-controller lease. `snapshot.holder: null` is a real state, not a missing feature. */
   readonly lease: WorkerLease;
+  // ── M2-A (§5.8.10) ─────────────────────────────────────────────────────────
+  /** The pending set as this handle last saw it. Non-empty ⟺ `state === "requires_action"`. */
+  readonly interactions: readonly InteractionSnapshot[];
+  /**
+   * H24. `worker.config` is updated SYNCHRONOUSLY with this promise, never from the event stream
+   * — neither agent emits `config_option_update` for a set (F34, F35). Membership can SHRINK, so
+   * a caller must re-read the list and never cache one entry.
+   */
+  setConfig(
+    configId: string,
+    value: string | number | boolean,
+  ): Promise<readonly ConfigOptionView[]>;
+  readonly config: readonly ConfigOptionView[] | null;
   /** The LAST wake's classification, or null before the first one (CONTRACTS.md §5.7). */
   readonly resume: ResumeReport | null;
   on<K extends keyof WorkerEventMap>(event: K, cb: WorkerEventMap[K]): () => void;
@@ -262,7 +293,23 @@ export function createWorkerHandle(transport: Transport, snapshot: WorkerSnapsho
     event: new Set(),
     error: new Set(),
     closed: new Set(),
+    // M2-A. Two more arms in the existing `bus` switch, delegating to the CHANNEL below —
+    // `client/src/worker.ts` stays frozen because each feature gets its own file (M2-PLAN §1.4).
+    interaction: new Set(),
+    settled: new Set(),
   };
+
+  // ── M2's two channels (M2-PLAN §1.4) ─────────────────────────────────────
+  //
+  // Constructed unconditionally and lazily throwing: an un-implemented channel must not stop a
+  // handle from being CREATED, only from being used. Every M1 path — `prompt`, `stream`,
+  // `events`, `lease`, `close` — reaches neither.
+  const interactionChannel = createInteractionChannelSafely(transport, id);
+  const configChannel = createConfigChannelSafely(
+    transport,
+    id,
+    () => current.configOptions ?? null,
+  );
 
   const local = new AbortController();
   let tailStarted = false;
@@ -350,6 +397,15 @@ export function createWorkerHandle(transport: Transport, snapshot: WorkerSnapsho
       current = { ...current, sessionId, headSeq: e.seq, updatedAt: e.ts };
       for (const cb of listeners.event) safely(() => cb(e));
       return;
+    }
+
+    if (e.kind === "acp.interaction") {
+      // The channel decides which of the two events this is: `pending` MEANS parked (ruling
+      // M2-R5), so an auto-resolved interaction — emitted once, already terminal — fires
+      // `settled` and never `interaction`.
+      safely(() => {
+        interactionChannel?.handleEnvelope(e);
+      });
     }
 
     current = { ...current, sessionId, headSeq: e.seq, updatedAt: e.ts };
@@ -604,6 +660,23 @@ export function createWorkerHandle(transport: Transport, snapshot: WorkerSnapsho
       return current.resume;
     },
 
+    // ── M2-A (§5.8.10), three delegating members and then FROZEN ────────────
+
+    get interactions(): readonly InteractionSnapshot[] {
+      return interactionChannel?.pending ?? current.interactions ?? [];
+    },
+
+    get config(): readonly ConfigOptionView[] | null {
+      return configChannel?.options ?? current.configOptions ?? null;
+    },
+
+    setConfig(configId, value): Promise<readonly ConfigOptionView[]> {
+      if (configChannel === null) {
+        return Promise.reject(new OmniError("internal", "unimplemented: M2-A-WP-C"));
+      }
+      return configChannel.set(configId, value);
+    },
+
     async hibernate(): Promise<WorkerSnapshot> {
       return adoptSnapshot(
         await transport.request<WorkerSnapshot>("POST", `/v1/workers/${id}/hibernate`, {}),
@@ -639,6 +712,18 @@ export function createWorkerHandle(transport: Transport, snapshot: WorkerSnapsho
 
     on<K extends keyof WorkerEventMap>(event: K, cb: WorkerEventMap[K]): () => void {
       listeners[event].add(cb);
+      // M2-A: the two interaction arms need the CHANNEL subscribed as well as the tail open —
+      // the channel is what turns an envelope into a handle with `allow()` / `deny()` on it.
+      if (event === "interaction") {
+        interactionChannel?.onInteraction((req) => {
+          for (const listener of listeners.interaction) safely(() => listener(req));
+        });
+      }
+      if (event === "settled") {
+        interactionChannel?.onSettled((snapshot) => {
+          for (const listener of listeners.settled) safely(() => listener(snapshot));
+        });
+      }
       // `error` alone does not open a stream: it is the sink for the others' failures, and a
       // handle that only wants to hear about problems should not create one.
       if (event !== "error") ensureTail();
@@ -736,5 +821,37 @@ function* derive(
       state,
       ...(typeof stopReason === "string" ? { stopReason: stopReason as StopReason } : {}),
     };
+  }
+}
+
+/**
+ * The two channels, constructed so that an UNIMPLEMENTED one cannot stop a handle from existing.
+ *
+ * `createWorkerHandle` runs on every `attach` and every `createAgent`, including in the whole M1
+ * suite, which touches none of M2's surface. A channel factory that throws at construction would
+ * therefore take M1 with it — the same reasoning that makes every `CreateWorkerDeps` seam
+ * optional (M2-PLAN §1.2). The `null` propagates to exactly the three members that need it, and
+ * each of them says which work package owes the body.
+ */
+function createInteractionChannelSafely(
+  transport: Transport,
+  id: WorkerId,
+): ReturnType<typeof createInteractionChannel> | null {
+  try {
+    return createInteractionChannel(transport, id);
+  } catch {
+    return null;
+  }
+}
+
+function createConfigChannelSafely(
+  transport: Transport,
+  id: WorkerId,
+  seed: () => readonly ConfigOptionView[] | null,
+): ReturnType<typeof createConfigChannel> | null {
+  try {
+    return createConfigChannel(transport, id, seed);
+  } catch {
+    return null;
   }
 }

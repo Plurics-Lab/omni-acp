@@ -44,15 +44,32 @@ describe("Worker.prompt", () => {
     expect(result.interactions).toEqual([
       {
         requestId: "req_1",
+        // M2 widens `InteractionRecord` (§5.8.5), and every added field has an M1 reading that
+        // is the truth rather than a guess: an M1 daemon knew one kind, answered inline through
+        // the baseline responder, and parked nothing.
+        kind: "permission",
+        method: "session/request_permission",
         title: "Modifying critical configuration file",
         decision: "deny",
+        by: "baseline",
+        parkedMs: 0,
+        // `null`, and honestly so: this fixture's `omni.policy_decision` carries no
+        // `toolCallId`, and `undefined` on a field typed `string | null` is the hole a strict
+        // comparison is exactly right to refuse (§5.8.5).
+        toolCallId: null,
         rule: "m0:auto-deny",
         optionId: "reject",
         at: expect.any(String) as unknown as string,
       },
     ]);
     expect(result.changes).toEqual([]);
+    // D8 in M2: still `null`, because no diff provider is wired here — and `patchInfo` says so
+    // rather than inventing a `quality` for a patch nobody produced.
     expect(result.patch).toBeNull();
+    expect(result.patchInfo).toBeNull();
+    // The fold's two new honest-empty lists (§5.8.5).
+    expect(result.strandedToolCalls).toEqual([]);
+    expect(result.pendingInteractions).toEqual([]);
     expect(result.error).toBeNull();
     expect(result.usage).toEqual({ used: 1_234, size: 200_000 });
   });

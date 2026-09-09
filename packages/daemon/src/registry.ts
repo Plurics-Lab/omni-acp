@@ -1,8 +1,11 @@
 import {
   CreateWorkerRequest,
+  InteractionAnswerBody,
   LeaseRequestBody,
   OmniError,
   PromptRequestBody,
+  SetConfigBody,
+  assertInteractionId,
   type Clock,
   type ClientRef,
   type CloseResult,
@@ -10,6 +13,8 @@ import {
   type EventLog,
   type HibernateTimer,
   type IdGen,
+  type InteractionAnswerResult,
+  type InteractionListResponse,
   type Lease,
   type LeaseSnapshot,
   type Logger,
@@ -20,6 +25,7 @@ import {
   type ResolvedDaemonConfig,
   type Seq,
   type SessionStrategy,
+  type SetConfigResponse,
   type Subscription,
   type Supervisor,
   type TokenId,
@@ -1048,6 +1054,54 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     // rehydration and the hibernated counter behind them — so the two throwing bodies below are
     // tagged M1-WP-E, the owner of this file, and not the feature's work package (review R18).
     // M1-WP-D swaps in the enforcing `Lease` FACTORY without touching this file — seam 3.
+
+    // ── M2 façade rows (H22-H24, §5.8.8) ──────────────────────────────────────
+    //
+    // Land-written and then TRANSFERRED to M2-WP-J, which owns all daemon wiring (M2-PLAN §1.1).
+    // Same shape and same reason as M1's rows above (review R11): an HTTP route is "parse -> call
+    // ONE daemon method -> serialize", so `POST …/interactions/{reqId}` must not become a
+    // get-then-act orchestration in the adapter.
+    //
+    // Each is `get(id, auth)` — which is where VISIBILITY is checked, before anything else, so a
+    // worker this token cannot see is a 404 and not a 423 — followed by ONE call on the handle.
+    // The handle's own body is where the state and lease checks live (hunks 5 and 6), so an
+    // un-configured daemon answers `interaction_not_found` and `-32601` here rather than a 500.
+
+    /** H22: `200 InteractionAnswerResult`. Lease-gated INSIDE the handle, exactly as `prompt` is. */
+    answer(id, auth, reqId, body): InteractionAnswerResult {
+      let parsed: InteractionAnswerBody;
+      try {
+        parsed = InteractionAnswerBody.parse(body);
+      } catch (e) {
+        throw badRequest(e, "invalid interaction answer");
+      }
+      return get(id, auth).answerInteraction(assertInteractionId(reqId), parsed, {
+        ...auth.asClientRef(),
+        tokenId: auth.tokenId,
+      });
+    },
+
+    /** H23: `200 InteractionListResponse`. UNGATED (rule L2) — reading is an observer's right. */
+    interactions(id, auth): InteractionListResponse {
+      return { interactions: get(id, auth).interactions };
+    },
+
+    /** H24: `200 SetConfigResponse`. */
+    async setConfig(id, auth, body): Promise<SetConfigResponse> {
+      let parsed: SetConfigBody;
+      try {
+        parsed = SetConfigBody.parse(body);
+      } catch (e) {
+        throw badRequest(e, "invalid config request");
+      }
+      const entry = lookup(id, auth);
+      if (entry === null) return notFound(id);
+      // `Worker.setConfig` auto-wakes a hibernated worker internally, so the ACL that `wake()`
+      // re-runs has to be re-run here too — otherwise the check is one HTTP route wide (H14).
+      // The same line `prompt` carries, for the same reason.
+      if (entry.handle.snapshot().state === "hibernated") await assertMayResume(entry, auth);
+      return await entry.handle.setConfig(parsed, auth.asClientRef());
+    },
 
     /** A hibernated worker owns no process, so it is bounded separately from `maxWorkers` (H14). */
     get hibernatedSize(): number {

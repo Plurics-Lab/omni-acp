@@ -25,12 +25,15 @@
     ],
     "changes": [],
     "patch": null,
+    "patchInfo": null,
     "vendorPatch": null,
     "interactions": [],
     "verdict": "ok",
     "warnings": [],
     "failedToolCalls": [],
     "deniedToolCalls": [],
+    "strandedToolCalls": [],
+    "pendingInteractions": [],
     "error": null
   },
   "status": {

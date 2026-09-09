@@ -8,6 +8,7 @@ import {
   verifySecret,
   type ClientId,
   type ClientRef,
+  type PolicyCeiling,
   type ResolvedDaemonConfig,
   type TokenConfig,
   type TokenId,
@@ -41,6 +42,12 @@ interface TokenEntry {
   readonly maxWorkers: number;
   /** Lower-case hex. The plaintext never reaches this object. */
   readonly sha256: string;
+  // ── M2-B (§5.8.7) ──────────────────────────────────────────────────────────
+  readonly policyCeiling: PolicyCeiling | null;
+  readonly policyPresets: readonly string[] | "*";
+  /** FAIL CLOSED: `[]` by default, not `"*"` — an MCP server is arbitrary code on this machine. */
+  readonly mcpPresets: readonly string[] | "*";
+  readonly envAllow: readonly string[];
 }
 
 /** An `Omni-Client-Id` is audit metadata; it is bounded so it cannot become a log-bloat vector. */
@@ -75,6 +82,14 @@ function toEntry(token: TokenConfig): TokenEntry | null {
     cwdRoots: roots.map(resolvePath),
     maxWorkers: token.maxWorkers,
     sha256: sha256.toLowerCase(),
+    // Read DEFENSIVELY, for the reason the `sha256 === undefined` line above states: a table
+    // mutated at runtime (H13's "re-evaluated per call" is tested by doing exactly that) can hold
+    // a row zod never produced. Every fallback is the FAIL-CLOSED value, so a hand-written row is
+    // the most restrictive token in the table rather than the least.
+    policyCeiling: token.policyCeiling ?? null,
+    policyPresets: token.policyPresets === "*" ? "*" : [...(token.policyPresets ?? [])],
+    mcpPresets: token.mcpPresets === "*" ? "*" : [...(token.mcpPresets ?? [])],
+    envAllow: [...(token.envAllow ?? [])],
   };
 }
 
@@ -166,6 +181,42 @@ function createAuthContext(
     /** D13: an admin sees the whole machine; everyone else sees their own token's workers. */
     canSee(w: WorkerSnapshot): boolean {
       return entry.role === "admin" || w.ownerTokenId === entry.tokenId;
+    },
+
+    // ── M2-B (§5.8.8). Land-written stubs; M2-B-WP-P/WP-S land the bodies here. ───
+    //
+    // Each one is the ONE place its rule is enforced, and each one FAILS CLOSED at the Land step
+    // rather than admitting a request it cannot check. `assertEnv` and `assertMcp` are the
+    // exception a caller actually meets today: a request that asks for NOTHING gets the empty
+    // answer, because refusing that would be refusing every M1 request.
+
+    policyCeiling: entry.policyCeiling,
+
+    /** D4. Throws `policy_exceeds_ceiling` (403) carrying `{ceiling, offending}` (§20.5). */
+    assertPolicy(sel) {
+      if (sel === undefined && entry.policyCeiling === null) {
+        throw new OmniError("internal", "unimplemented: M2-B-WP-P (policy engine)");
+      }
+      throw new OmniError("internal", "unimplemented: M2-B-WP-P (policy engine)");
+    },
+
+    /**
+     * DESIGN §8's hard blacklist ⊕ `envDeny` ⊕ this token's `envAllow`. Throws `bad_request`
+     * NAMING the key — never a silent drop (ruling M2-R12).
+     */
+    assertEnv(env) {
+      // An absent map is not an empty map with a policy question: it is a request that asked for
+      // no env at all, which is every M1 request, and it resolves to nothing.
+      if (env === undefined || Object.keys(env).length === 0) {
+        return { env: {}, keys: [], persist: true };
+      }
+      throw new OmniError("internal", "unimplemented: M2-B-WP-S (per-worker env)");
+    },
+
+    /** Preset NAMES → resolved server objects. `400` for unknown, `403` for disallowed. */
+    assertMcp(names) {
+      if (names === undefined || names.length === 0) return [];
+      throw new OmniError("internal", "unimplemented: M2-B-WP-S (mcp presets)");
     },
 
     asClientRef(): ClientRef {

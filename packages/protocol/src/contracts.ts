@@ -20,38 +20,76 @@ import type {
 } from "./acp.js";
 import type {
   AgentCatalogEntry,
+  CreateRunRequest,
   CreateWorkerRequest,
   DaemonInfo,
+  DeliveryRecord,
+  InteractionAnswerBody,
+  InteractionAnswerResult,
+  InteractionListResponse,
   LeaseRequestBody,
   ProbeRequestBody,
   ProbeResponse,
   PromptAccepted,
+  PolicySelection,
   PromptRequestBody,
+  RunSnapshot,
+  SetConfigBody,
+  SetConfigResponse,
+  WebhookEvent,
+  WebhookTarget,
   WhoAmIResponse,
 } from "./control-plane.js";
 import type {
   AgentDescriptor,
+  McpServerPreset,
+  PolicyAction,
+  PolicyCeiling,
   ResolvedDaemonConfig,
+  ResolvedDiffConfig,
   ResolvedEventLogConfig,
+  ResolvedInteractionConfig,
   ResolvedLeaseConfig,
+  ResolvedPolicy,
+  ResolvedWatchdogConfig,
+  ResolvedWebhookConfig,
 } from "./config.js";
 import type { AcpErrorDetail, OmniErrorBody } from "./errors.js";
 import type {
   EventEnvelope,
   EventInput,
+  InteractionKind,
+  InteractionMethod,
   OrphanRecord,
+  ParkTimeoutAction,
   PolicyDecisionPayload,
+  RunState,
   WorkerCloseReason,
   WorkerState,
 } from "./events.js";
-import type { ClientId, DaemonId, Seq, SessionId, TokenId, TurnId, WorkerId } from "./ids.js";
+import type {
+  ClientId,
+  DaemonId,
+  DeliveryId,
+  InteractionId,
+  RunId,
+  Seq,
+  SessionId,
+  TokenId,
+  TurnId,
+  WorkerId,
+} from "./ids.js";
 import type { LeaseEventPayload, LeaseSnapshot } from "./lease.js";
 import type { ResumeHint, ResumeOutcome, ResumeReport } from "./resume.js";
 import type { RuntimeDescriptor } from "./runtime.js";
-import type { TurnStatus } from "./turn.js";
+import type { TurnStatus, TurnWarning } from "./turn.js";
 import type {
   AgentCapabilitiesSnapshot,
   CloseResult,
+  ConfigOptionView,
+  ElicitationField,
+  InteractionSnapshot,
+  PolicySnapshot,
   ProcessInfo,
   WorkerSnapshot,
 } from "./worker.js";
@@ -75,6 +113,12 @@ export interface IdGen {
   worker(): WorkerId;
   turn(): TurnId;
   request(): string;
+  // ── M2 (§5.8.1) ────────────────────────────────────────────────────────────
+  /** DAEMON-MINTED. F33: the two agent→client requests share ONE JSON-RPC id counter, so a
+   *  transport id is not an identity a route may address. */
+  interaction(): InteractionId;
+  run(): RunId;
+  delivery(): DeliveryId;
 }
 
 export interface Logger {
@@ -324,6 +368,30 @@ export interface WorkerRow {
   readonly lastActiveMs: number;
   readonly closedAtMs: number | null;
   readonly hibernateIdleMs: number | null;
+
+  // ── M2 (§5.8.8) ────────────────────────────────────────────────────────────
+  //
+  // Persisted BECAUSE OF THE WAKE PATH, each for a reason a restart makes sharp:
+  //  - `onUnresolved` — a `park` worker that hibernated and woke must RE-DECLARE
+  //    `clientCapabilities.elicitation`, or F28 says the agent silently degrades to prose and the
+  //    park never happens again (F42 is the code that would do exactly that today);
+  //  - `env` / `mcpNames` / `policyRef` — a wake must reproduce the environment, or the woken
+  //    worker is a different worker wearing the same id.
+  // Interactions are deliberately NOT persisted (ruling M2-R10).
+  //
+  // OPTIONAL at the Land step for the reason `WorkerSnapshot`'s M2 rows are: a `WorkerRow` is
+  // built in `registry.ts`, in `boot-recovery.ts` and in five test files, and the v2 CREATE-only
+  // migration that stores them is M2-B-WP-R's. Absent reads as the M1 default in every case.
+
+  readonly onUnresolved?: "park" | "deny" | "fail";
+  readonly parkTimeoutMs?: number | null;
+  readonly parkTimeoutAction?: ParkTimeoutAction;
+  readonly mcpNames?: readonly string[];
+  readonly policyRef?: string | null;
+  /** `null` when `env.persist:false` was requested — which forces `resume.method: null` (§23.3). */
+  readonly env?: Readonly<Record<string, string>> | null;
+  readonly watchdog?: { silentMs: number; toolMs: number; cancelTimeoutMs: number };
+  readonly patchMode?: "off" | "on_write" | "always";
 }
 
 export interface RetentionReport {
@@ -405,6 +473,13 @@ export type TurnInput =
       /** v1 `PromptResponse.usage` (F21). Lands on `state_update{idle}.usage`. */
       readonly usage?: unknown;
       readonly at: number;
+      /**
+       * M2, SEAM D (M2-PLAN §1.3): merged into `state_update{idle}._meta`. The reducer does not
+       * know what any key means — it is the same channel `omni/vendorPatch` and `omni/warnings`
+       * already ride (§12.5) — and it is what lets the git provider land with ZERO edits to
+       * `turn-lifecycle.ts` (ruling M2-R9).
+       */
+      readonly meta?: Readonly<Record<string, unknown>>;
     }
   | { readonly type: "prompt_error"; readonly error: OmniErrorBody; readonly at: number }
   | {
@@ -419,6 +494,10 @@ export type TurnInput =
   | { readonly type: "drained"; readonly at: number }
   /** One COMPLETE stderr line, for `end_turn`-with-fatal-stderr promotion (§13.4). */
   | { readonly type: "stderr_line"; readonly line: string; readonly at: number }
+  /** M2. The turn is suspended on a human. Both watchdog budgets stop; the park timer owns the
+   *  deadline (§21.4). */
+  | { readonly type: "interaction_parked"; readonly id: InteractionId; readonly at: number }
+  | { readonly type: "interaction_resolved"; readonly id: InteractionId; readonly at: number }
   | { readonly type: "tick"; readonly at: number };
 
 export type SettleReason = "quiet" | "hard" | "error" | "gone" | "drained" | "cancelled";
@@ -434,7 +513,8 @@ export interface TurnOutput {
   readonly emit: readonly EventInput[];
   /** Absolute epoch-ms at which the Worker must deliver a `tick`, or null. */
   readonly scheduleTickAt: number | null;
-  readonly state: "idle" | "running" | "settling" | "closing";
+  /** M2 adds `parked`: a turn suspended on a human is not `running` and is not `settling`. */
+  readonly state: "idle" | "running" | "parked" | "settling" | "closing";
   readonly turnId: TurnId | null;
   readonly settled: SettleReason | null;
   readonly action: CloseOutAction | null;
@@ -501,6 +581,393 @@ export interface Normalizer {
   noteUnsupported(method: string): void;
   /** Classify a JSON-RPC error with the descriptor's rules. NEVER throws. */
   classifyError(e: AcpErrorDetail): ErrorClass;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// M2's five seams (§5.8.8). Every one of them is OPTIONAL on `DaemonDeps`, and with all of them
+// absent the daemon is M1 — which is what the whole M1 suite proves (ruling M2-R1).
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── interaction (M2-A) ───────────────────────────────────────────────────────
+
+/** v1 `elicitation/create` params, mapped. F29: the scope fields are FLAT in `params`, not nested. */
+export interface MappedElicitationRequest {
+  readonly mode: "form" | "url";
+  readonly sessionId: string;
+  readonly toolCallId: string | null;
+  readonly requestId: string | null;
+  readonly message: string;
+  readonly fields: readonly ElicitationField[];
+  /** Properties this parse did not fold into a field — kept so an answer that names one is a
+   *  `bad_request` with the name in it rather than a silent drop. */
+  readonly unmodelled: readonly string[];
+  readonly _meta?: Readonly<Record<string, unknown>>;
+}
+
+/** D10's unification: the two agent→client requests are ONE lifecycle. */
+export interface InteractionRequest {
+  readonly id: InteractionId;
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
+  readonly title: string;
+  readonly message: string | null;
+  /** v2's TAGGED subject for a permission; null for an elicitation. The policy engine matches on it. */
+  readonly subject: Readonly<Record<string, unknown>> | null;
+  readonly options: readonly PermissionOption[];
+  readonly fields: readonly ElicitationField[];
+  /** Present on BOTH kinds (F29's flat `toolCallId`, F32's mirror). */
+  readonly toolCallId: string | null;
+  readonly turnId: TurnId | null;
+  /** Verbatim params. NEVER reshaped — `acp.interaction.raw` audits the agent, not our mapping (§7.5). */
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+export type InteractionAnswer =
+  | { readonly action: "allow"; readonly optionId?: string; readonly note?: string }
+  | { readonly action: "deny"; readonly note?: string }
+  | {
+      readonly action: "answer";
+      readonly content: Readonly<Record<string, unknown>>;
+      readonly note?: string;
+    }
+  | { readonly action: "cancel" };
+
+export type InteractionOutcome =
+  | { readonly kind: "permission"; readonly optionId: string }
+  /** → JSON-RPC -32603 (D4 rule 4). NEVER an invented id (rule 1), never `cancelled` (rule 5). */
+  | { readonly kind: "permission_error" }
+  | { readonly kind: "elicitation_accept"; readonly content: Readonly<Record<string, unknown>> }
+  | { readonly kind: "elicitation_decline" }
+  | { readonly kind: "elicitation_cancel" };
+
+export interface InteractionResolution {
+  readonly outcome: InteractionOutcome;
+  readonly record: PolicyDecisionPayload;
+}
+
+/** What the strategy may do to the Worker. Deliberately three verbs. */
+export interface InteractionContext {
+  readonly turnId: TurnId | null;
+  /** Appended in array order, synchronously — the same contract `TurnOutput.emit` has. */
+  emit(inputs: readonly EventInput[]): void;
+  /**
+   * `running → requires_action`. Returns the un-park; REFCOUNTED exactly like
+   * `Lease.pinExpiry()`, and the LAST un-park emits `interaction_resolved`. It also pauses the
+   * watchdog (§21.4) and holds the lease pin for the whole window.
+   */
+  park(id: InteractionId): () => void;
+  /** `onUnresolved:"fail"` and `parkTimeoutAction:"fail"`: cancel the turn, do not close the worker. */
+  failTurn(reason: string): void;
+}
+
+/**
+ * The ONE lifecycle. It SUPERSEDES `PermissionResponder` rather than replacing it:
+ * `baselineInteractions(responder, clock)` wraps M1's responder verbatim, so a worker with no
+ * strategy injected is byte-for-byte M1 — which is what the M1 suite proves (§19.10).
+ */
+export interface InteractionStrategy {
+  /** D10's per-worker gate, read ONCE at handshake and re-read on every WAKE (F42). `{}` unless
+   *  `onUnresolved === "park"`. */
+  readonly clientCapabilities: Readonly<Record<string, unknown>>;
+  /** NEVER rejects for a reason other than `AcpRequestError`: a rejected promise here is an agent
+   *  that waits forever on a JSON-RPC id (F1). */
+  permission(
+    req: MappedPermissionRequest,
+    ctx: InteractionContext,
+  ): Promise<RequestPermissionResponse>;
+  elicitation(req: MappedElicitationRequest, ctx: InteractionContext): Promise<unknown>;
+  /** H22. Throws `interaction_not_found` / `interaction_settled` / `bad_request`. */
+  answer(
+    id: InteractionId,
+    a: InteractionAnswer,
+    who: ClientRef & { tokenId: TokenId },
+  ): InteractionAnswerResult;
+  get(id: InteractionId): InteractionSnapshot | null;
+  readonly pending: readonly InteractionSnapshot[];
+  /**
+   * Settle every parked request with `reason`, put a real answer on the wire for each, and RETURN
+   * once every held JSON-RPC promise has resolved. Called by `cancel()` **before**
+   * `session/cancel`, by `#doClose`, by `#doHibernate` and by `daemon.stop()` — a log that ends
+   * on a `pending` interaction is a log that lies, and an agent blocked on our answer may never
+   * read the cancel (§19.8). Idempotent.
+   */
+  settleAll(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): void;
+  close(): void;
+}
+
+/** What `DaemonDeps.interactions` is handed to build one strategy per worker (§5.8.9). */
+export interface InteractionDeps {
+  readonly workerId: WorkerId;
+  readonly clock: Clock;
+  readonly ids: IdGen;
+  readonly logger: Logger;
+  readonly config: ResolvedInteractionConfig;
+  readonly onUnresolved: "park" | "deny" | "fail";
+  readonly parkTimeoutMs: number | null;
+  readonly parkTimeoutAction: ParkTimeoutAction;
+  /** M2-B's engine, injected. Absent ⇒ the constant `onUnresolved` verdict, which is what makes
+   *  WP-I and WP-P file-disjoint and orderable either way (M2-PLAN §1.3 seam A). */
+  readonly decide?: (s: PolicySubject) => PolicyVerdict;
+  /** M1's responder, for `baselineInteractions` and for option selection under D4 rules 1-6. */
+  readonly responder: PermissionResponder;
+}
+
+// ── policy (M2-B; D4) ────────────────────────────────────────────────────────
+
+export interface PolicySubject {
+  readonly method: InteractionMethod;
+  /** v2's tag. An unknown tag falls to `default` (D4: unknown subjects are declined by policy). */
+  readonly type: "tool_call" | "command" | string;
+  readonly kind: string | null;
+  /**
+   * REALPATH'd absolutes off `subject.toolCall.locations[]`. For a file that does not exist yet
+   * (a create), the deepest existing ancestor is realpath'd and the remainder re-appended —
+   * otherwise every `allow` rule for `src/**` fails on exactly the writes it exists to permit.
+   *
+   * EMPTY IS NOT "NO PATHS": F38 proves `locations[]` under-reports. A `path` clause therefore
+   * matches only when this is non-empty AND every entry matches, so an unlisted second path can
+   * never launder the first (§20.3).
+   */
+  readonly paths: readonly string[];
+  readonly command: string | null;
+  readonly title: string;
+  readonly agentId: string;
+  readonly cwd: string;
+}
+
+export interface PolicyVerdict {
+  readonly action: PolicyAction;
+  /** `"<policyId>#<ruleId>"` or `"<policyId>#default"`. Goes verbatim into `PolicyDecisionPayload`. */
+  readonly rule: string;
+  readonly source: "baseline" | "default" | "preset" | "inline" | "ceiling";
+  /** Set when the ceiling narrowed the action. NEVER silent (§20.5). */
+  readonly clamped: { readonly from: PolicyAction; readonly by: string } | null;
+}
+
+/**
+ * PURE and TOTAL: same subject in ⇒ deep-equal verdict out, no I/O, no clock.
+ *
+ * It decides WHAT, never WHICH `optionId` — option selection stays in `permission-responder.ts`,
+ * the one place D4 rules 1-6 live. That separation is what makes it structurally impossible for
+ * M2-B to break rule 3 by editing the engine, and the `policy-never-names-an-option` guard
+ * enforces it.
+ */
+export interface PolicyEngine {
+  decide(s: PolicySubject): PolicyVerdict;
+  readonly id: string;
+  readonly snapshot: PolicySnapshot;
+}
+
+/** One chosen option, and why. The ONE place D4 rules 1-6 pick an id (§5.8.9). */
+export interface OptionChoice {
+  readonly optionId: string | null;
+  readonly rule: string;
+}
+
+// ── idle watchdog (M2-A; DESIGN §7) ──────────────────────────────────────────
+
+export type WatchdogSignal =
+  | { readonly kind: "turn_start"; readonly at: number }
+  | { readonly kind: "envelope"; readonly at: number; readonly envelope: EventEnvelope }
+  | { readonly kind: "parked"; readonly at: number }
+  | { readonly kind: "unparked"; readonly at: number }
+  | { readonly kind: "cancel_sent"; readonly at: number }
+  | { readonly kind: "turn_end"; readonly at: number };
+
+export interface WatchdogVerdict {
+  /** Absolute epoch-ms the Worker must schedule, or null (disarmed). */
+  readonly deadlineAt: number | null;
+  readonly budget: "silent" | "tool" | null;
+  readonly phase: "idle" | "silent" | "tool" | "cancelling" | "paused" | "spent";
+  readonly openToolCalls: readonly string[];
+}
+
+export interface WatchdogState {
+  readonly lastAt: number;
+  readonly open: ReadonlySet<string>;
+  readonly parked: boolean;
+  readonly running: boolean;
+  readonly cancelSentAt: number | null;
+}
+
+/**
+ * PURE STATE + one timer, split exactly as `HibernateTimer` is: `watchdogStep` is the fold and is
+ * table-testable with no clock and no process at all; `createWatchdog` wraps it in one
+ * `Clock.setTimer`.
+ */
+export interface Watchdog {
+  observe(s: WatchdogSignal): WatchdogVerdict;
+  readonly verdict: WatchdogVerdict;
+  /**
+   * The RESOLVED budgets this watchdog is running under.
+   *
+   * Added at the Land step beyond §5.8.8's three members, for one reason: `WorkerSnapshot.watchdog`
+   * must report `{silentMs, toolMs, cancelTimeoutMs}` "so an operator reads them without
+   * re-deriving config" (§5.8.4), `worker.ts` is FROZEN after the Land step, and a worker that had
+   * to be handed the numbers a second time is a worker that can disagree with its own watchdog.
+   */
+  readonly config: ResolvedWatchdogConfig;
+  cancel(): void;
+}
+
+export interface WatchdogDeps {
+  readonly workerId: WorkerId;
+  readonly clock: Clock;
+  readonly config: ResolvedWatchdogConfig;
+  readonly onFire: (budget: "silent" | "tool") => void;
+}
+
+// ── diff provider (M2-B; D8) ─────────────────────────────────────────────────
+
+export interface PatchHandle {
+  readonly topLevel: string;
+  readonly indexFile: string;
+  readonly tree: string;
+  readonly startedAtMs: number;
+}
+
+export interface PatchResult {
+  readonly text: string | null;
+  readonly source: "git" | null;
+  readonly truncated: boolean;
+  readonly quality: "exact" | "shared_worktree" | "unavailable";
+  readonly warnings: readonly TurnWarning[];
+}
+
+export interface DiffProvider {
+  /**
+   * Called at prompt ADMISSION, **per turn** — never once per worker. F39: codex-acp creates
+   * `.git/` in its own cwd mid-session, so "outside a repo ⇒ null" cannot be decided once at
+   * worker start. NEVER throws: `null` is D8's honest answer and a git failure is not a failed turn.
+   */
+  begin(o: { cwd: string; workerId: WorkerId; signal?: AbortSignal }): Promise<PatchHandle | null>;
+  /** After settle, BEFORE `idle` is emitted. NEVER throws: a failure is `text: null` + a warning. */
+  end(h: PatchHandle, o?: { signal?: AbortSignal }): Promise<PatchResult>;
+  /** Best effort; deletes the temp index when a turn dies without an `end`. NEVER throws. */
+  abandon(h: PatchHandle): void;
+}
+
+// ── runs and webhooks (M2-B; D9) ─────────────────────────────────────────────
+
+/**
+ * D9's thin payload. **Eight keys, not seven**: `workerId` is added because the thin payload must
+ * be ADDRESSABLE — `/v1` is keyed on `workerId`, and a receiver holding only `sessionId` cannot
+ * pull anything back (ruling M2-R13). The `webhook-body-is-thin` guard pins the key set at
+ * exactly these.
+ */
+export interface WebhookPayload {
+  readonly deliveryId: DeliveryId;
+  readonly event: WebhookEvent;
+  readonly daemonId: DaemonId;
+  readonly workerId: WorkerId;
+  readonly runId: RunId | null;
+  readonly sessionId: SessionId | null;
+  readonly seq: Seq;
+  readonly ts: string;
+}
+
+export interface RunRegistry {
+  create(req: CreateRunRequest, auth: AuthContext): Promise<RunSnapshot>;
+  get(id: RunId, auth: AuthContext): RunSnapshot;
+  list(auth: AuthContext, o?: { limit?: number; cursor?: string }): readonly RunSnapshot[];
+  cancel(id: RunId, auth: AuthContext): Promise<RunSnapshot>;
+  logFor(id: RunId, auth: AuthContext): EventLog;
+  /** Boot: every run whose `bootId` is not ours and whose state is live becomes `abandoned`, with
+   *  a terminal `run.failed` delivery enqueued (§24.4). */
+  recover(): { readonly abandoned: number };
+}
+
+/** One persisted run row (§24). The store half of `RunRegistry`; M2-B-WP-R owns both. */
+export interface RunRow {
+  readonly snapshot: RunSnapshot;
+  readonly tokenId: TokenId;
+  readonly bootId: string;
+  readonly idempotencyKey: string | null;
+  readonly webhook: WebhookTarget | null;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export interface RunStore {
+  put(row: RunRow): void;
+  get(id: RunId): RunRow | null;
+  byIdempotencyKey(tokenId: TokenId, key: string): RunRow | null;
+  list(o: { tokenId?: TokenId; limit: number; cursor?: string }): {
+    rows: readonly RunRow[];
+    cursor: string | null;
+  };
+  /** Boot: rows from a FOREIGN bootId in a live state, for `recoverRuns` to abandon (§24.4). */
+  liveFromOtherBoots(bootId: string): readonly RunRow[];
+  /** Retention sweeps runs and their deliveries TOGETHER, on M1's existing timer. */
+  sweep(o: { olderThanMs: number }): number;
+}
+
+export interface DeliveryStore {
+  enqueue(r: {
+    deliveryId: DeliveryId;
+    runId: RunId;
+    tokenId: TokenId;
+    event: WebhookEvent;
+    url: string;
+    payload: WebhookPayload;
+    nowMs: number;
+  }): void;
+  /** Rows whose `next_attempt_ms <= nowMs`, oldest first, at most `limit`. */
+  due(nowMs: number, limit: number): readonly DeliveryRecord[];
+  /** ATOMIC compare-and-set pending→delivering, stamping this boot's id. false ⇒ somebody else
+   *  has it. */
+  claim(id: DeliveryId, bootId: string, nowMs: number): boolean;
+  settle(r: {
+    deliveryId: DeliveryId;
+    ok: boolean;
+    status: number | null;
+    error: string | null;
+    responseMs: number;
+    nextAttemptMs: number | null;
+    state: "delivered" | "pending" | "failed";
+    nowMs: number;
+  }): void;
+  /** Boot: `delivering` rows owned by ANOTHER bootId → `pending`, `attempt` UNCHANGED (§24.4). */
+  requeueStale(bootId: string, nowMs: number): number;
+  list(o: { runId?: RunId; state?: string; limit: number; cursor?: string }): {
+    rows: readonly DeliveryRecord[];
+    cursor: string | null;
+  };
+  redeliver(id: DeliveryId, nowMs: number): DeliveryRecord;
+}
+
+export interface WebhookDispatcher {
+  start(): void;
+  /** Enqueues and returns IMMEDIATELY. It NEVER blocks a turn — a slow receiver may not slow an
+   *  agent. */
+  dispatch(
+    p: Omit<WebhookPayload, "deliveryId">,
+    target: WebhookTarget,
+    tokenId: TokenId,
+  ): DeliveryId;
+  redeliver(id: DeliveryId): Promise<DeliveryRecord>;
+  /** Drains what is due right now and returns when the in-flight set is empty. Tests and `stop()`. */
+  drain(o?: { timeoutMs?: number }): Promise<void>;
+  stop(): Promise<void>;
+}
+
+/** The `net.Resolver`-shaped seam `assertWebhookUrl` takes, so the SSRF test needs no DNS. */
+export type Resolver = (hostname: string) => Promise<readonly string[]>;
+
+/** What `AuthContext.assertEnv` returns: the resolved map, and the KEY NAMES for the snapshot. */
+export interface EnvResolution {
+  readonly env: Readonly<Record<string, string>>;
+  readonly keys: readonly string[];
+  /** `false` ⇒ `resume.method` is forced to null and the worker refuses to hibernate (§23.3). */
+  readonly persist: boolean;
+}
+
+/** What `filterMcpCapabilities` reports; it is never an error (WP-S bullet 3). */
+export interface McpResolution {
+  readonly servers: readonly unknown[];
+  readonly applied: readonly string[];
+  readonly dropped: readonly { readonly name: string; readonly reason: string }[];
+  readonly warnings: readonly TurnWarning[];
 }
 
 // ── permission responder (M1-WP-B/C implement) ───────────────────────────────
@@ -598,8 +1065,18 @@ export interface AcpLinkLike {
 export interface SessionOpenOptions {
   readonly cwd: string;
   readonly descriptor: RuntimeDescriptor;
-  /** Always `[]` in M1 (DESIGN §8 — presets are M2). */
+  /** M2-B: RESOLVED preset objects. A strategy never sees a preset NAME. `[]` in M1. */
   readonly mcpServers: readonly unknown[];
+  /**
+   * M2-A, D10. Computed once by `clientCapabilitiesFor(onUnresolved, cfg)` and passed in, so
+   * `handshake.ts` and the WAKE path in `session-open.ts` cannot drift — F42 is that they
+   * currently both hard-code `{}` in two different files, and `SessionReopenOptions` MUST be
+   * given the same value as `open`.
+   *
+   * OPTIONAL at the Land step, required by §5.8.8: absent means the literal `{}` both files
+   * hard-code today, so M1's behaviour is the default and M2-A-WP-I flips it by passing a value.
+   */
+  readonly clientCapabilities?: Readonly<Record<string, unknown>>;
   readonly budgetMs: number;
   readonly signal?: AbortSignal;
 }
@@ -617,6 +1094,12 @@ export interface SessionOpenResult {
   readonly capabilities: AgentCapabilitiesSnapshot;
   readonly sessionId: SessionId;
   readonly resume: ResumeReport | null;
+  /**
+   * M2: the catalogue as of THIS open/reopen, typed. Seeds `WorkerSnapshot.configOptions`; a
+   * resumed session may report a different one (WP-C bullet 8). Optional at the Land step —
+   * `capabilities.configOptions` is still the verbatim list M1 carries.
+   */
+  readonly configOptions?: readonly ConfigOptionView[] | null;
 }
 
 /**
@@ -671,6 +1154,25 @@ export interface WorkerHandle {
   wake(who: ClientRef, opts?: { timeoutMs?: number }): Promise<WorkerSnapshot>;
   /** Processes this worker has had. 0 = it has never run. */
   readonly generation: number;
+
+  // ── M2 (§5.8.8) ────────────────────────────────────────────────────────────
+
+  /** H22. Lease-gated by the caller; the handle enforces state, not identity. */
+  answerInteraction(
+    id: InteractionId,
+    a: InteractionAnswer,
+    who: ClientRef & { tokenId: TokenId },
+  ): InteractionAnswerResult;
+  readonly interactions: readonly InteractionSnapshot[];
+  /** H24. `409 worker_busy` unless `ready`; auto-wakes a `hibernated` worker exactly as `prompt`
+   *  does. */
+  setConfig(body: SetConfigBody, who: ClientRef): Promise<SetConfigResponse>;
+  /**
+   * DAEMON-initiated cancel, deliberately NOT lease-gated: the lease governs CLIENTS, and the
+   * idle watchdog is not one. Without this the daemon's own timer `423`s itself the moment a real
+   * `createLease` replaces `alwaysGrantedLease` — the kind of thing discovered in production.
+   */
+  cancelInternal(reason: "watchdog_silent" | "watchdog_tool"): Promise<void>;
 }
 
 // ── daemon (WP-5 implements; testkit's stubDaemon() produces one) ────────────
@@ -700,6 +1202,17 @@ export interface AuthContext {
   /** D13: admin sees all; otherwise same ownerTokenId only. */
   canSee(w: WorkerSnapshot): boolean;
   asClientRef(): ClientRef;
+
+  // ── M2-B (§5.8.8) ──────────────────────────────────────────────────────────
+
+  /** D4. Throws `policy_exceeds_ceiling` (403) carrying `{ceiling, offending}`. */
+  assertPolicy(sel: PolicySelection | undefined): PolicyEngine;
+  /** DESIGN §8's hard blacklist ⊕ `envDeny` ⊕ the token's `envAllow`. Throws `bad_request`
+   *  NAMING the key — never a silent drop (ruling M2-R12). */
+  assertEnv(env: Readonly<Record<string, string>> | undefined): EnvResolution;
+  /** Preset NAMES → resolved server objects. `400` for unknown, `403` for disallowed. */
+  assertMcp(names: readonly string[] | undefined): readonly unknown[];
+  readonly policyCeiling: PolicyCeiling | null;
 }
 
 export interface WorkerRegistry {
@@ -747,6 +1260,21 @@ export interface WorkerRegistry {
   wake(id: WorkerId, auth: AuthContext): Promise<WorkerSnapshot>;
   /** Boot adoption: every live-state row from a previous boot becomes `hibernated` or `closed`. */
   adopt(): Promise<{ hibernated: number; closed: number; orphans: readonly OrphanRecord[] }>;
+
+  // ── M2 façade rows (H22-H24), same rule: parse -> ONE call -> serialize ────
+
+  /** H22: `200 InteractionAnswerResult`. */
+  answer(
+    id: WorkerId,
+    auth: AuthContext,
+    reqId: InteractionId,
+    body: InteractionAnswerBody,
+  ): InteractionAnswerResult;
+  /** H23: `200 InteractionListResponse`. UNGATED (rule L2) — reading the pending set is an
+   *  observer's right. */
+  interactions(id: WorkerId, auth: AuthContext): InteractionListResponse;
+  /** H24: `200 SetConfigResponse`. */
+  setConfig(id: WorkerId, auth: AuthContext, body: SetConfigBody): Promise<SetConfigResponse>;
 }
 
 export interface Catalog {
@@ -778,6 +1306,13 @@ export interface Daemon {
   readonly workers: WorkerRegistry;
   readonly catalog: Catalog;
   readonly supervisor: Supervisor;
+  /**
+   * M2-B (D9). Always present; with no dispatcher wired every verb answers `bad_request` naming
+   * M2-B-WP-R, which is D29's honest "not implemented yet" rather than a 500 (the M1 Land
+   * precedent S8).
+   */
+  readonly runs: RunRegistry;
+  readonly deliveries: DeliveryStore;
 
   /**
    * The in-process entry to everything `AuthContext` gates (D15's library-first path).
@@ -820,4 +1355,18 @@ export interface DaemonDeps {
    * `worker.ts` and `registry.ts` zero further edits.
    */
   readonly leaseFactory?: (owner: ClientRef, workerId: WorkerId) => Lease;
+
+  // ── M2's five seams (§5.8.8). ABSENT means M1, for every one of them. ──────
+
+  /** M2-A. Absent ⇒ `baselineInteractions(responder, clock)` — byte-for-byte M1. */
+  readonly interactions?: (o: InteractionDeps) => InteractionStrategy;
+  /** M2-A. Absent ⇒ no watchdog, which is M1. */
+  readonly watchdog?: (o: WatchdogDeps) => Watchdog;
+  /** M2-B. Absent ⇒ `createBaselineResponder`'s constant verdict — M1 unchanged. */
+  readonly policy?: (sel: PolicySelection | null, ceiling: PolicyCeiling | null) => PolicyEngine;
+  /** M2-B, D8. Absent ⇒ `TurnResult.patch` stays null, which is M1 (ruling M1-R11). */
+  readonly diff?: DiffProvider;
+  /** M2-B, D9. Absent ⇒ `POST /v1/runs` answers `400 unknown route` (the M1 Land precedent S8). */
+  readonly webhooks?: WebhookDispatcher;
+  readonly runs?: RunRegistry;
 }

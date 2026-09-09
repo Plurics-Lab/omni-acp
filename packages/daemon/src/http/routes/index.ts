@@ -3,11 +3,15 @@ import type { Context, Hono } from "hono";
 import type { Daemon } from "../../types.js";
 import { authMiddleware, authOf } from "../auth-middleware.js";
 import { registerAgentRoutes } from "./agents.js";
+import { registerConfigRoutes } from "./config.js";
+import { registerInteractionRoutes } from "./interactions.js";
 import { registerLeaseRoutes } from "./lease.js";
+import { registerRunRoutes } from "./runs.js";
+import { registerWebhookRoutes } from "./webhooks.js";
 import { registerWorkerRoutes } from "./workers.js";
 
 /**
- * Registers H1-H21 of CONTRACTS.md §2.1, in four modules.
+ * Registers H1-H26 of CONTRACTS.md §2.1, in eight modules.
  *
  * Every route is exactly three moves: parse with zod, call ONE daemon method, serialize. That is
  * literally satisfiable because `WorkerRegistry` carries the result-returning façade
@@ -40,6 +44,13 @@ export function registerRoutes(app: Hono, daemon: Daemon): Hono {
   registerAgentRoutes(app, daemon);
   registerWorkerRoutes(app, daemon);
   registerLeaseRoutes(app, daemon);
+  // M2 (H22-H26). Each feature adds its OWN module beside `workers.ts`, which is M1's routes
+  // split reused unchanged: this index and `workers.ts` stay Land-frozen, so five work packages
+  // add five routes without meeting in one file.
+  registerInteractionRoutes(app, daemon);
+  registerConfigRoutes(app, daemon);
+  registerRunRoutes(app, daemon);
+  registerWebhookRoutes(app, daemon);
 
   return app;
 }

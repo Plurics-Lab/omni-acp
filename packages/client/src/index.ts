@@ -13,6 +13,9 @@ export type { LocalOptions } from "./local.js";
 export type { Server, CreateAgentOptions } from "./server.js";
 export type { Worker, PromptInput, PromptOptions, StreamEvent, WorkerEventMap } from "./worker.js";
 export type { WorkerLease } from "./lease.js";
+// ── M2 (CONTRACTS.md §5.8.10) ───────────────────────────────────────────────
+export type { InteractionRequestHandle } from "./interactions.js";
+export type { RunsChannel } from "./runs.js";
 
 export { OmniError } from "@omni-acp/protocol";
 export type {
@@ -31,4 +34,11 @@ export type {
   ProbeSummary,
   ResumeReport,
   RuntimeDescriptor,
+  // ── M2 (CONTRACTS.md §5.8.10) ─────────────────────────────────────────────
+  ConfigOptionView,
+  DeliveryRecord,
+  ElicitationField,
+  InteractionSnapshot,
+  PolicySnapshot,
+  RunSnapshot,
 } from "@omni-acp/protocol";

@@ -97,3 +97,87 @@ export { fingerprintOf } from "./process/fingerprint.js";
 // ── lease (M1-WP-D) ─────────────────────────────────────────────────────────
 export { alwaysGrantedLease } from "./lease/always-granted.js";
 export { createLease } from "./lease/lease.js";
+
+// ── the M2 contracts this package implements (§5.8.8) ───────────────────────
+export type {
+  DiffProvider,
+  EnvResolution,
+  InteractionAnswer,
+  InteractionContext,
+  InteractionDeps,
+  InteractionOutcome,
+  InteractionRequest,
+  InteractionResolution,
+  InteractionStrategy,
+  MappedElicitationRequest,
+  McpResolution,
+  OptionChoice,
+  PatchHandle,
+  PatchResult,
+  PolicyEngine,
+  PolicySubject,
+  PolicyVerdict,
+  Resolver,
+  RunRegistry,
+  RunRow,
+  RunStore,
+  DeliveryStore,
+  Watchdog,
+  WatchdogDeps,
+  WatchdogSignal,
+  WatchdogState,
+  WatchdogVerdict,
+  WebhookDispatcher,
+  WebhookPayload,
+} from "@omni-acp/protocol";
+
+// ── interactions: park / deny / fail, elicitation (M2-A-WP-I) ───────────────
+export { createInteractionStrategy } from "./worker/interaction/strategy.js";
+export { baselineInteractions } from "./worker/interaction/baseline.js";
+export { createParkTimer } from "./worker/interaction/park.js";
+export { clientCapabilitiesFor } from "./worker/interaction/capability.js";
+export {
+  createPendingInteractions,
+  type PendingInteractions,
+} from "./worker/interaction/registry.js";
+export { buildElicitationContent, mapElicitation } from "./normalizer/map/elicitation.js";
+
+// ── idle watchdog, dual budget (M2-A-WP-W) ─────────────────────────────────
+export { initialWatchdogState, watchdogStep } from "./worker/watchdog-state.js";
+export { createWatchdog } from "./worker/watchdog.js";
+
+// ── session/set_config_option (M2-A-WP-C) ──────────────────────────────────
+export { setConfigOption, viewConfigOptions } from "./worker/config-options.js";
+
+// ── policy rule engine (M2-B-WP-P) ─────────────────────────────────────────
+export { createPolicyEngine } from "./policy/engine.js";
+export { matchRule } from "./policy/match.js";
+export { compileGlob, globHead } from "./policy/glob.js";
+export { toPolicySubject } from "./policy/subject.js";
+export { assertWithinCeiling, clampVerdict } from "./policy/ceiling.js";
+export { BUILTIN_POLICIES, resolvePolicySelection } from "./policy/presets.js";
+
+// ── mcp presets, per-worker env, prompt containment (M2-B-WP-S) ────────────
+export { resolveMcpPresets } from "./mcp/presets.js";
+export { filterMcpCapabilities } from "./mcp/capabilities.js";
+export { resolveWorkerEnv } from "./worker/env.js";
+export { assertPromptContent } from "./worker/prompt-content.js";
+
+// ── runs, webhooks, persistence v2 (M2-B-WP-R) ─────────────────────────────
+export { createRunRegistry, type RunRegistryDeps } from "./run/registry.js";
+export { recoverRuns } from "./run/recovery.js";
+export {
+  createWebhookDispatcher,
+  recoverDeliveries,
+  type WebhookDispatcherDeps,
+} from "./webhook/dispatcher.js";
+export { planNextAttempt } from "./webhook/ladder.js";
+export { signDelivery } from "./webhook/sign.js";
+export { assertWebhookUrl } from "./webhook/guard.js";
+export { createRunStore } from "./persist/run-store.js";
+export { createDeliveryStore } from "./persist/delivery-store.js";
+
+// ── git diff provider (M2-WP-J, D8) ────────────────────────────────────────
+export { createGitDiffProvider } from "./diff/git-provider.js";
+export { withTempIndex } from "./diff/temp-index.js";
+export { classifyWorktree } from "./diff/worktrees.js";
