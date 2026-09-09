@@ -21,6 +21,17 @@ import { join } from "node:path";
  * Owned by M2-WP-J.
  */
 
+/**
+ * Make an EXISTING directory a repository.
+ *
+ * Exported because a compat case cannot use `tempRepo()`: a worker's `cwd` is ACL-checked against
+ * the token's `cwdRoots`, so the repository has to live INSIDE the harness workspace rather than
+ * in a temp directory of its own.
+ */
+export async function initGitRepoAt(dir: string): Promise<void> {
+  await writeGitSkeleton(dir);
+}
+
 /** The four entries `git rev-parse --show-toplevel` needs to call a directory a repository. */
 async function writeGitSkeleton(dir: string): Promise<void> {
   const dot = join(dir, ".git");

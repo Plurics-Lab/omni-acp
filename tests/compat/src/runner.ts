@@ -204,7 +204,15 @@ export function runCompatSuite(
         const live = harness;
         return {
           agentId: agent.id,
-          serverUrl: live.url,
+          /**
+           * A GETTER, because `withDaemonConfig` restarts the daemon and `listen.port` is 0: the
+           * new socket is a NEW port, and a case that captured the url before its own overlay
+           * would `fetch` a closed one. Read fresh, this is always the daemon that is running
+           * (M2-WP-J; the first case to reconfigure and then fetch found it).
+           */
+          get serverUrl(): string {
+            return live.url;
+          },
           token: live.tokenA,
           cwd: live.workspace,
           harness: live,

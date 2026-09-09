@@ -6,7 +6,6 @@ import {
   type CreateWorkerRequest,
   type DaemonId,
   type DaemonInfo,
-  type PolicySelection,
   type ProbeRequestBody,
   type ProbeResponse,
   type WhoAmIResponse,
@@ -35,8 +34,12 @@ export interface CreateAgentOptions {
    *
    * Merged preset ⊕ inline, then checked against the token's `policyCeiling` — exceeding it is
    * `403 policy_exceeds_ceiling` at CREATE, before a process exists (§20.5).
+   *
+   * Typed off `CreateWorkerRequest`, which is the `z.input` shape (§5.8.7): a CLIENT WRITES this,
+   * and on the output type every `match` field the schema defaults would read as required — so a
+   * caller would have to spell `subject` and `method` on a rule that only cares about `kind`.
    */
-  readonly policy?: PolicySelection;
+  readonly policy?: CreateWorkerRequest["policy"];
   /** Per-worker environment. A blacklisted key is REJECTED by name, never dropped (§23.3). */
   readonly env?: Readonly<Record<string, string>>;
   /** Per-worker override of the daemon-wide idle watchdog, field by field (§21). */

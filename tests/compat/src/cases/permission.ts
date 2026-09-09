@@ -93,17 +93,26 @@ export function permissionCases(): readonly CompatCase[] {
        * §27.2's `permission-allow` row: allow the edit, assert the file exists AND that
        * `decision:"allow"` names an id drawn from `offered`.
        *
-       * It `requires: ["policy"]` on purpose, and no agent declares that today. The reason is
-       * recorded rather than worked around: creating a worker under a NAMED policy needs
-       * `CreateAgentOptions.policy` on the SDK (`packages/client/src/server.ts`, M2-WP-J's), and
-       * the daemon's `AuthContext.assertPolicy` is still the Land stub. Both are one-liners at
-       * the join, and until they land this case is a printed `capability` skip for every agent
-       * rather than a silent pass — §18.3's rule doing exactly its job.
+       * It `requires: ["policy"]`, and the worker is created under an INLINE one — which is what
+       * makes the case mean anything. The daemon's default preset is `deny-all`, so a worker
+       * created with no policy would deny this write and the case would be asserting the
+       * `permission-deny` path under a different name. The rules below are the narrowest thing
+       * that can pass: edits are allowed, everything else falls to `deny`, and D4 rules 1-6 still
+       * pick the option — the engine decides WHAT, never WHICH `optionId` (§20.1).
+       *
+       * `CreateAgentOptions.policy` and `AuthContext.assertPolicy` both landed with M2-WP-J's
+       * join, which is what turned this from a printed `capability` skip into a running case.
        */
       id: "permission-allow",
       requires: ["permission", "policy"],
       async run(ctx) {
-        const worker = await ctx.harness.A.createAgent(ctx.agentId, { cwd: ctx.cwd });
+        const worker = await ctx.harness.A.createAgent(ctx.agentId, {
+          cwd: ctx.cwd,
+          policy: {
+            default: "deny",
+            rules: [{ id: "edits", match: { kind: ["edit"] }, action: "allow" }],
+          },
+        });
         try {
           const result = await worker.prompt(ctx.prompts.write);
           assert(result.stopReason === "end_turn", `stopReason is ${String(result.stopReason)}`);

@@ -69,14 +69,24 @@ export function watchdogCases(): readonly CompatCase[] {
         await ctx.withDaemonConfig(
           withWatchdog({ silentMs: 300_000, toolMs: 8_000, cancelTimeoutMs: 60_000 }),
         );
-        const worker = await ctx.worker();
+        // A DEDICATED worker, created AFTER the overlay (M2-WP-J). `ctx.worker()` is the shared
+        // one, and `withDaemonConfig` restarts the daemon — which closes it. Re-attaching would
+        // hand this case a CLOSED worker whose budgets are the ones it was created under, so the
+        // assertion below would be about the previous configuration or about nothing at all.
+        const worker = await ctx.harness.A.createAgent(ctx.agentId, { cwd: ctx.cwd });
         assertWired(worker.snapshot, { toolMs: 8_000, silentMs: 300_000 });
 
         const started = Date.now();
-        const result = await worker.prompt(
-          "Run a shell command that sleeps for 30 seconds and then prints WOKE. " +
-            "Use the terminal. Do not do anything else.",
-        );
+        const result = await worker
+          .prompt(
+            "Run a shell command that sleeps for 30 seconds and then prints WOKE. " +
+              "Use the terminal. Do not do anything else.",
+          )
+          .finally(() => {
+            // The dedicated worker and the overlay are BOTH this case's to give back: a leaked
+            // 8-second tool budget would cancel the next case's turn.
+            void worker.close().catch(() => {});
+          });
         const elapsed = Date.now() - started;
 
         // The aggregate SETTLED. That is the half of ruling M2-R8 a hang would violate, and it is
@@ -109,6 +119,7 @@ export function watchdogCases(): readonly CompatCase[] {
           result.verdict === "partial" || result.verdict === "failed",
           `verdict is ${result.verdict}: a turn holding a stranded call is not ok`,
         );
+        await ctx.withDaemonConfig(null);
       },
     },
 
@@ -125,7 +136,8 @@ export function watchdogCases(): readonly CompatCase[] {
         await ctx.withDaemonConfig(
           withWatchdog({ silentMs: 3_000, toolMs: 300_000, cancelTimeoutMs: 60_000 }),
         );
-        const worker = await ctx.worker();
+        // Dedicated, for the reason `watchdog-cancel` above states.
+        const worker = await ctx.harness.A.createAgent(ctx.agentId, { cwd: ctx.cwd });
         assertWired(worker.snapshot, { silentMs: 3_000 });
 
         const result = await worker.prompt(ctx.prompts.plain);
@@ -143,6 +155,8 @@ export function watchdogCases(): readonly CompatCase[] {
         // And the worker is still usable: nothing escalated into a close.
         const state = worker.snapshot.state;
         assert(state !== "closed", `the worker is ${state} after a turn that was never stalled`);
+        await worker.close().catch(() => {});
+        await ctx.withDaemonConfig(null);
       },
     },
   ];

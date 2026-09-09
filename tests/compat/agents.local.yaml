@@ -43,8 +43,7 @@ agents:
     # The last four are daemon capabilities rather than agent ones, and they are listed per agent
     # because that is where `requires` is answered; an agent that could not exercise one (a
     # fixture with no tools, say) simply does not list it.
-    provides:
-      [tools, permission, cancel, elicitation, configOptions, policy, watchdog, patch, runs]
+    provides: [tools, permission, cancel, elicitation, configOptions, policy, watchdog, patch, runs]
     # Observed on this machine, 2026-09-04: initialize ~7 s cold / ~1.5 s warm, `loadSession: true`,
     # sessionCapabilities list/resume/close/delete/fork.
     budgets:

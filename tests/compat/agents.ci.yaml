@@ -27,7 +27,14 @@ agents:
     # The tier-3 acceptance fixture: real process, real ndJSON. Its turn makes two tool calls and
     # asks for permission on the second, which is what makes it the only hermetic agent that can
     # satisfy `permission-deny`.
-    provides: [tools, permission, cancel]
+    #
+    # `watchdog` and `runs` are DAEMON capabilities rather than agent ones, and M2-WP-J wired both
+    # into `createDaemon`: any agent that completes a turn can now exercise the idle watchdog's
+    # quiet window and the Run API. They are declared per agent because that is where `requires`
+    # is answered. `patch` is NOT declared: the example agent's scripted turn denies its own write
+    # (see the `plain-turn` skip below), so there is nothing on disk for git to diff and the case
+    # would be asserting an empty patch.
+    provides: [tools, permission, cancel, watchdog, runs]
     # Observed on this machine, 2026-09-04, against @agentclientprotocol/sdk 1.4.0:
     # `initialize` answers `agentCapabilities: {loadSession: false}`. M1-PLAN §2 (WP-F 6) reads
     # "the SDK example agent (`loadSession: true`)" — that is not true of the pinned SDK, and the
@@ -44,6 +51,14 @@ agents:
           case: tool-turn,
           reason: "the example agent runs the same scripted turn for every prompt, so its `read` turn is the write turn `permission-deny` already asserts",
         }
+      - {
+          case: watchdog-cancel,
+          reason: "its scripted turn always COMPLETES, so no tool call is ever left open for the tool budget to fire on; `fixture-stall-in-tool` is the hermetic agent for that",
+        }
+      - {
+          case: watchdog-late-update,
+          reason: "its denied write leaves a tool call non-terminal, so every turn strands one — this case's subject is a turn that strands none",
+        }
 
   # The turn-completing fixtures. `crash` and `orphan` are deliberately absent: neither completes
   # a turn, so neither can satisfy a case list whose first assertion is that a turn ends.
@@ -51,17 +66,17 @@ agents:
     source: fixture
     fixture: echo
     enabled: true
-    provides: [cancel]
+    provides: [cancel, watchdog, runs]
   - id: fixture-chatty
     source: fixture
     fixture: chatty
     enabled: true
-    provides: [cancel]
+    provides: [cancel, watchdog, runs]
   - id: fixture-noisy
     source: fixture
     fixture: noisy
     enabled: true
-    provides: [cancel]
+    provides: [cancel, watchdog, runs]
 
   # `slow` is in the eight because it is one of the eight non-crashing fixtures, NOT because it
   # completes a turn — it never answers `session/prompt` and it ignores `session/cancel`, which is
@@ -105,17 +120,17 @@ agents:
     source: fixture
     fixture: plan
     enabled: true
-    provides: [cancel]
+    provides: [cancel, watchdog, runs]
   - id: fixture-thought
     source: fixture
     fixture: thought
     enabled: true
-    provides: [cancel]
+    provides: [cancel, watchdog, runs]
   - id: fixture-mode
     source: fixture
     fixture: mode
     enabled: true
-    provides: [cancel]
+    provides: [cancel, watchdog, runs]
 
   # The one hermetic agent that can be WOKEN. It advertises `loadSession` and
   # `sessionCapabilities.resume` and implements both over a session persisted outside the cwd, so
@@ -124,7 +139,7 @@ agents:
     source: fixture
     fixture: hybrid
     enabled: true
-    provides: [tools, cancel]
+    provides: [tools, cancel, watchdog, runs]
     # `resumeRequiresSameCwd` is what turns rule 4's verdict from `unclassified` into
     # `cwd_mismatch` (§15.4). It is a config overlay because `hybrid` has no builtin descriptor —
     # which is exactly the path an operator adding a new runtime takes.
@@ -134,4 +149,71 @@ agents:
       - {
           case: plain-turn,
           reason: "hybrid's turn FAILS a tool call on its own merits, so `verdict` is `partial` by construction — that failure is the fixture's whole subject (F24, corpus gap)",
+        }
+      - {
+          case: watchdog-cancel,
+          reason: "hybrid's tool call terminalizes on its own, so the tool budget never fires; `fixture-stall-in-tool` is the hermetic agent that stalls",
+        }
+
+  # ── M2's fixture (M2-PLAN §4: "now including the four `elicit-*` and two `stall-*`") ─────────
+  #
+  # ONE of the six, and the omission is a finding rather than an oversight. `stall-in-tool` makes
+  # an M2 case runnable with no login: it opens a tool call and never terminalizes it, which is
+  # exactly what `watchdog-cancel` needs.
+  #
+  # The four `elicit-*` fixtures are NOT here, because neither elicitation case can be satisfied
+  # by a fixture: `elicitation-gated`'s control asserts that an agent which was told nothing about
+  # `elicitation` does not send one (F28's behaviour on a REAL agent), and the fixtures send one
+  # unconditionally — they exist to exercise OUR mapper, not to model an agent's gate. Listing one
+  # here bought two `config` skips and a five-minute timeout. They are driven directly instead, by
+  # `interaction-park.itest.ts`, `interaction-timeout.itest.ts` and `elicitation-gate.itest.ts`,
+  # where a fixture is a deterministic input rather than a runtime under test.
+  - id: fixture-stall-in-tool
+    source: fixture
+    fixture: stall-in-tool
+    enabled: true
+    # It opens ONE `tool_call{status:"pending"}` and never speaks again (F36's shape), so the tool
+    # budget is the only thing that can end its turn. Every case whose first move is "run a turn
+    # and wait for it" is therefore a `config` skip with that one reason, exactly as `slow` is.
+    provides: [tools, cancel, watchdog]
+    skip:
+      - {
+          case: plain-turn,
+          reason: "stall-in-tool never answers session/prompt; it exists for the tool budget and F36's stranded call",
+        }
+      - {
+          case: tool-turn,
+          reason: "its tool call NEVER terminalizes by design, so `changes` never matches the workspace",
+        }
+      - {
+          case: tool-merge,
+          reason: "its sparse updates never carry a terminal status, so there is no merged final call to compare",
+        }
+      - {
+          case: stream-resume,
+          reason: "the turn only ends when the watchdog cancels it, which is a different case's subject",
+        }
+      - {
+          case: cancel-late-update,
+          reason: "it ignores session/cancel by design, so no update can be ordered against one",
+        }
+      - {
+          case: lease,
+          reason: "the holder's turn never completes for an observer to watch it finish",
+        }
+      - {
+          case: restart-survives,
+          reason: "its log holds one unfinished turn, so there is no completed turn to compare across a restart",
+        }
+      - {
+          case: idempotent-map,
+          reason: "no turn ever settles, so there is no completed fold to run twice",
+        }
+      - {
+          case: watchdog-late-update,
+          reason: "this fixture stalls on purpose; the quiet window's NEGATIVE case needs an agent that finishes a turn",
+        }
+      - {
+          case: run-webhook,
+          reason: "a run over an agent whose turn never ends would only ever report the watchdog's cancel",
         }

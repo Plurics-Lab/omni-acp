@@ -212,28 +212,45 @@ describe("compat config — the shapes that keep a skip arguable", () => {
     }
   });
 
-  it("claude-acp's `unverified` MIRRORS the builtin descriptor's, and never a shorter list", async () => {
-    // §17.2 is the single source of truth (review R8). The YAML restates it so an operator
-    // reading only that file sees what will not be asserted — restating is allowed, SHORTENING
-    // is how a gap becomes a silent pass.
-    const local = loadCompatConfig("agents.local.yaml");
-    const agent = local.agents.find((a) => a.id === "claude-acp");
-    expect(agent).toBeDefined();
+  /**
+   * §17.2 is the single source of truth (review R8). The YAML restates it so an operator reading
+   * only that file sees what will not be asserted — restating is allowed, SHORTENING is how a gap
+   * becomes a silent pass.
+   *
+   * Read from the SOURCE by name rather than imported: `tests/compat` depends on
+   * {client, daemon, protocol, testkit} and deliberately not on `@omni-acp/core` (§3.1), so each
+   * list is scraped from the one exported constant §17.2 calls the single source of truth. The
+   * scrape strips comments first, because the constants carry one per row and a reader adding
+   * another must not silently empty this assertion (M2-WP-J).
+   */
+  function scrapeUnverified(source: string, name: string): string[] {
+    const start = source.indexOf(`export const ${name} = [`);
+    expect(start, `known.ts exports no ${name}`).toBeGreaterThanOrEqual(0);
+    const end = source.indexOf("] as const;", start);
+    expect(end, `${name} is not terminated by "] as const;"`).toBeGreaterThan(start);
+    const block = source
+      .slice(start, end)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+    return [...block.matchAll(/"([^"]+)"/g)].map((m) => m[1] ?? "");
+  }
 
-    // Read from the SOURCE by name rather than imported: `tests/compat` depends on
-    // {client, daemon, protocol, testkit} and deliberately not on `@omni-acp/core` (§3.1), so the
-    // list is scraped from the one exported constant that §17.2 calls the single source of truth.
-    // `unverified:` alone would match the DEFAULT profile's empty list two hundred lines earlier,
-    // which is how this assertion would go quietly vacuous.
+  it("each real agent's `unverified` MIRRORS its builtin descriptor's, and never a shorter list", async () => {
+    const local = loadCompatConfig("agents.local.yaml");
     const known = await readFile(join(REPO_ROOT, "packages/core/src/runtime/known.ts"), "utf8");
-    const block = /CLAUDE_ACP_UNVERIFIED\s*=\s*\[([^\]]*)\]/.exec(known);
-    expect(block, "known.ts exports no CLAUDE_ACP_UNVERIFIED").not.toBeNull();
-    const descriptor = (block?.[1] ?? "")
-      .split(",")
-      .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-      .filter((s) => s !== "");
-    expect(descriptor.length).toBeGreaterThan(0);
-    expect([...(agent?.unverified ?? [])].sort()).toEqual([...descriptor].sort());
+
+    for (const [id, constant] of [
+      ["claude-acp", "CLAUDE_ACP_UNVERIFIED"],
+      // M2 ships a second builtin, and codex's list is the one that carries `permission`: eight
+      // recorded processes, no `session/request_permission` in any of them.
+      ["codex-acp", "CODEX_ACP_UNVERIFIED"],
+    ] as const) {
+      const agent = local.agents.find((a) => a.id === id);
+      expect(agent, `agents.local.yaml has no ${id}`).toBeDefined();
+      const descriptor = scrapeUnverified(known, constant);
+      expect(descriptor.length).toBeGreaterThan(0);
+      expect([...(agent?.unverified ?? [])].sort(), `${id}`).toEqual([...descriptor].sort());
+    }
   });
 });
 
