@@ -9,11 +9,13 @@
 > scaffold stub verbatim. Work packages (see `docs/M2-PLAN.md`) fill bodies in; they do not change
 > signatures. A signature change is a renegotiation of this document, not a commit.
 >
-> **Reading M0 vs M1 vs M2.** Shipped text is kept in place, because it shipped and its reasoning is still
-> the reason the code looks the way it does. Wherever a later milestone changes an earlier statement, the
-> earlier sentence carries a `~~strikethrough~~` or a **SUPERSEDED BY §n** banner and the new rule is
-> stated next to it — never by silently rewriting history. §12–§18 are M1-only. §19–§27 are new and are
-> M2-only. §11.4–§11.6 record the M1 rulings; §11.7–§11.9 record the M2 rulings.
+> **Reading M0 vs M1 vs M2 vs M3.** Shipped text is kept in place, because it shipped and its reasoning is
+> still the reason the code looks the way it does. Wherever a later milestone changes an earlier statement,
+> the earlier sentence carries a `~~strikethrough~~` or a **SUPERSEDED BY §n** banner and the new rule is
+> stated next to it — never by silently rewriting history. §12–§18 are M1-only. §19–§27 are M2-only.
+> **§28 is M3-WP1** (credentials, home isolation, `setCredential`, `restart`) and is additive: with nothing
+> stored and `credential` omitted, every M2 behaviour holds byte for byte, which is what lets M2's whole
+> suite run against it unedited. §11.4–§11.6 record the M1 rulings; §11.7–§11.9 record the M2 rulings.
 >
 > **M2 is two slices.** **M2-A** is the interaction lifecycle, the idle watchdog and the config route —
 > §19, §21, §22. **M2-B** is the policy engine, MCP presets and env, the Run API and webhooks, the diff
@@ -7196,3 +7198,311 @@ Each is demonstrated **failing on a planted violation**, per §10.2's rule.
 | `http-has-no-logic` **(existing, recursive)** | covers the four new route modules for free |
 | `no-direct-spawn` **(existing, extended)** | now also proves `diff/git-provider.ts` reaches git only through the injected `RunUtility` |
 | `sse-is-unchanged` **(existing)** | `sse.ts`'s sha256 is unchanged by M2 — the Run API proxies the worker log rather than adding a stream writer |
+
+---
+
+## 28. Credentials, home isolation, `setCredential` and `restart` (M3-WP1)
+
+> Binding, 2026-09-12. The design document is `docs/M3-WP1-CREDENTIALS.md`; §28 is the CODE-LEVEL
+> contract that follows from it, in this document's own terms. Its §Real-agent record holds the
+> measurements every row below cites, taken against claude-acp 0.73.0 and codex-acp 1.8.0 on the
+> machine this repository is developed on.
+
+**Backward compatibility is the frame, not a footnote.** With nothing stored and `credential`
+omitted, `credentials.allowInherit` defaults `true` and a worker composes exactly the environment
+it composed in M2 — `WorkerSnapshot.credential` is absent, no home is built, `toSpawnSpec` adds
+nothing. The whole of M2's suite runs against this unedited, which is what makes the section
+additive rather than a renegotiation.
+
+### 28.1 The descriptor is still the only thing that branches (§17.1, extended)
+
+`RuntimeDescriptor.credentials` (`RuntimeCredentials`, optional, `null` for a runtime we have not
+measured) carries six fields, and **every one of them is an observation**:
+
+| field | claude-acp 0.73.0 | codex-acp 1.8.0 | how it was established |
+| ----- | ----------------- | --------------- | ---------------------- |
+| `homeEnv` | `CLAUDE_CONFIG_DIR` | `CODEX_HOME` | E1 / E2: the variable alone, with the credential file inside the directory, is sufficient for a complete turn |
+| `files` | `[".credentials.json"]` | `["auth.json"]` | E1 / E2, and it doubles as the ALLOWLIST a `PUT` is checked against |
+| `tokenEnv` | `CLAUDE_CODE_OAUTH_TOKEN` | *(absent)* | E5. `codex login --with-access-token` takes the token on stdin and there is no env spelling for a subscription token, so a `token` credential for codex is a `400` naming the gap |
+| `apiKeyEnv` | `ANTHROPIC_API_KEY` | `CODEX_API_KEY` | E5 |
+| `reload` | **`"file"`** | **`"restart"`** | MEASURED, with a control. §Real-agent record R1 |
+| `loginRequiredSignal` | `"prompt_-32000"` | `"session_new"` | MEASURED three ways per agent. R2, which **refutes E4's** `authMethods` reading |
+
+`credentials` is **builtin-only**: `RuntimeOverlay` has no spelling for it, and `resolveDescriptor`
+carries `base.credentials ?? null` through untouched. The reason is that every field is a
+measurement — an operator who needs a different contract is describing a different runtime, which
+is a builtin entry rather than a knob, and a knob here could silently point a real agent's home at
+a variable it does not read, which fails **open**: the agent would fall back to the daemon's login.
+
+`ProbeSummary.authMethods` records `initialize`'s array verbatim. It is the raw observation and
+never a verdict — R2 is why.
+
+### 28.2 The store: ownership is the PATH
+
+`<dataDir>/credentials/<tokenId>/<agentId>/<name>/`, directories `0700`, files `0600`, with
+`meta.json` beside a `files/` subdirectory (so a credential whose own file is called `meta.json`
+cannot overwrite the store's bookkeeping). Every segment goes through `probe-cache.ts`'s rule
+verbatim — an ordinary id keeps its spelling, anything else is hex-encoded — so no id from config
+and no name from the wire can escape the tree.
+
+Three rules, each structural rather than remembered:
+
+1. **Ownership is the path.** A read for token `b` never constructs a path into token `a`'s tree,
+   so it cannot leak by forgetting a comparison. A name this token has not stored is
+   `422 credential_required`, and it is the SAME sentence a name nobody has ever stored produces.
+2. **Secrets only go up.** No method on `CredentialStore` returns one. `read` exists for the
+   daemon's own composition step and is not on the HTTP surface. `fingerprint` is the first 12 hex
+   characters of a sha256 over the canonical content — 48 bits, enough to say "this is a different
+   credential than before" and useless for authenticating anything.
+3. **An admin may `list` every token's credentials and read none of their contents.** D13 gives an
+   admin the machine's worker fleet; it does not give them other people's logins.
+
+`expiresAt` is read from the credential's own body by a **generic** rule (a key literally called
+`expiresAt` at depth 1 or 2, accepting an epoch-ms number or a parseable string) rather than from a
+descriptor pointer. claude's `claudeAiOauth.expiresAt` is found this way; codex's `auth.json`
+carries no expiry at all and the answer is honestly `null`. It feeds `login.state: "expired"` and
+is never a gate — the agent refreshes its own token.
+
+`PUT` on an existing name is an **in-place update** and returns `workersAffected` +
+`restartRequired`. The second field exists because the first cannot be acted on: every live
+worker's home already LINKS at the file that just changed, so a `reload:"file"` runtime picks the
+new credential up on its next request and a `reload:"restart"` one does not. `restartRequired`
+names exactly the second group — `[]` for claude and one worker id for codex, both measured (R3
+row 7).
+
+`DELETE` with `inUseBy > 0` is `409 worker_busy`: those workers' homes point AT the file, and
+removing it is an authentication failure on their next request that nothing in the log explains.
+
+A `PUT` is refused `403 insecure_transport` unless the connection is loopback or TLS. It is the
+one request body in the repository that carries a plaintext secret; TLS is a later work package,
+so the test today is `listen.host`, with `credentials.allowInsecureTransport` as the escape hatch
+for TLS terminating in front of the daemon. `listen: null` is in-process only (D15) and passes.
+
+### 28.3 Home isolation, and why the credential is a LINK
+
+Per worker, `<dataDir>/homes/<workerId>`, `0700`, and **reused across every hibernate, wake and
+restart** — E7: the agent's own session files live in it (claude writes `projects/`, `sessions/`,
+`.claude.json`, `backups/`; codex writes `sessions/`, `thread_history_1.sqlite` and two dozen more,
+both measured in R3 row 1).
+
+The credential file inside it is a **symlink** to the store's canonical file, with a
+symlink → hardlink → copy ladder for Windows and the chosen mode REPORTED (a copy does not carry
+the agent's own refresh back, and an operator has to be able to see that this daemon is running in
+the degraded shape — §6.6's honesty rule applied to something other than a process).
+
+**E3 is the fact that decides it**: the agent refreshes its own token, so the credential file is
+not read-only data. Two workers sharing one home would race on one file; two workers with
+independent COPIES would each refresh their own and diverge from the source within hours. A link
+per home gives both properties — every worker reads the newest token, and whichever one refreshes
+it writes through to the file the others read. A relink is a `rename` over the existing path, never
+unlink-then-create: the window in the second is a live agent finding no credential where one was a
+millisecond earlier.
+
+`CreateWorkerRequest.credential` and `.home`:
+
+| value | meaning |
+| ----- | ------- |
+| omitted | this token's `default` for this agent; `inherit` when it has none (M2, gated by `credentials.allowInherit`) |
+| a name | that stored credential. Not this token's but ANOTHER token's ⇒ `403 credential_forbidden` |
+| `"inherit"` | the explicit spelling of the fallback |
+| `"none"` | an EMPTY home — and therefore **`422 credential_required` at CREATE** for a runtime that declares a credential contract (§28.4). The value stays meaningful through `setCredential`, where it revokes a live worker's credential |
+| `home: "isolated"` (default) | the per-worker home above |
+| `home: "shared"` | no per-worker home, the daemon's environment. With a `files` credential this is **refused** `bad_request`: a file credential can only reach the agent through its home, so the request asks for a credential to be used and for the only channel that could carry it to be absent. A `token`/`apiKey` credential is fine — it lands in a variable |
+
+**The cross-token `403` is a deliberate one-bit trade** (§凭据仓库's acceptance 6). A name lives
+inside its token's namespace, so a name this token has not stored is naturally a `422`; answering
+`403` for exactly the names another token owns reveals that those names exist somewhere. The spec
+asks for it and it is the right call — "that credential is not yours" and "that credential does not
+exist" are materially different things to debug when two people share a machine — and what leaks is
+one bit about a NAME, never its content and never its owner.
+
+**Six variables join `ENV_DENY_EXACT`**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_API_KEY`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`. They are the same
+CLASS as `HOME`, not a new one: DESIGN §8 puts credentials in the daemon's key store, and a client
+that could set `CLAUDE_CONFIG_DIR` would be pointing the agent at a home the daemon did not build —
+the whole isolation boundary in one variable. They are refused BY NAME (ruling M2-R12), and the
+credential layer sets them itself in `toSpawnSpec`, which is above the list and not subject to it.
+
+`toSpawnSpec` is still **the only producer of `SpawnSpec`** and gains two optional options, `home`
+and `credentialEnv`. The composition order is inherited env → `descriptor.env` → credential, and
+the last position is load-bearing twice: an operator who pinned `CLAUDE_CONFIG_DIR` in
+`agents[].env` pinned the SHARED home, and `home:"isolated"` is a per-worker request to override
+exactly that; and the daemon's own inherited `CLAUDE_CONFIG_DIR` — an operator who started the
+daemon from a shell where they had been using Claude Code — must not reach an isolated worker.
+
+### 28.4 Create-time validation, and the probe's `login`
+
+`422` at CREATE, before a slot is reserved and before anything spawns: `credential_required` for a
+missing credential and for `"none"`, `credential_expired` for an expired one. The reason is
+measured: a claude-acp worker with no credential handshakes FINE and fails on the first
+`session/prompt` (R2), and a codex-acp one fails at `session/new` — so waiting would turn something
+the daemon already knew into a 502 from the agent, one `maxWorkers` slot and a cold start later.
+Measured cost of the refusal: **9–10 ms, with `<dataDir>/homes` still empty** (R3 row 2).
+
+`LoginState` is computed **per token** and served on `AgentCatalogEntry.login`, which is why
+`GET /v1/agents` moved from `catalog.list()` to `Daemon.agents(auth)`: the probe is a shared cached
+fact about a binary, "am I logged in" is a fact about the caller's credential, and reading the
+store is I/O. One daemon call, so the route stays three moves (`m1-status-codes` asserts it).
+
+The LIGHT check is the file plus `expiresAt`, and it does **not** handshake — R2 is the whole
+reason: proving a login costs a process on one agent and a prompt on the other. `{deep:true}`
+spawns ONE throwaway process through `Supervisor.spawn` + `Catalog.toSpawnSpec` (never a second
+spawn site, F10), in a `mkdtemp` cwd it removes, with a throwaway home rather than any live
+worker's, answering no permission request, reclaiming the tree on every edge — §17.4's five rules,
+unchanged. `loginRequiredSignal` decides how far it goes: `"session_new"` stops at `session/new` and
+costs **zero tokens**.
+
+### 28.5 `worker.restart()` — M1's reclaim + wake, with exactly two exceptions
+
+`{reason?, force?, resume?=true, fresh?, credential?, timeoutMs?}` →
+`RestartResult{generation, pid, resume, sessionId, terminatedTurn, elapsedMs}`.
+
+State: `ready | requires_action | running → starting(reason:"restart") → ready`, `generation + 1`,
+and §15.1's table gains exactly that row. The two exceptions to the wake path:
+
+1. **The lease is KEPT.** A hibernate releases it (§15.2 step 3) because a holder cannot control a
+   worker with no process and a lease held across a 30-minute sleep silently becomes permanent. A
+   restart is a five-second gap the holder ASKED for; releasing it would hand the worker to
+   whichever peer polled first, mid-rotation.
+2. **The home is KEPT.** E7 again: a restart that rebuilt the home would resume into a session
+   directory with no history, which is the failure `resume` exists to prevent.
+
+Everything else is shared code: `#reclaimProcess`, `#openProcess`, `SessionStrategy.reopen` and
+`classifyResume`'s four states. Measured: **2.75 s** (claude) / **3.17 s** (codex), `outcome:
+"landed"` / `rule7` / `session/resume` on both, and the post-restart prompt answers a question
+about the pre-restart conversation (R3 row 4).
+
+| edge | answer |
+| ---- | ------ |
+| `running` without `force` | `409 worker_busy`, and **nothing has happened**: no envelope, no reclaimed process. A refusal that had already reclaimed is a half-applied operation wearing an error code |
+| `running` with `force` | the turn is terminated by `omni.worker_state{starting, reason:"restart"}` carrying the terminated `turnId` — **NOT** a synthesized `idle`. `reduceTurn` gains its third terminal and reports `stopReason: null`, `error.code: "restarted"`, `verdict: "failed"`; in-flight tool calls fall out as `strandedToolCalls` because the turn is terminal. Text the agent had already produced stays in the projection |
+| no resume spelling and no `fresh:true` | `422 not_resumable`, raised **before** the process is reclaimed — an agent that cannot resume must not lose a healthy session to a restart that then could not reopen it |
+| `fresh: true` | a NEW session through the same code `start()` uses; `resume: {outcome:"fresh"}` rather than a four-state verdict, because nothing was resumed |
+| the new process cannot resume | the worker is left **`hibernated` with its pointer**, NOT closed — §restart's one deliberate difference from §15.5. The worker was alive a moment ago and the operator still holds its lease; the next prompt gets to try the wake path and close it there. The pointer is kept because §15.1 invariant 1 requires a `hibernated` worker to have one |
+| `closed` | `410 worker_closed` |
+
+`restart` needs **no** credential layer: replacing a process is not a credential operation, which
+is why it works on a registry with none wired. `#restarting` is set synchronously before the first
+`await`, on `#hibernating`'s exact reasoning, and the whole thing is single-flight.
+
+`isTurnTerminal` in the SDK learns the same terminal, or a `stream()` would hang on a turn that is
+already over.
+
+### 28.6 `worker.setCredential(credential, {apply})`
+
+Lease-gated, legal in every state but `closed` (410). The LINK moves atomically whatever `apply`
+says; what `apply` decides is only whether a new PROCESS is started, and the descriptor's
+**measured** `reload` is what makes that honest:
+
+| `apply` | `reload:"file"` (claude, measured) | `reload:"restart"` (codex, measured) |
+| ------- | ---------------------------------- | ------------------------------------ |
+| `"auto"` (default), idle | `"immediate"` — 7 ms, no new process, `generation` unchanged | `"restarted"` — 3.15 s, `generation + 1` |
+| `"auto"`, mid-turn | `"immediate"` | `"on-next-start"`, `credentialStale: true`, and the promised restart fires on the next transition into `ready`. The turn the caller did not ask to interrupt is not interrupted |
+| `"restart"`, mid-turn | `409 worker_busy`, **before the link moves** | same |
+| `"defer"` | `"deferred"` | `"deferred"`, `credentialStale: true` |
+
+`WorkerSnapshot.credential` is `{name, method, fingerprint}` and `credentialStale` says whether
+the process is using it yet — which is what stops the fingerprint being a lie. `home` is on the
+snapshot because an operator debugging a resume needs to find the directory (E7).
+
+One `omni.credential{op, credential, method, fingerprint, applied, generation, previous}` envelope
+per call. It exists because **a credential swap is invisible in every other stream**: on a
+`reload:"file"` agent no process restarts and no state changes, so an operator reading the log
+would see a turn start answering as somebody else with nothing in between saying why (DESIGN §8's
+审计 row). Its zod arm is fully specified with no `z.unknown()` anywhere, and `fingerprint` /
+`previous` are `/^[0-9a-f]{12}$/`.
+
+### 28.7 The wire, the SDK and the CLI
+
+```
+GET    /v1/credentials
+PUT    /v1/credentials/{agent}/{name}         CredentialInput → CredentialPutResult
+GET    /v1/credentials/{agent}/{name}         → CredentialSummary
+DELETE /v1/credentials/{agent}/{name}         inUseBy>0 ⇒ 409
+POST   /v1/credentials/{agent}/{name}/check   {deep?, timeoutMs?} → LoginState
+PUT    /v1/workers/{wid}/credential           {credential, apply?} → CredentialApplied
+POST   /v1/workers/{wid}/restart              {reason?, force?, resume?, fresh?, credential?} → RestartResult
+```
+
+Seven routes in `http/routes/credentials.ts` — its own module beside `workers.ts`, which is M1's
+split reused a third time — each parse → ONE call → serialize, all covered by the recursive
+`http-has-no-logic` guard. `Daemon.credentials` is always present, and every verb answers
+`bad_request` naming M3-WP1 when no store is wired (the `dispatcher` precedent).
+
+SDK: `server.credentials.{list,get,put,remove,check}`, `createAgent({credential, home})`,
+`worker.setCredential()`, `worker.restart()`, and `server.agents()` carrying `login`.
+
+`OmniACP.localCredential(agent)` reads this machine's own `~/.claude/.credentials.json` /
+`~/.codex/auth.json` **on the client side**, from a table of two known runtimes, and hands back a
+`CredentialInput`. It is not on the daemon because a daemon that read that file on request would be
+a daemon that reads any file you can name, from a remote request, as whatever user it runs as —
+there is no safe version of that primitive. The corollary is stated rather than worked around: it
+only works when the SDK runs on the machine that holds the login, which is `OmniACP.local()` and a
+loopback daemon, the case it exists for.
+
+CLI: `omni-acp credentials import|put|list|get|rm|check`. Two rules that are about secrets rather
+than shape, and a CLI is the easiest place to get them wrong:
+
+- **a secret is never an argv.** `put` reads it from STDIN. There is no `--value` (an argument is in
+  the shell history and in `ps` output for every account on the machine) and no `--file <path>` (the
+  file-disclosure primitive, moved one layer out). `--file` takes a credential FILE NAME.
+- **nothing printed is a secret.** `list` / `get` / `check` render a 12-hex fingerprint, and there
+  is no `--show` because the daemon has no route that would answer it.
+
+### 28.8 Error codes
+
+Five added, `ERROR_STATUS` kept total (a `Record`, so a code without a status is a compile error):
+
+| code | status | why it is not an existing code |
+| ---- | ------ | ------------------------------ |
+| `credential_required` | 422 | `not_resumable` means the SESSION is gone; a worker that cannot start because nothing was stored is a different failure with a different fix, answered at CREATE |
+| `credential_expired` | 422 | the fix differs from the row above: "store a NEWER one", not "store one" |
+| `credential_forbidden` | 403 | `forbidden` covers "not your agent"; this is the one 403 whose message must not name the resource |
+| `insecure_transport` | 403 | the only refusal in the repository about the CONNECTION rather than the request |
+| `restarted` | 409 | a TURN error. It never leaves an HTTP body — it lives in `TurnResult.error.code` — and 409 is what it would map to, because a turn a restart cut short is `worker_busy`'s class of conflict |
+
+### 28.9 Config
+
+```yaml
+credentials:
+  allowInherit: true            # M2's behaviour, and the compatibility bar. A later WP flips it
+  allowInsecureTransport: false # a credential PUT needs loopback or TLS
+  homeRetentionDays: 1          # a CLOSED worker's home survives this long
+```
+
+`homeRetentionDays` is deliberately shorter than `eventLog.retentionDays: 7`: a home holds the
+agent's caches and can be large, and an operator who keeps a week of LOGS has not asked to keep a
+week of `node_modules`-sized agent state. The home sweep rides the EXISTING retention timer — two
+timers over the same rows is two answers to "is this worker retired".
+
+**The sweep's inputs are `keep`, `closedAtMs` and `orphans`, and a home in none of the three is
+LEFT ALONE.** That rule is a bug the real-agent run found (R4 item 1): a home is created before the
+agent is spawned and the worker only enters the registry when its handshake returns, so during a
+cold start there is a home with no row, indistinguishable by inspection from an orphan — and the
+first version deleted a live worker's credential link mid-create. `HomeManager.orphansAtBoot` takes
+the orphan set ONCE in `createDaemon`, between boot adoption and `start()`, which is the only moment
+at which no worker of this boot can be mid-create. A timing grace would have been a guess about a
+cold start that varies from 1.5 s to >90 s between these two agents. `keep` is the union of the LIVE
+fleet and the persisted rows, because under `eventLog.driver:"memory"` there are no rows at all.
+
+### 28.10 Tests and the new guards
+
+| | |
+| - | - |
+| `daemon/test/credentials/store.test.ts` | modes read off the FILESYSTEM, fingerprint stability, owner scoping (and that the refusal is the same sentence a never-stored name produces), the in-place update's two counters, expiry, the transport gate, the file-name allowlist, a hand-written half-written tree |
+| `daemon/test/credentials/home.test.ts` | the link asserted with `readlink` — a byte comparison passes just as happily for two copies, which is the bug E3 makes fatal — the relink-by-rename, `unlink` leaving session state alone, and the four sweep rules including the create window |
+| `daemon/test/credentials/env-composition.test.ts` | which variable lands per runtime, and that an isolated home beats both the descriptor's own and the daemon's inherited one |
+| `core/test/worker/restart.test.ts` | the state machine over `fakeSupervisor` ⊕ `resumableAgent` ⊕ `fakeClock`, and the forced restart asserted THROUGH `reduceTurn` over the real envelopes |
+| `tests/integration/src/credentials.itest.ts` | acceptance 1–7 over real processes and the real SDK, against `hybrid.mjs` under the agent id `claude-acp` so the contract under test is the shipped builtin's |
+| `tests/compat/src/cases/credentials.ts` | `restart-resumes`, `requires: ["resume"]` — the one claim only a real agent can settle |
+
+New guards, each demonstrated failing on a planted violation (§10.2):
+
+| guard | rule |
+| ----- | ---- |
+| `secret-never-leaks` | three planted secrets in three storage shapes, a whole create → prompt → swap → restart → close cycle over the real routes, then a grep of every response body, every log line WITH its fields, and every event envelope. It is a grep because that is the only form of the claim that cannot be out-argued: what it catches is the third path nobody thought about |
+| `cli-prints-no-secret` | every CLI renderer fed a credential-shaped body carrying a planted token prints a fingerprint instead, and `--value` / `--secret` are `unknown flag` |
+| `no-elicitation-schema-parse` **(extended)** | the exemption list gains `SetCredentialBody` and `RestartRequestBody` — the same OBJECT as `InteractionAnswerBody`, our own control-plane bodies, not a widening. Every exemption NAMES its schema and the planted-violation test is run against each of the three |
+| `http-has-no-logic` **(existing, recursive)** | covers `routes/credentials.ts` for free; its file list gains the row |
+| `env-deny-is-one-table` **(existing)** | still one module, now with six more entries |
+| `descriptor-is-the-only-branch` **(existing)** | the credential layer branches on `RuntimeCredentials` and on no agent id — the store, the home manager and the catalog composition all read the descriptor |

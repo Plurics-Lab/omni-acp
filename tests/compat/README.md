@@ -122,34 +122,50 @@ reason somebody actually wrote.
 
 ## The cases
 
-`tests/compat/src/cases.ts`, in the order §4 runs them. Each declares what it `requires`, and an
-agent that lacks a requirement **skips** the case with a printed source rather than failing it.
+`tests/compat/src/cases/`, in the order the registry composes them. Each declares what it
+`requires`, and an agent that lacks a requirement **skips** the case with a printed source rather
+than failing it.
 
-| case                  | requires     | asserts                                                                                                                                                                                                                  |
-| --------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `handshake`           | —            | initialize + `session/new`; `capabilities.raw` non-empty; `runtimeId` stable across two workers; `generation` 1; `persistence: durable`                                                                                  |
-| `plain-turn`          | —            | exactly one `state_update{running}` … one `{idle}`; non-empty text; `verdict: "ok"`; `GET /turns/{id}` deep-equals the `prompt()` aggregate                                                                              |
-| `tool-turn`           | `tools`      | a READ-ONLY prompt yields ≥1 tool call with a terminal final status, and `changes` matches the workspace                                                                                                                 |
-| `stream-resume`       | —            | the SSE dropped mid-turn and reconnected with `?since=`; the union's **envelope frames** equal an uninterrupted observer's and are gap-free. Control frames asserted separately                                          |
-| `cancel-late-update`  | `cancel`     | an update arriving after `session/cancel` is ordered **before** `idle`                                                                                                                                                   |
-| `tool-merge`          | `tools`      | a sparse `tool_call_update` never clears `kind` / `locations` / `title`                                                                                                                                                  |
-| `permission-deny`     | `permission` | only an **offered** `optionId` is ever sent; `deniedToolCalls` non-empty while `stopReason` is `end_turn`; the workspace is untouched                                                                                    |
-| `hibernate-wake`      | `resume`     | a small `idleTimeoutMs` forces `hibernated`; the recorded pid answers `waitGone`; the lease is released; the next prompt wakes with `resume.outcome: "landed"`; `seq` continues; replay is marked only inside the window |
-| `resume-cwd-mismatch` | `resume`     | resuming from a FOREIGN cwd is refused with a message that must **not** classify `rejected_permanent`                                                                                                                    |
-| `lease`               | —            | a second client's `prompt` is `423` naming the holder; the observer keeps streaming; `steal` bumps the epoch; the previous holder's next call is `423`                                                                   |
-| `restart-survives`    | —            | stop, restart on the same `dataDir`, `?since=` returns the same envelopes with the same `seq`                                                                                                                            |
-| `unknown-method`      | —            | the probe battery's invented methods come back as `unsupportedMethods`                                                                                                                                                   |
-| `idempotent-map`      | —            | no v1-only `sessionUpdate` kind survives at `payloadVersion: 2`; `reduceTurn` is a fixed point over duplicated envelopes                                                                                                 |
+The table below is **M1's thirteen plus M3-WP1's one**. M2's cases (elicitation, permission,
+config-option, watchdog, webhook-run, prompt-content, patch) live in their own modules under
+`src/cases/` and are documented at `docs/CONTRACTS.md` §27.1; `compat-report.json` is the
+authoritative list for any run, because it is written unconditionally and names every case that
+was selected, passed, failed or skipped.
+
+| case                  | requires     | asserts                                                                                                                                                                                                                                                                                                             |
+| --------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `handshake`           | —            | initialize + `session/new`; `capabilities.raw` non-empty; `runtimeId` stable across two workers; `generation` 1; `persistence: durable`                                                                                                                                                                             |
+| `plain-turn`          | —            | exactly one `state_update{running}` … one `{idle}`; non-empty text; `verdict: "ok"`; `GET /turns/{id}` deep-equals the `prompt()` aggregate                                                                                                                                                                         |
+| `tool-turn`           | `tools`      | a READ-ONLY prompt yields ≥1 tool call with a terminal final status, and `changes` matches the workspace                                                                                                                                                                                                            |
+| `stream-resume`       | —            | the SSE dropped mid-turn and reconnected with `?since=`; the union's **envelope frames** equal an uninterrupted observer's and are gap-free. Control frames asserted separately                                                                                                                                     |
+| `cancel-late-update`  | `cancel`     | an update arriving after `session/cancel` is ordered **before** `idle`                                                                                                                                                                                                                                              |
+| `tool-merge`          | `tools`      | a sparse `tool_call_update` never clears `kind` / `locations` / `title`                                                                                                                                                                                                                                             |
+| `permission-deny`     | `permission` | only an **offered** `optionId` is ever sent; `deniedToolCalls` non-empty while `stopReason` is `end_turn`; the workspace is untouched                                                                                                                                                                               |
+| `hibernate-wake`      | `resume`     | a small `idleTimeoutMs` forces `hibernated`; the recorded pid answers `waitGone`; the lease is released; the next prompt wakes with `resume.outcome: "landed"`; `seq` continues; replay is marked only inside the window                                                                                            |
+| `resume-cwd-mismatch` | `resume`     | resuming from a FOREIGN cwd is refused with a message that must **not** classify `rejected_permanent`                                                                                                                                                                                                               |
+| `lease`               | —            | a second client's `prompt` is `423` naming the holder; the observer keeps streaming; `steal` bumps the epoch; the previous holder's next call is `423`                                                                                                                                                              |
+| `restart-survives`    | —            | stop, restart on the same `dataDir`, `?since=` returns the same envelopes with the same `seq`                                                                                                                                                                                                                       |
+| `unknown-method`      | —            | the probe battery's invented methods come back as `unsupportedMethods`                                                                                                                                                                                                                                              |
+| `idempotent-map`      | —            | no v1-only `sessionUpdate` kind survives at `payloadVersion: 2`; `reduceTurn` is a fixed point over duplicated envelopes                                                                                                                                                                                            |
+| `restart-resumes`     | `resume`     | **M3-WP1.** `worker.restart()` replaces the PROCESS and the new one still remembers the conversation: `resume.outcome: "landed"`, `generation + 1`, a different pid, the SAME sessionId, the lease holder unchanged, the home unchanged, and a post-restart prompt that answers a question about a pre-restart turn |
 
 ---
 
-## Why `agents.local.yaml` has exactly one entry
+## Why `agents.local.yaml` has exactly two entries
 
-Because exactly one real ACP agent is available on the machine this milestone was built on:
-`claude-acp` (`npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, a logged-in Claude Code), and
-`docs/research/transcripts/claude-acp-0.73.0/` is its recorded ground truth. `codex-acp`, `gemini`,
-`opencode` and `kimi` are **not installed and must not be installed here**; they are YAML entries
-somebody else adds later, with no code change.
+Because exactly two real ACP agents are available on the machine this work was built on:
+`claude-acp` (`npx -y @agentclientprotocol/claude-agent-acp@0.73.0`, a logged-in Claude Code) and
+`codex-acp` (`npx -y @agentclientprotocol/codex-acp@1.8.0`, a ChatGPT login), with
+`docs/research/transcripts/claude-acp-0.73.0/` and `docs/research/transcripts/codex-acp-1.8.0/` as
+their recorded ground truth. `gemini`, `opencode` and `kimi` are **not installed and must not be
+installed here**; they are YAML entries somebody else adds later, with no code change.
 
-`docs/CONTRACTS.md` §11.6 records honestly that with one real agent DESIGN §11's criterion is **not
-falsifiable**, and that this suite is a partial satisfaction of it rather than a claimed one.
+The two agents disagree about almost everything the later milestones are about, and that
+disagreement is the value rather than a nuisance: claude asks permission and elicits, codex does
+neither; claude re-reads its credential file per request while codex caches it at startup
+(`docs/M3-WP1-CREDENTIALS.md` §Real-agent record R1, measured). Every case carries a `requires`
+list, so what one runtime cannot do is a printed `capability` skip sourced from its own recordings
+rather than a silent pass.
+
+`docs/CONTRACTS.md` §11.6 records honestly that with this few real agents DESIGN §11's criterion is
+**not falsifiable**, and that this suite is a partial satisfaction of it rather than a claimed one.
