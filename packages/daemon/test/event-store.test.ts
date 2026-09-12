@@ -195,11 +195,32 @@ describe("createDaemon — retention is armed, and stopped with the daemon", () 
     expect(store.sweeps).toBe(1);
   });
 
-  it("arms nothing for the memory driver", async () => {
+  it("sweeps NOTHING for the memory driver, and stops its timer with the daemon", async () => {
     const clock = fakeClock();
     const daemon = await build({ clock });
-    expect(clock.pendingTimers).toBe(0);
+
+    /**
+     * M3-WP1 changed what this test can assert, and the change is real rather than cosmetic.
+     *
+     * Before it, `retentionSweepMs` had exactly one job — the §14.5 row sweep — so the memory
+     * driver armed NO timer at all and `pendingTimers === 0` was the whole statement. M3-WP1 rides
+     * the WORKER-HOME sweep on the same timer (`<dataDir>/homes/<wid>` outlives a closed worker by
+     * `credentials.homeRetentionDays`), and homes do not depend on a database: a worker created
+     * with `home:"isolated"` under `eventLog.driver:"memory"` leaves a directory behind, and a
+     * daemon that never swept it would grow `<dataDir>/homes` forever.
+     *
+     * So the property that MATTERS is unchanged and is asserted directly: the memory driver
+     * performs no ROW sweep however far the clock advances (`store.sweeps` has no store to count,
+     * so `info.persistence.lastSweep` stays null — the observable form of the same claim), and
+     * every timer this daemon armed dies with `stop()`, which is what the original assertion was
+     * protecting (a timer that outlived `stop()` holds the process open).
+     */
+    clock.advance(10 * 3_600_000);
+    expect(daemon.info.persistence.lastSweep).toBeNull();
+    expect(daemon.info.persistence.driver).toBe("memory");
+
     await daemon.stop();
+    expect(clock.pendingTimers).toBe(0);
   });
 });
 

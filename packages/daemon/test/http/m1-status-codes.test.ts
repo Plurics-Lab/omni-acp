@@ -307,10 +307,15 @@ describe("routes/agents.ts is three moves per route (D15 constraint 1)", () => {
   });
 
   it("calls exactly ONE daemon method per route", () => {
-    // `daemon.catalog.list()` for H4, `daemon.catalog.probe(...)` for H16. Anything else — a
+    // `daemon.agents(auth)` for H4, `daemon.catalog.probe(...)` for H16. Anything else — a
     // `daemon.workers.get()` to check something first, say — is the orchestration D15 forbids.
+    //
+    // H4 moved from `daemon.catalog.list()` to `daemon.agents(auth)` in M3-WP1, and the move is
+    // what KEEPS this test true: `AgentCatalogEntry.login` is per TOKEN and reading it is I/O, so
+    // a route that had kept `catalog.list()` would have had to compose the two answers itself —
+    // which is exactly the second call this assertion forbids.
     const calls = [...source.matchAll(/\bdaemon\.[A-Za-z.]+\(/g)].map((m) => m[0]);
-    expect(calls).toEqual(["daemon.catalog.list(", "daemon.catalog.probe("]);
+    expect(calls).toEqual(["daemon.agents(", "daemon.catalog.probe("]);
   });
 
   it("decides no status, and reads ERROR_STATUS nowhere", () => {

@@ -159,7 +159,23 @@ describe("H2-H4 the read-only routes", () => {
       },
     });
     expect(await (await get(daemon, "/v1/agents")).json()).toEqual({
-      agents: [{ id: "example", command: "node", args: ["a.js"], source: "config", probed: null }],
+      agents: [
+        {
+          id: "example",
+          command: "node",
+          args: ["a.js"],
+          source: "config",
+          probed: null,
+          // M3-WP1's per-token row. `stubDaemon`'s credential store knows nothing, and "we could
+          // not tell" is a real answer rather than a fabricated `ok` (H4's own rule about
+          // `probed`, applied to the login).
+          login: {
+            state: "unknown",
+            checkedAt: expect.any(String) as unknown as string,
+            deep: false,
+          },
+        },
+      ],
     });
   });
 });

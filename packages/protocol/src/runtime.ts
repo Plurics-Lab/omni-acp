@@ -132,6 +132,15 @@ export interface RuntimeDescriptor {
   readonly budgets: RuntimeBudgets;
   /** Rows the compat suite must NOT assert for this agent — corpus gaps, not failures (§18.3). */
   readonly unverified: readonly string[];
+  /**
+   * M3-WP1. This runtime's credential contract, or null/absent when we have observed none.
+   *
+   * OPTIONAL, for the reason `WorkerSnapshot`'s M2 rows are: a `RuntimeDescriptor` is built as an
+   * object literal in `known.ts`, in `testkit`'s `fakeRuntime()` and in a dozen tests, and a
+   * required field would make every one of them a compile error for a milestone they predate.
+   * Absent reads as `null`, which is M2's `inherit` behaviour.
+   */
+  readonly credentials?: RuntimeCredentials | null;
 }
 
 /**
@@ -159,6 +168,12 @@ export interface ProbeSummary {
   /** What `-32602 data.<field>._errors` taught us about param names (F17). */
   readonly learnedParams: Readonly<Record<string, string>>;
   readonly timings: Readonly<Record<string, number>>;
+  /**
+   * M3-WP1. `initialize.authMethods`, verbatim — E4's `[api-key, chat-gpt]` on an unlogged-in
+   * codex-acp and `[]` on claude-acp. It is the raw observation; `LoginState` is the judgement,
+   * and it is computed per TOKEN by the probe service rather than stored here.
+   */
+  readonly authMethods?: readonly unknown[];
 }
 
 export type MethodVerdict =
@@ -176,3 +191,81 @@ export type MethodVerdict =
   | { readonly kind: "implemented_bad_value"; readonly code: -32603; readonly details: string }
   | { readonly kind: "error"; readonly code: number; readonly message: string }
   | { readonly kind: "skipped"; readonly reason: string };
+
+/**
+ * M3-WP1. What this runtime needs on disk, and in the environment, in order to be logged in.
+ *
+ * Every field is an observation (docs/M3-WP1-CREDENTIALS.md E1/E2/E4): the env var that relocates
+ * the agent's HOME, the credential FILE NAMES inside it, and the two env spellings a bare token
+ * or an API key lands as. It is the only thing the credential layer branches on — there is no
+ * `if (agentId === "claude-acp")` in the store, the home manager or the catalog, for the same
+ * reason §17.1 forbids one in the Normalizer.
+ *
+ * `null` / absent means "this runtime has no credential contract we have observed": the worker
+ * then INHERITS the daemon's environment, which is M2's behaviour exactly.
+ */
+export interface RuntimeCredentials {
+  /** `"CLAUDE_CONFIG_DIR"` | `"CODEX_HOME"`. The per-worker home is handed to the agent here. */
+  readonly homeEnv: string;
+  /** Credential file names INSIDE the home: `[".credentials.json"]` / `["auth.json"]`. */
+  readonly files: readonly string[];
+  /** Where a bare subscription token lands, when the runtime accepts one (E5). */
+  readonly tokenEnv?: string;
+  /** Where an API key lands: `"ANTHROPIC_API_KEY"` | `"CODEX_API_KEY"`. */
+  readonly apiKeyEnv?: string;
+  /**
+   * Whether swapping the linked credential takes effect WITHOUT a new process.
+   *
+   * MEASURED, never assumed: the value in `known.ts` cites the experiment that produced it —
+   * point the link at a garbage credential while a process is running and see whether the NEXT
+   * prompt fails. `"file"` ⇒ the agent re-reads the file per request, so a `setCredential` is
+   * `immediate`; `"restart"` ⇒ it cached the credential at startup and only a new process picks
+   * the new one up.
+   */
+  readonly reload: "file" | "restart";
+  /**
+   * WHERE this runtime's refusal lands when it is not logged in — measured, and E4's two values
+   * turned out to be three (docs/M3-WP1-CREDENTIALS.md §Real-agent record).
+   *
+   * `"prompt_-32000"` — `initialize` says nothing, `session/new` SUCCEEDS, and the refusal only
+   *   arrives as `-32000 Authentication required` on `session/prompt` (claude-acp 0.73.0).
+   * `"session_new"` — `session/new` itself refuses: `-32000 Authentication required` with no
+   *   credential file at all, `-32603 "plan type is required for chatgpt authentication"` with a
+   *   malformed one (codex-acp 1.8.0).
+   * `"authMethods"` — a non-empty `initialize.authMethods` means "not logged in". E4 read codex
+   *   this way and the measurement REFUTED it: codex answers `authMethods: [api-key]` while fully
+   *   logged in, so this value describes no agent we have, and a checker that used it for codex
+   *   would report every healthy login as `required`.
+   *
+   * All three are why a LIGHT check reads the FILE and never the handshake: a handshake that
+   * proves a login costs a process on one agent and a prompt on the other.
+   */
+  readonly loginRequiredSignal: "authMethods" | "prompt_-32000" | "session_new";
+}
+
+/**
+ * M3-WP1. Whether the credential this token would use for this agent is usable, computed for the
+ * CURRENT token and never cached across tokens.
+ *
+ * `"unknown"` is a first-class answer and the honest one whenever the runtime declares no
+ * credential contract, or the only check available is a deep one nobody asked for. It is NEVER a
+ * secret carrier: `expiresAt` is a timestamp, `fingerprint` is a sha256 prefix, and the token
+ * itself has no field here at all.
+ */
+export interface LoginState {
+  readonly state: "ok" | "expired" | "required" | "unknown";
+  /** `"files"` | `"token"` | `"apiKey"` | `"inherit"` — HOW this agent would be authenticated. */
+  readonly method?: string;
+  /** What the runtime offered in `initialize.authMethods`, when a probe has seen it (E4). */
+  readonly methods?: readonly string[];
+  /** From the credential's own body where it carries one (claude `claudeAiOauth.expiresAt`). */
+  readonly expiresAt?: string | null;
+  /** The credential NAME consulted, or null when the answer is about the inherited environment. */
+  readonly credential?: string | null;
+  readonly fingerprint?: string | null;
+  readonly checkedAt: string;
+  /** true ⇒ a process was spawned and a minimal prompt was sent. */
+  readonly deep: boolean;
+  /** Present when `state` is not `"ok"`: the one sentence an operator can act on. */
+  readonly detail?: string;
+}

@@ -21,8 +21,10 @@ import { readJson } from "./index.js";
 export function registerAgentRoutes(app: Hono, daemon: Daemon): void {
   const auth = authMiddleware(daemon);
 
-  // H4.
-  app.get("/v1/agents", auth, (c) => c.json({ agents: daemon.catalog.list() }));
+  // H4. ONE daemon call, and from M3-WP1 on it is the daemon's own agents row rather than
+  // `catalog.list()`: the `login` field is per TOKEN and reading it is I/O, so composing the two
+  // here would be the adapter making a decision (D15 constraint 1).
+  app.get("/v1/agents", auth, async (c) => c.json(await daemon.agents(authOf(c.req.raw))));
 
   // H16. An empty body is legal — every field of `ProbeRequestBody` is optional — so a bare
   // `POST` with no `content-type` is the common case and must not be a 400.

@@ -6,6 +6,7 @@ import {
   type AgentDescriptor,
   type AuthContext,
   type Catalog,
+  type CredentialStore,
   type ClientRef,
   type Daemon,
   type DaemonInfo,
@@ -217,6 +218,14 @@ export function stubDaemon(
     answer: (id) => notFound(id),
     interactions: (id) => notFound(id),
     setConfig: (id) => Promise.resolve(notFound(id)),
+
+    // ── M3-WP1 façade rows ──────────────────────────────────────────────────
+    //
+    // Same discipline, same `notFound` default: a stub holds no worker, so there is no credential
+    // to swap and no process to replace, and a route test that forgot to override says so loudly
+    // instead of passing against an invented `CredentialApplied`.
+    setCredential: (id) => Promise.resolve(notFound(id)),
+    restart: (id) => Promise.resolve(notFound(id)),
   };
 
   const catalog: Catalog = {
@@ -224,11 +233,18 @@ export function stubDaemon(
     get: (id) => {
       throw new OmniError("bad_request", `unknown agent "${id}"`);
     },
-    toSpawnSpec: (d: AgentDescriptor, o: { cwd: string }): SpawnSpec => ({
+    toSpawnSpec: (
+      d: AgentDescriptor,
+      o: { cwd: string; home?: string | null; credentialEnv?: Readonly<Record<string, string>> },
+    ): SpawnSpec => ({
       command: d.command,
       args: d.args,
       cwd: o.cwd,
-      env: { ...d.env },
+      // M3-WP1: `credentialEnv` is honoured because a test that asserts the composition must be
+      // able to see it. `home` is NOT: the real catalog needs the descriptor's `credentials.homeEnv`
+      // to know which variable to set, and a stub that guessed one would assert a variable no real
+      // runtime reads.
+      env: { ...d.env, ...(o.credentialEnv ?? {}) },
       label: d.id,
     }),
     // `Catalog.descriptor` NEVER throws (CONTRACTS.md §5.4): it falls back to the generic v1
@@ -265,6 +281,27 @@ export function stubDaemon(
     orphansAtStart: { found: 0, reaped: 0, skipped: 0 },
   };
 
+  /**
+   * M3-WP1's store. Every verb refuses OUT LOUD — the registry rows' rule, and the shape
+   * `create-daemon.ts` installs when nothing is wired — except `loginFor`, which is contracted
+   * never to reject because `GET /v1/agents` serves it for every configured agent.
+   */
+  const credentials: CredentialStore = {
+    list: () => Promise.resolve({ credentials: [] }),
+    get: (_auth, agentId, name) =>
+      Promise.reject(
+        new OmniError("credential_required", `stubDaemon: no credential ${name} for ${agentId}`),
+      ),
+    put: () =>
+      Promise.reject(new OmniError("bad_request", "stubDaemon: override `credentials.put`")),
+    remove: () =>
+      Promise.reject(new OmniError("bad_request", "stubDaemon: override `credentials.remove`")),
+    check: () =>
+      Promise.reject(new OmniError("bad_request", "stubDaemon: override `credentials.check`")),
+    loginFor: () =>
+      Promise.resolve({ state: "unknown", checkedAt: startedAt, deep: false } as const),
+  };
+
   const base: Daemon = {
     id: daemonId,
     config: DaemonConfig.parse({
@@ -274,6 +311,10 @@ export function stubDaemon(
     url: null,
     workers,
     catalog,
+    // M3-WP1. Placeholder: the real one is installed on `merged` below, where the OVERRIDDEN
+    // catalog and credential store are in scope. See the note there.
+    agents: () => Promise.resolve({ agents: [] }),
+    credentials,
     supervisor,
     // M2-B (D9). Present, and every verb refuses out loud — the same rule the registry rows
     // above follow, and the same shape `create-daemon.ts` installs when nothing is wired.
@@ -356,9 +397,33 @@ export function stubDaemon(
   };
 
   const merged: Daemon = { ...base, ...(overrides === undefined ? {} : flatten(overrides)) };
+  /**
+   * M3-WP1's `GET /v1/agents`, composed AFTER the overrides are merged.
+   *
+   * It has to be here rather than beside the other rows: `daemon.agents(auth)` is the catalogue
+   * plus each entry's per-token `login`, and a version defined over the BASE catalog would keep
+   * answering `[]` for every test that overrode `catalog.list` — which is most of them, and which
+   * is exactly the silent wrong answer a stub must never give. `merged` is where both halves are
+   * final, and a test that overrides `agents` itself still wins because the override is applied
+   * below rather than above.
+   *
+   * It is still ONE call from the route's point of view, which is what `m1-status-codes` asserts.
+   */
+  const composedAgents: Daemon["agents"] = async (auth) => ({
+    agents: await Promise.all(
+      merged.catalog.list().map(async (entry) => ({
+        ...entry,
+        login: await merged.credentials.loginFor(auth, entry.id),
+      })),
+    ),
+  });
   const daemon = recording(
     {
       ...merged,
+      // The composed one, unless the caller overrode `agents` explicitly — in which case theirs is
+      // already in `merged` and wins, which is why this reads `merged.agents` rather than
+      // assigning unconditionally.
+      agents: overrides !== undefined && "agents" in overrides ? merged.agents : composedAgents,
       workers: recording(merged.workers, "workers.", calls),
       catalog: recording(merged.catalog, "catalog.", calls),
     },

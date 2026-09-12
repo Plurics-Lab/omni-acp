@@ -4,10 +4,16 @@ import {
   LeaseRequestBody,
   OmniError,
   PromptRequestBody,
+  RestartRequestBody,
   SetConfigBody,
+  SetCredentialBody,
   assertInteractionId,
   type Clock,
   type ClientRef,
+  type CredentialApplied,
+  type CredentialBinding,
+  type RestartResult,
+  type WorkerCredentialBinding,
   type CloseResult,
   type DaemonId,
   type DiffProvider,
@@ -33,12 +39,14 @@ import {
   type ResolvedWatchdogConfig,
   type Seq,
   type SessionStrategy,
+  type SpawnSpec,
   type SetConfigResponse,
   type Subscription,
   type Supervisor,
   type TokenId,
   type TurnId,
   type TurnStatus,
+  type AgentDescriptor,
   type WorkerCloseReason,
   type WorkerHandle,
   type WorkerId,
@@ -61,6 +69,8 @@ import {
   toPolicySubject,
 } from "@omni-acp/core";
 import { recoverFromPreviousBoot, type BootRecoveryResult } from "./boot-recovery.js";
+import type { CredentialLayer } from "./credentials/layer.js";
+import { homeDir } from "./credentials/paths.js";
 import { resolveMcpForWorker } from "./mcp.js";
 import type { AuthContext, Catalog, WorkerRegistry } from "./types.js";
 
@@ -172,6 +182,18 @@ export interface WorkerRegistryOptions {
    * a rehydrated worker gets no engine. Both are the fail-closed answers.
    */
   readonly tokens?: { contextFor(tokenId: TokenId, clientId?: string | null): AuthContext };
+
+  /**
+   * M3-WP1's ONE seam (docs/M3-WP1-CREDENTIALS.md).
+   *
+   * ABSENT ⇒ M2 exactly: no credential is resolved, no home is built, `WorkerSnapshot.credential`
+   * is absent, and `PUT …/credential` answers `bad_request` naming the work package. Every
+   * existing test constructs this registry without it, and that is the compatibility bar.
+   *
+   * `restart` needs NONE of this — replacing a process is not a credential operation — which is
+   * why it works on a registry with no layer wired at all.
+   */
+  readonly credentials?: CredentialLayer;
 }
 
 interface Entry {
@@ -206,8 +228,21 @@ interface Entry {
    * so the worker has nowhere to hold them. The registry does, it is the thing that resolved
    * them, and `viewOf` stamps them onto every snapshot that leaves this file (including the
    * `201` body, which is why `create()` hands back a decorated handle rather than the raw one).
+   *
+   * MUTABLE since M3-WP1, and only for `credentialName`: a `setCredential` changes which
+   * credential this worker will WAKE on, and the alternative — replacing the `Entry` object — would
+   * leave `watchEntry`'s state listener, `views`'s memoised handle and `handle.closed`'s callback
+   * all closed over the previous one. One field, one writer (`credentialBindingFor`).
    */
-  readonly m2: WorkerViewRows;
+  m2: WorkerViewRows;
+  /**
+   * M3-WP1's per-worker binding, or undefined when no credential layer is wired (M2).
+   *
+   * The registry holds it as well as the worker because two callers outside `worker.ts` need it:
+   * the wake path, which has to read the store before a spawn (`ensure`), and `CredentialStore`'s
+   * `linked()` hook, which answers "which live workers read this credential".
+   */
+  readonly credentials: BoundCredential | undefined;
   /**
    * Why this worker may NOT be resumed, or null (§23.1, review finding V2/V8).
    *
@@ -218,6 +253,12 @@ interface Entry {
    */
   readonly revoked: string | null;
 }
+
+/**
+ * The registry's view of a worker's credential binding: the protocol's shape plus the one method
+ * only this file needs (§14.8's lazy rehydration, applied to the credential).
+ */
+type BoundCredential = WorkerCredentialBinding & { ensure(): Promise<void> };
 
 /** What `reviveM2` rebuilt for a rehydrated worker, or why it could not. */
 interface RevivedM2 {
@@ -252,6 +293,16 @@ interface WorkerViewRows {
   /** `null` ⇒ `env.persist:false` was asked for, and the row must not carry the map (§23.3). */
   readonly env: Readonly<Record<string, string>> | null;
   readonly mcpNames: readonly string[];
+  // ── M3-WP1 ──────────────────────────────────────────────────────────────────
+  //
+  // The NAME and the MODE, and deliberately not the binding: the worker reports
+  // `credential` / `home` / `credentialStale` off its own injected binding, so decorating them
+  // here would give one worker two answers about what it is running on. What the registry owns is
+  // what the REQUEST asked for — which is what has to survive to the wake path and what
+  // `CredentialStore.put` reads to answer `restartRequired`.
+  /** `null` ⇒ `inherit`; `"none"`'s sentinel is carried as the literal name so a row round-trips. */
+  readonly credentialName: string | null;
+  readonly homeMode: "isolated" | "shared";
 }
 
 /** M1's rows for a worker created before any of this existed, and for a rehydrated one. */
@@ -269,6 +320,10 @@ const M1_VIEW: WorkerViewRows = Object.freeze({
   watchdog: null,
   env: null,
   mcpNames: [],
+  // An M1/M2 worker was created before any of this existed: it inherited the daemon's
+  // environment and had no home, which is what these two say.
+  credentialName: null,
+  homeMode: "shared",
 });
 
 /**
@@ -293,6 +348,20 @@ function idleBudgetOf(requested: number | undefined, daemonWide: number): number
   const ms = requested ?? daemonWide;
   return ms > 0 ? ms : null;
 }
+
+/**
+ * M3-WP1's `inherit`, as a value: M2's behaviour, named.
+ *
+ * `home: null` and an empty `env` mean `toSpawnSpec` composes exactly what it composed before this
+ * work package existed, which is the backward-compatibility bar for the whole of it.
+ */
+const INHERIT_BINDING: CredentialBinding = Object.freeze({
+  name: null,
+  method: "inherit" as const,
+  fingerprint: null,
+  home: null,
+  env: Object.freeze({}),
+});
 
 /** How long `closeAll` waits for the whole fleet before returning anyway (best effort). */
 const DEFAULT_CLOSE_ALL_MS = 30_000;
@@ -467,6 +536,16 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       env: entry.m2.env,
       ...(entry.m2.watchdog === null ? {} : { watchdog: entry.m2.watchdog }),
       patchMode: entry.m2.patchMode,
+
+      // ── M3-WP1, persisted FOR THE SAME REASON the M2 rows above are ──────────
+      //
+      // A worker that hibernated on a stored credential must WAKE on that credential, and E7 says
+      // it must wake into the same home. Neither is derivable: the name is the request's and the
+      // home mode decides whether `credentials.homeEnv` is set at all, so a row that carried
+      // neither would wake the worker on the daemon's own login with a fresh empty directory —
+      // which is the `env` / `mcpNames` failure again, one layer down.
+      credentialName: entry.m2.credentialName,
+      homeMode: entry.m2.homeMode,
     };
   };
 
@@ -625,6 +704,9 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     const ref: { current: WorkerHandle | null } = { current: null };
     let revived: RevivedM2 = { engine: null, mcpServers: [], revoked: null };
     let handle: WorkerHandle;
+    // Hoisted out of the `try` for the `Entry` literal below, on `revived`'s reasoning: a row we
+    // could not reconstruct returns no entry at all, and a row we could carries its binding.
+    let credentials: BoundCredential | undefined;
     try {
       // From the CURRENT config, never from the row (M1-WP-C's `RehydrateDeps` header): a
       // `cwdRoots`, timeout or quirk-table change between boots must take effect on the worker
@@ -641,7 +723,42 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // that lost the variables it was created with is a different worker wearing the same id,
       // which is the whole reason `WorkerRow.env` is persisted. `null` there means the request
       // asked for `persist:false`, and then the honest answer is to reproduce nothing.
-      const spec = o.catalog.toSpawnSpec(descriptor, { cwd: row.snapshot.cwd });
+      /**
+       * M3-WP1 on the wake path. The binding is seeded from the PERSISTED view and the store is
+       * read once, lazily, by `ensure()` before the wake that needs it — `rehydrate()` is
+       * synchronous (§14.8) and resolving a credential is not.
+       *
+       * The seed is exact rather than a guess: `snapshot.credential` is what this worker was
+       * running on when the row was written, and `homeMode` says whether its home exists. What it
+       * cannot carry is a token/apiKey SECRET, which is precisely what `ensure()` goes and reads.
+       */
+      const persistedHome =
+        rows.homeMode === "isolated" ? homeDir(o.config.dataDir, row.snapshot.workerId) : null;
+      const seeded: CredentialBinding = {
+        name: row.snapshot.credential?.name ?? rows.credentialName,
+        method: row.snapshot.credential?.method ?? "inherit",
+        fingerprint: row.snapshot.credential?.fingerprint ?? null,
+        home: persistedHome,
+        env: {},
+      };
+      credentials = credentialBindingFor({
+        workerId,
+        agentId: row.agentId,
+        tokenId: row.snapshot.ownerTokenId,
+        homeMode: rows.homeMode,
+        initial: seeded,
+        name: rows.credentialName,
+        // The store has NOT been read: `ensure()` is what does that, before the wake.
+        needsBind: o.credentials !== undefined,
+        entryOf: () => entries.get(workerId),
+      });
+      const toSpawnSpec = (d: AgentDescriptor, opts: { cwd: string }): SpawnSpec =>
+        o.catalog.toSpawnSpec(d, {
+          ...opts,
+          home: credentials?.current().home ?? null,
+          credentialEnv: credentials?.current().env ?? {},
+        });
+      const spec = toSpawnSpec(descriptor, { cwd: row.snapshot.cwd });
       handle = createRehydratedWorker(row, log, {
         descriptor: { ...descriptor, env: { ...spec.env, ...(rows.env ?? {}) } },
         supervisor: o.supervisor,
@@ -684,7 +801,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         },
         runtime,
         ...(runtimeId === undefined ? {} : { runtimeId }),
-        toSpawnSpec: (d, spawnOpts) => o.catalog.toSpawnSpec(d, spawnOpts),
+        toSpawnSpec,
+        ...(credentials === undefined ? {} : { credentials }),
         owner,
         // ── M2's seams, rebuilt from the ROW (M2-WP-J) ───────────────────────
         ...(() => {
@@ -807,6 +925,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         alertOnUnpoliced: revived.engine?.alertOnUnpoliced ?? [],
       },
       revoked: revived.revoked,
+      credentials,
       idleTimer: null,
     };
     if (OCCUPIES_A_SLOT.includes(row.snapshot.state)) reacquire(entry);
@@ -1045,6 +1164,17 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
     }
     auth.assertAgent(entry.agentId);
     await auth.assertCwd(entry.handle.snapshot().cwd);
+    /**
+     * M3-WP1, and it sits with the other two re-checks for the same reason: a wake reproduces the
+     * environment the worker was created in, and the credential is part of that environment.
+     *
+     * `ensure()` is what reads the store for a worker THIS BOOT DID NOT CREATE — `rehydrate()` is
+     * synchronous and cannot — and it rebuilds the home links, so a worker that slept through a
+     * credential rotation wakes on the CURRENT credential rather than on a fingerprint it
+     * remembered. It runs before `reserveForWake`, so a `422 credential_expired` costs neither a
+     * slot nor a cold start, exactly like the two checks above.
+     */
+    await entry.credentials?.ensure();
   };
 
   const closeEntry = (entry: Entry, reason: WorkerCloseReason): Promise<CloseResult> => {
@@ -1111,6 +1241,90 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
    * has already spent — a replay reading 1 → 2 → 1, and an `isStaleEpoch` (exact equality) that
    * accepts a fence minted before the crash.
    */
+  /**
+   * M3-WP1. The per-worker `WorkerCredentialBinding` handed to `createWorker`, and the ONE place
+   * a credential is re-resolved for a live worker.
+   *
+   * It closes over the ENTRY rather than over a value, because `setCredential` has to make three
+   * things agree: what the worker reports (the binding it returns), what the persisted row says
+   * (so a wake reproduces it), and what a later `CredentialStore.put` counts as linked (so
+   * `restartRequired` names this worker). A binding that only updated the first would leave a
+   * woken worker on the credential it had before the swap.
+   *
+   * `auth` is rebuilt from the token store per call, because nobody holds an `AuthContext` across
+   * a restart (ruling M1-R8) and a rotation is exactly the operation that may outlive the client
+   * that started it.
+   */
+  const credentialBindingFor = (spec: {
+    workerId: WorkerId;
+    agentId: string;
+    tokenId: TokenId;
+    homeMode: "isolated" | "shared";
+    initial: CredentialBinding;
+    /** The NAME to re-resolve from, for a worker this boot did not create. */
+    name: string | null;
+    /** true ⇒ `initial` came off a persisted row and the store has not been read yet. */
+    needsBind: boolean;
+    entryOf: () => Entry | undefined;
+  }): BoundCredential | undefined => {
+    const layer = o.credentials;
+    if (layer === undefined) return undefined;
+    let current = spec.initial;
+    let pending = spec.needsBind;
+    const contextFor = (): AuthContext => {
+      const auth = o.tokens?.contextFor(spec.tokenId, null);
+      if (auth === undefined) {
+        throw new OmniError(
+          "bad_request",
+          "this registry was built without a token store, so a credential cannot be resolved",
+        );
+      }
+      return auth;
+    };
+    const bind = async (name: string | null): Promise<CredentialBinding> => {
+      const next = await layer.bind({
+        auth: contextFor(),
+        agentId: spec.agentId,
+        requested: name ?? undefined,
+        workerId: spec.workerId,
+        home: spec.homeMode,
+      });
+      current = next;
+      pending = false;
+      const entry = spec.entryOf();
+      if (entry !== undefined && entry.m2.credentialName !== next.name) {
+        // The ROW, so a wake reproduces the NEW credential — and the registry's own index, so the
+        // next `CredentialStore.put` on that name counts this worker.
+        entry.m2 = { ...entry.m2, credentialName: next.name };
+        persistRow(entry);
+      }
+      return next;
+    };
+    return {
+      /**
+       * §14.8's lazy rehydration, applied to the credential.
+       *
+       * `rehydrate()` is SYNCHRONOUS — it is called from `lookup()`, which is — while resolving a
+       * credential reads the store and relinking a home writes the filesystem. So a worker this
+       * boot did not create starts on the PERSISTED view (name, method and fingerprint off
+       * `snapshot.credential`, home off the row's `homeMode`), which is exactly what it was
+       * running on when the row was written, and the store is read once, HERE, before the wake
+       * that needs it. Every caller of this is already async and already ahead of a spawn.
+       *
+       * A no-op for a worker this boot created, and a no-op on every call after the first.
+       */
+      async ensure(): Promise<void> {
+        if (!pending) return;
+        await bind(spec.name);
+      },
+      // The descriptor's MEASURED answer. Absent contract ⇒ `"file"`, which is the harmless
+      // reading: there is no credential to reload, so nothing needs a restart.
+      reload: layer.contractFor(spec.agentId)?.reload ?? "file",
+      current: () => current,
+      relink: (name: string) => bind(name),
+    };
+  };
+
   const leaseFor = (
     owner: ClientRef | null,
     workerId: WorkerId,
@@ -1169,6 +1383,18 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         caps: catalogEntry?.probed?.capabilities ?? null,
       });
 
+      /**
+       * M3-WP1's CREATE-TIME VALIDATION (§Home 隔离: 创建时校验 … 不要等第一个 prompt).
+       *
+       * It sits with M2's per-request resolution above and BEFORE `reserve`, for that block's own
+       * reason: every refusal here is cheaper than the spawn it precedes. A worker whose
+       * credential is missing would otherwise handshake fine and fail on the first prompt —
+       * `-32000 Authentication required` on claude-acp (measured) or a `session/new` failure on
+       * codex-acp (measured) — which is a 502 from the agent for something the daemon already
+       * knew, minus a ~7 s `npx` cold start and a `maxWorkers` slot.
+       */
+      await o.credentials?.validate({ auth, agentId: req.agent, requested: req.credential });
+
       reserve(auth);
       const workerId = o.ids.worker();
       const logger = o.logger.child({ workerId, agent: req.agent });
@@ -1179,7 +1405,54 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       // life — including the `starting` envelope and a handshake that fails.
       const subscription = subscribeFanOut(workerId, log);
 
-      const spec = o.catalog.toSpawnSpec(descriptor, { cwd });
+      /**
+       * M3-WP1. The home and the link, built AFTER the id exists and BEFORE the spawn.
+       *
+       * `<dataDir>/homes/<workerId>` is the worker's own, at 0700, and the credential file inside
+       * it is a SYMLINK to the store's canonical copy — never a copy, because E3 says the agent
+       * refreshes its own token and a copy would diverge from the source within hours while a
+       * link writes through to the one file every other worker reads.
+       *
+       * With no layer wired this is `null` and everything below composes M2's environment exactly.
+       */
+      const credentialBinding =
+        o.credentials === undefined
+          ? null
+          : await o.credentials.bind({
+              auth,
+              agentId: req.agent,
+              requested: req.credential,
+              workerId,
+              home: req.home ?? "isolated",
+            });
+      const credentials = credentialBindingFor({
+        workerId,
+        agentId: req.agent,
+        tokenId: auth.tokenId,
+        homeMode: req.home ?? "isolated",
+        initial: credentialBinding ?? INHERIT_BINDING,
+        name: credentialBinding?.name ?? null,
+        // This boot BUILT the home a moment ago, so there is nothing to read back.
+        needsBind: false,
+        entryOf: () => entries.get(workerId),
+      });
+
+      /**
+       * `toSpawnSpec` composes the credential environment — the home env var and, for a token /
+       * apiKey credential, the variable the descriptor declares — because `SpawnSpec.env` is
+       * documented as COMPLETE and a second composer is how the create path and the wake path come
+       * to spawn one worker with two different environments.
+       *
+       * This closure is what threads it onto BOTH: `worker.ts` calls `deps.toSpawnSpec` on create,
+       * on wake and on restart, and it passes only a cwd.
+       */
+      const toSpawnSpec = (d: typeof descriptor, opts: { cwd: string }): SpawnSpec =>
+        o.catalog.toSpawnSpec(d, {
+          ...opts,
+          home: credentialBinding?.home ?? null,
+          credentialEnv: credentials?.current().env ?? {},
+        });
+      const spec = toSpawnSpec(descriptor, { cwd });
 
       /**
        * The handshake's `modes` catalogue, read LAZILY (M1-WP-B's `NormalizerOptions.modes`).
@@ -1277,6 +1550,9 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
         // by NOT writing the map — a woken worker must never inherit an environment silently.
         env: env.persist ? env.env : null,
         mcpNames: req.mcp ?? [],
+        // M3-WP1: what the REQUEST resolved to, for the wake path and for `restartRequired`.
+        credentialName: credentialBinding?.name ?? null,
+        homeMode: credentialBinding?.home === null ? "shared" : (req.home ?? "isolated"),
       };
 
       try {
@@ -1313,7 +1589,8 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
             }),
             responder: o.responder,
             lease: leaseFor(auth.asClientRef(), workerId, log),
-            toSpawnSpec: (d, spawnOpts) => o.catalog.toSpawnSpec(d, spawnOpts),
+            toSpawnSpec,
+            ...(credentials === undefined ? {} : { credentials }),
             ...(o.session === undefined ? {} : { session: o.session }),
             runtime,
             ...(runtimeId === undefined ? {} : { runtimeId }),
@@ -1383,6 +1660,7 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
           hibernateIdleMs: idleBudget(req.idleTimeoutMs),
           idleTimer: null,
           m2: view,
+          credentials,
           // A worker this boot created resolved everything it needs a moment ago.
           revoked: null,
         };
@@ -1639,6 +1917,47 @@ export function createWorkerRegistry(o: WorkerRegistryOptions): WorkerRegistry {
       return await entry.handle.setConfig(parsed, auth.asClientRef());
     },
 
+    // ── M3-WP1 façade rows (§线上协议), same rule: parse -> ONE call -> serialize ───
+
+    /**
+     * `PUT /v1/workers/{wid}/credential`.
+     *
+     * VISIBILITY FIRST (`get`), then ONE call on the handle — where the lease gate and the state
+     * checks live, exactly as `answer` and `setConfig` do it. The BODY is parsed here as well as
+     * in the handle, because `WorkerRegistry` is also D15's in-process entry point and an
+     * embedder's typo must be a `bad_request` rather than a path join over `undefined`.
+     */
+    async setCredential(id, auth, body): Promise<CredentialApplied> {
+      let parsed: SetCredentialBody;
+      try {
+        parsed = SetCredentialBody.parse(body);
+      } catch (e) {
+        throw badRequest(e, "invalid credential request");
+      }
+      return await get(id, auth).setCredential(parsed, auth.asClientRef());
+    },
+
+    /**
+     * `POST /v1/workers/{wid}/restart`.
+     *
+     * A hibernated worker's restart IS a wake, so the ACL is re-run here for `wake`'s own reason
+     * (H14): otherwise the check is one HTTP route wide. A LIVE worker's restart is not a
+     * resurrection and needs no re-check — it already passed one when it was created and the
+     * config has not been consulted since.
+     */
+    async restart(id, auth, body): Promise<RestartResult> {
+      let parsed: RestartRequestBody;
+      try {
+        parsed = RestartRequestBody.parse(body);
+      } catch (e) {
+        throw badRequest(e, "invalid restart request");
+      }
+      const entry = lookup(id, auth);
+      if (entry === null) return notFound(id);
+      if (entry.handle.snapshot().state === "hibernated") await assertMayResume(entry, auth);
+      return await entry.handle.restart(parsed, auth.asClientRef());
+    },
+
     /**
      * §19.8 / §24.4 rule 5's FIRST rung, so `daemon.stop()` can run it before anything else
      * (review finding V11).
@@ -1859,6 +2178,11 @@ function decorateHandle(handle: WorkerHandle, snapshot: () => WorkerSnapshot): W
     settleInteractions: (reason) => handle.settleInteractions(reason),
     setConfig: (body, who) => handle.setConfig(body, who),
     cancelInternal: (reason) => handle.cancelInternal(reason),
+    // M3-WP1. Delegated verbatim, like every other verb: neither answer is a snapshot, so there
+    // is nothing to decorate. Written out rather than proxied for the reason at the top of this
+    // function — a `Proxy` would silently forward the next member nobody thought about.
+    setCredential: (body, who) => handle.setCredential(body, who),
+    restart: (body, who) => handle.restart(body, who),
   };
 }
 
@@ -1887,6 +2211,10 @@ function viewRowsOf(row: WorkerRow): WorkerViewRows {
     watchdog: row.watchdog ?? null,
     env: row.env ?? null,
     mcpNames: row.mcpNames ?? [],
+    // A row from an M1/M2 boot carries neither, and both fallbacks are that boot's own behaviour:
+    // the daemon's environment, and no home.
+    credentialName: row.credentialName ?? null,
+    homeMode: row.homeMode ?? "shared",
   };
 }
 

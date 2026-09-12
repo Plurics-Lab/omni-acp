@@ -108,6 +108,31 @@ describe("eventEnvelopeSchema", () => {
           error: { code: "worker_closed", message: "the worker died with its boot" },
         },
       },
+      {
+        // M3-WP1. The audit line for a credential swap, and the reason it exists at all: on a
+        // `reload:"file"` agent (claude-acp, measured) no process restarts and no state changes, so
+        // an operator reading the log would see a turn start answering as somebody else with
+        // nothing in between saying why.
+        //
+        // FINGERPRINTS, NEVER SECRETS. The arm is fully specified with no `z.unknown()` anywhere,
+        // and `fingerprint` / `previous` are `/^[0-9a-f]{12}$/` — 48 bits, enough to tell two
+        // credentials apart and useless for authenticating anything.
+        ...meta,
+        payloadVersion: 2,
+        turnId: null,
+        kind: "omni.credential",
+        payload: {
+          op: "set",
+          credential: "default",
+          method: "files",
+          fingerprint: "a1b2c3d4e5f6",
+          // MEASURED: codex-acp caches its credential in the process, so a swap landing mid-turn
+          // is honestly `on-next-start` rather than a lie about having taken effect.
+          applied: "on-next-start",
+          generation: 2,
+          previous: "0123456789ab",
+        },
+      },
     ];
     const kinds = envelopes.map((e) => {
       const parsed: EventEnvelope = eventEnvelopeSchema.parse(e);

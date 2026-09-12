@@ -3,8 +3,18 @@ import { PolicyCeiling, PolicyRule, POLICY_ACTIONS } from "./config.js";
 import type { PlatformOwnership, RetentionReport } from "./contracts.js";
 import type { OmniErrorBody } from "./errors.js";
 import type { RunState, WorkerState } from "./events.js";
-import type { DaemonId, DeliveryId, RunId, Seq, TokenId, TurnId, WorkerId } from "./ids.js";
-import type { ProbeSummary } from "./runtime.js";
+import type {
+  DaemonId,
+  DeliveryId,
+  RunId,
+  Seq,
+  SessionId,
+  TokenId,
+  TurnId,
+  WorkerId,
+} from "./ids.js";
+import type { ResumeReport } from "./resume.js";
+import type { LoginState, ProbeSummary } from "./runtime.js";
 import type { TurnResult } from "./turn.js";
 import type { ConfigOptionView, InteractionSnapshot, WorkerSnapshot } from "./worker.js";
 
@@ -77,6 +87,35 @@ export const CreateWorkerRequest = z.strictObject({
   idleTimeoutMs: z.number().int().nonnegative().max(86_400_000).optional(),
   /** "take" (default) ⇒ the creator holds the lease; "observe" ⇒ created lease-free (D5). */
   lease: z.enum(["take", "observe"]).optional(),
+  // ── M3-WP1 ────────────────────────────────────────────────────────────────
+  /**
+   * WHICH stored credential this worker runs on, by NAME — never by value.
+   *
+   * Omitted ⇒ this token's `default` for this agent, and `"inherit"` when it has none (M2's
+   * behaviour exactly, gated by `credentials.allowInherit`). `"none"` ⇒ an EMPTY home, which is
+   * how an operator proves a worker is unauthenticated rather than quietly borrowing the
+   * daemon's own login. `"inherit"` is the explicit spelling of the fallback.
+   *
+   * A name this token does not own is `403 credential_forbidden` and never a 404: the answer must
+   * not say whether somebody else's credential exists.
+   */
+  credential: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^(?:[A-Za-z0-9][A-Za-z0-9._-]*)$/, "a credential name is [A-Za-z0-9._-], not a path")
+    .optional(),
+  /**
+   * `"isolated"` (the default) ⇒ `<dataDir>/homes/<workerId>`, with the credential files LINKED to
+   * the store's canonical copy. `"shared"` ⇒ no per-worker home at all and the daemon's own
+   * environment, which is M2.
+   *
+   * Isolation is the default because E3 is unavoidable: the agent REFRESHES its token, so two
+   * workers sharing one home race on the same file, and two workers with independent COPIES
+   * diverge from the source. A link per home is what makes a refresh land back on the one
+   * canonical file every worker reads.
+   */
+  home: z.enum(["isolated", "shared"]).optional(),
 });
 /**
  * The INPUT shape — what a caller WRITES — deliberately, and this is the one place in the file
@@ -372,6 +411,14 @@ export interface AgentCatalogEntry {
   readonly probed: ProbeSummary | null;
   /** The descriptor that WILL govern a worker created now: `"<agentId>@<fingerprint12>"`. */
   readonly runtimeId: string;
+  /**
+   * M3-WP1. Whether THIS TOKEN can log this agent in right now, computed per request.
+   *
+   * Per token and not per agent, which is why it is on the catalog ENTRY rather than inside
+   * `probed`: the probe is a shared, cached fact about the binary, and "am I logged in" is a fact
+   * about the caller's credential. Absent/null ⇒ this daemon has no credential layer wired.
+   */
+  readonly login?: LoginState | null;
 }
 
 export interface WorkerListResponse {
@@ -380,6 +427,175 @@ export interface WorkerListResponse {
 
 export interface AgentListResponse {
   readonly agents: readonly AgentCatalogEntry[];
+}
+
+// ── M3-WP1: the credential store (docs/M3-WP1-CREDENTIALS.md §凭据仓库) ───────
+
+/**
+ * The three shapes a credential can arrive in, and they are a DISCRIMINATED UNION so that the
+ * daemon never has to guess which one it got.
+ *
+ * `files` is the shape both real agents actually use (E1/E2): a map of FILE NAME → content, and
+ * the names are validated against the descriptor's own `credentials.files` list so a client
+ * cannot write `../../id_rsa` into the store. `token` and `apiKey` land as the env var the
+ * descriptor declares (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` / `CODEX_API_KEY`).
+ *
+ * SECRETS ONLY GO UP. There is no response shape in this file that carries one, and
+ * `CredentialSummary` is what every read returns.
+ */
+export const CredentialInput = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("files"),
+    /**
+     * FILE NAME → content. A name with a separator, a `..`, a NUL or a leading dot-dot is refused
+     * at parse: the store joins these onto a directory it owns, and a path that escapes it is the
+     * one bug in a credential store that matters.
+     */
+    files: z.record(
+      z
+        .string()
+        .min(1)
+        .max(128)
+        .regex(/^\.?[A-Za-z0-9][A-Za-z0-9._-]*$/, "a credential file name is a bare file name"),
+      z
+        .string()
+        .min(1)
+        .max(256 * 1024),
+    ),
+  }),
+  z.strictObject({
+    kind: z.literal("token"),
+    token: z
+      .string()
+      .min(1)
+      .max(16 * 1024),
+  }),
+  z.strictObject({
+    kind: z.literal("apiKey"),
+    apiKey: z
+      .string()
+      .min(1)
+      .max(16 * 1024),
+  }),
+]);
+export type CredentialInput = z.output<typeof CredentialInput>;
+
+/**
+ * What a READ of a credential returns. Every field is metadata.
+ *
+ * `fingerprint` is the first 12 hex characters of a sha256 over the canonical content — enough to
+ * tell two credentials apart and useless for authenticating anything, which is the whole design
+ * (§凭据仓库: secret 只上行).
+ */
+export interface CredentialSummary {
+  readonly agentId: string;
+  readonly name: string;
+  readonly ownerTokenId: TokenId;
+  readonly method: "files" | "token" | "apiKey";
+  readonly fingerprint: string;
+  /** File names present in the store, sorted. `[]` for the token / apiKey shapes. */
+  readonly files: readonly string[];
+  /** The env var a token / apiKey credential lands as, or null for the files shape. */
+  readonly env: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** Read out of the credential's own body where it carries one (claude's `expiresAt`). */
+  readonly expiresAt: string | null;
+  /** LIVE workers currently linked to this credential. A `DELETE` with `inUseBy > 0` is a 409. */
+  readonly inUseBy: number;
+}
+
+export interface CredentialListResponse {
+  readonly credentials: readonly CredentialSummary[];
+}
+
+/**
+ * `PUT` on a name that already exists is an IN-PLACE update, and these two fields are why the
+ * route returns more than a summary.
+ *
+ * A store write re-points nothing by itself: every live worker's home already LINKS to the file
+ * that just changed, so a `reload:"file"` agent picks the new credential up on its next request
+ * and a `reload:"restart"` one does not. `restartRequired` names the workers in the second group,
+ * so an operator who swapped an expired token knows exactly which processes are still using it.
+ */
+export interface CredentialPutResult extends CredentialSummary {
+  /** Live workers whose home links to this credential. */
+  readonly workersAffected: number;
+  /** Of those, the ones whose runtime is `reload:"restart"` — they need `POST …/restart`. */
+  readonly restartRequired: readonly WorkerId[];
+}
+
+export const CredentialCheckBody = z.strictObject({
+  /** true ⇒ spawn one throwaway process and send a minimal prompt. Costs tokens; opt-in. */
+  deep: z.boolean().optional(),
+  timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+});
+export type CredentialCheckBody = z.output<typeof CredentialCheckBody>;
+
+/** `PUT /v1/workers/{wid}/credential`. */
+export const SetCredentialBody = z.strictObject({
+  /** A stored name, or the two sentinels. NEVER a value: a secret does not travel per worker. */
+  credential: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^(?:[A-Za-z0-9][A-Za-z0-9._-]*)$/, "a credential name is [A-Za-z0-9._-], not a path"),
+  /**
+   * `"auto"` (default) — re-point the link, then do whatever the descriptor's `reload` says:
+   * `"file"` ⇒ nothing more (`applied: "immediate"`), `"restart"` ⇒ restart NOW when idle and
+   * after this turn otherwise (`applied: "restarted"` / `"on-next-start"`).
+   * `"restart"` — force it. `409 worker_busy` while a turn is live unless the caller restarts
+   * with `force` itself.
+   * `"defer"` — re-point and stop (`applied: "deferred"`), for an operator rotating credentials
+   * across a fleet who will restart on their own schedule.
+   */
+  apply: z.enum(["auto", "restart", "defer"]).optional(),
+});
+export type SetCredentialBody = z.output<typeof SetCredentialBody>;
+
+export interface CredentialApplied {
+  readonly credential: {
+    readonly name: string | null;
+    readonly method: "files" | "token" | "apiKey" | "inherit" | "none";
+    readonly fingerprint: string | null;
+  };
+  readonly applied: "immediate" | "restarted" | "on-next-start" | "deferred";
+  readonly generation: number;
+  /** The fingerprint this replaced, or null when the worker had none. */
+  readonly previous: string | null;
+}
+
+/** `POST /v1/workers/{wid}/restart`. */
+export const RestartRequestBody = z.strictObject({
+  /** Recorded verbatim in the `omni.worker_state{reason:"restart"}` envelope's audit line. */
+  reason: z.string().max(500).optional(),
+  /** Required to interrupt a LIVE turn; without it a `running` worker is `409 worker_busy`. */
+  force: z.boolean().optional(),
+  /** Default true. The new process resumes the SAME session, so the conversation survives. */
+  resume: z.boolean().optional(),
+  /** Explicitly abandon the session and open a new one. Required when the agent cannot resume. */
+  fresh: z.boolean().optional(),
+  /** Swap the credential as part of the restart — one operation, one process replacement. */
+  credential: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^(?:[A-Za-z0-9][A-Za-z0-9._-]*)$/, "a credential name is [A-Za-z0-9._-], not a path")
+    .optional(),
+  timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+});
+export type RestartRequestBody = z.output<typeof RestartRequestBody>;
+
+export interface RestartResult {
+  /** `generation` AFTER the restart: always the previous value + 1 (§15.1's counter). */
+  readonly generation: number;
+  readonly pid: number | null;
+  /** The four-state verdict, or `{outcome:"fresh"}` when `fresh:true` opened a new session. */
+  readonly resume: ResumeReport | { readonly outcome: "fresh" };
+  readonly sessionId: SessionId | null;
+  /** The turn `force:true` interrupted, or null. Its `TurnResult.error.code` is `"restarted"`. */
+  readonly terminatedTurn: TurnId | null;
+  readonly elapsedMs: number;
 }
 
 export const HEADER = {

@@ -52,6 +52,16 @@ export const EVENT_KINDS = [
    * stream writer (Land exit criterion 6).
    */
   "omni.run",
+  /**
+   * M3-WP1. One per credential operation on a worker — `set` today, `revoked` when the store
+   * drops something a live worker was linked to.
+   *
+   * It carries a FINGERPRINT and never a secret, and it exists because a credential swap is
+   * invisible in every other stream: the process does not restart on a `reload:"file"` agent, no
+   * state changes, and an operator reading the log would see a turn start answering as somebody
+   * else with nothing in between saying why (DESIGN §8's 审计 row, 凭据 line).
+   */
+  "omni.credential",
 ] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
 
@@ -171,7 +181,19 @@ export type WorkerStateReason =
   /** requires_action → running: `parkTimeoutAction` fired instead of a human. */
   | "park_timeout"
   /** The idle watchdog sent `session/cancel`. NOT a close — the escalation into `cancel_timeout` is. */
-  | "watchdog_idle";
+  | "watchdog_idle"
+  // ── M3-WP1 ─────────────────────────────────────────────────────────────────
+  /**
+   * `ready` | `requires_action` | `running` → `starting`: the process is being replaced while the
+   * WORKER survives — same id, same lease, same home, `generation + 1`.
+   *
+   * It is deliberately NOT `wake`: a wake starts from `hibernated` and a restart does not, the
+   * lease is RELEASED by a hibernate and KEPT by a restart, and `reduceTurn` treats this reason as
+   * the one non-close way a turn can terminate (`TurnResult.error.code: "restarted"`). A reader
+   * that could not tell the two apart could not tell "your worker went to sleep" from "your turn
+   * was cut short on purpose".
+   */
+  | "restart";
 
 export interface WorkerStatePayload {
   readonly state: WorkerState;
@@ -343,6 +365,30 @@ export interface RunEventPayload {
   readonly error?: OmniErrorBody;
 }
 
+/**
+ * M3-WP1's audit envelope. NO SECRET, EVER — the whole payload is metadata.
+ *
+ * `fingerprint` is the first 12 hex characters of the sha256 over the credential's content, which
+ * is enough to say "this is a different credential than before" and useless for authenticating
+ * anything. `applied` is what actually happened, which is not always what was asked for: a
+ * `reload:"restart"` agent mid-turn answers `on-next-start`, and an operator who read only the
+ * request would believe the swap had taken effect.
+ */
+export interface CredentialEventPayload {
+  readonly op: "set" | "revoked";
+  /** The credential NAME (`"default"`), never its content. */
+  readonly credential: string | null;
+  /** `"files"` | `"token"` | `"apiKey"` | `"inherit"` | `"none"`. */
+  readonly method: string;
+  /** sha256 prefix, 12 hex characters. `null` for `inherit` / `none`, which hash nothing. */
+  readonly fingerprint: string | null;
+  readonly applied: "immediate" | "restarted" | "on-next-start" | "deferred";
+  /** The worker's generation AFTER this operation, so a restart is visible in the audit line. */
+  readonly generation: number;
+  /** The fingerprint this replaced, or null when the worker had none. */
+  readonly previous: string | null;
+}
+
 export type EventBody =
   | { readonly kind: "acp.session_update"; readonly payload: NormalizedSessionUpdate }
   | { readonly kind: "acp.interaction"; readonly payload: InteractionPayload }
@@ -350,7 +396,8 @@ export type EventBody =
   | { readonly kind: "omni.worker_state"; readonly payload: WorkerStatePayload }
   | { readonly kind: "omni.lease"; readonly payload: LeaseEventPayload }
   | { readonly kind: "omni.error"; readonly payload: OmniErrorBody & { stderrTail?: string } }
-  | { readonly kind: "omni.run"; readonly payload: RunEventPayload };
+  | { readonly kind: "omni.run"; readonly payload: RunEventPayload }
+  | { readonly kind: "omni.credential"; readonly payload: CredentialEventPayload };
 
 export type EventEnvelope = EnvelopeMeta & EventBody;
 
@@ -465,6 +512,8 @@ const WORKER_STATE_REASONS = [
   "resumed",
   "wake_retry",
   "daemon_restart",
+  // ── M3-WP1 ────────────────────────────────────────────────────────────────
+  "restart",
   // ── M2 (§5.8.3) ───────────────────────────────────────────────────────────
   "interaction_parked",
   "interaction_resolved",
@@ -647,6 +696,28 @@ export const eventEnvelopeSchema: z.ZodType<EventEnvelope> = z.discriminatedUnio
       previous: z.enum(RUN_STATES).nullable(),
       reason: z.string(),
       error: z.object(omniErrorBodyShape).optional(),
+    }),
+  }),
+  z.object({
+    ...envelopeMetaShape,
+    kind: z.literal("omni.credential"),
+    // Fully specified, because we are its author (the rule above the schema). There is no
+    // `z.unknown()` anywhere in this arm ON PURPOSE: a `passthrough` here is how a secret would
+    // one day arrive in an envelope nobody re-read, and `secret-never-leaks` greps the wire.
+    payload: z.object({
+      op: z.enum(["set", "revoked"]),
+      credential: z.string().nullable(),
+      method: z.string(),
+      fingerprint: z
+        .string()
+        .regex(/^[0-9a-f]{12}$/)
+        .nullable(),
+      applied: z.enum(["immediate", "restarted", "on-next-start", "deferred"]),
+      generation: z.number().int().nonnegative(),
+      previous: z
+        .string()
+        .regex(/^[0-9a-f]{12}$/)
+        .nullable(),
     }),
   }),
 ]);

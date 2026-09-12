@@ -558,6 +558,23 @@ export type ResolvedRunConfig = z.output<typeof RunConfig>;
  * (`redactArgs`'s argument, §5.1). `envDeny` in config EXTENDS it; nothing shrinks it.
  */
 export const ENV_DENY_EXACT: readonly string[] = [
+  // ── M3-WP1's six, and they are the same CLASS as `HOME` rather than a new one ──────────────
+  //
+  // DESIGN §8: 凭据 由 daemon 侧密钥库持有. A client that could set `ANTHROPIC_API_KEY` per worker
+  // would be putting a credential of its own choosing into a process the operator pays for — and
+  // a client that could set `CLAUDE_CONFIG_DIR` or `CODEX_HOME` would be pointing the agent at a
+  // home the daemon did not build, which is the whole isolation boundary in one variable.
+  //
+  // They are REFUSED BY NAME, never dropped (ruling M2-R12): a caller that set one and got a
+  // worker anyway would reasonably believe it took effect. The credential layer sets these
+  // variables itself, in `catalog.toSpawnSpec`, which is above the deny list and not subject to
+  // it — the list governs the CLIENT's contribution.
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CODEX_API_KEY",
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
   "HOME",
   "PATH",
   "USER",
@@ -596,6 +613,42 @@ export const ENV_DENY_PREFIX: readonly string[] = [
   "PYTHON",
 ];
 
+/**
+ * M3-WP1's daemon block (docs/M3-WP1-CREDENTIALS.md §Home 隔离).
+ *
+ * Two switches and a retention bound, and both switches default to the value that keeps M2's
+ * behaviour byte for byte: inheritance is still allowed, and an insecure transport is still
+ * refused for a credential WRITE only (M2 had no credential write to refuse).
+ */
+export const CredentialsConfig = z.object({
+  /**
+   * true (DEFAULT) ⇒ a worker with no stored credential runs on the DAEMON's environment, which
+   * is M2's behaviour exactly and what keeps every existing test passing unchanged. M3's later
+   * work packages flip this to false, at which point a worker with no credential is a
+   * `422 credential_required` instead.
+   */
+  allowInherit: z.boolean().default(true),
+  /**
+   * A credential WRITE carries a plaintext secret in a request body, so it is refused over a
+   * connection that is neither TLS nor loopback (`403 insecure_transport`). TLS is M3's later
+   * work package; until then the test is `listen.host` being a loopback address, and this is the
+   * escape hatch for an operator terminating TLS in front of the daemon.
+   *
+   * DEFAULT FALSE, which costs nothing today: `listen` defaults to `127.0.0.1`.
+   */
+  allowInsecureTransport: z.boolean().default(false),
+  /**
+   * How long a CLOSED worker's home survives, in days, so a post-mortem can still read the
+   * agent's own session files (E7). `0` ⇒ delete it as soon as the worker closes.
+   *
+   * It is separate from `eventLog.retentionDays` on purpose: a home holds the agent's caches and
+   * can be large, and an operator who keeps 7 days of LOGS does not necessarily want 7 days of
+   * `node_modules`-sized agent state.
+   */
+  homeRetentionDays: z.number().int().nonnegative().max(365).default(1),
+});
+export type ResolvedCredentialsConfig = z.output<typeof CredentialsConfig>;
+
 export const DaemonConfig = z
   .strictObject({
     /** Else generated + persisted to dataDir. */
@@ -629,6 +682,8 @@ export const DaemonConfig = z
     /** Extra keys the operator forbids in `CreateWorkerRequest.env`. Extends the hard list; can
      *  never shrink it. */
     envDeny: z.array(z.string().max(256)).default([]),
+    /** M3-WP1. Defaults keep M2's behaviour, so an unmodified M2 config file still parses. */
+    credentials: CredentialsConfig.prefault({}),
   })
   .superRefine((c, ctx) => {
     // A watchdog that closed FIRST would report a fake agent timeout for a turn that was settling,

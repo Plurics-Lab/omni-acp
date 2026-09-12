@@ -30,6 +30,14 @@ describe("ERROR_STATUS", () => {
       // retries a worker 404 by recreating its worker would do so over a stale reqId.
       interaction_not_found: 404,
       interaction_settled: 409,
+      // ── M3-WP1's FIVE (docs/M3-WP1-CREDENTIALS.md). Four statuses and one that never leaves an
+      // HTTP body: `restarted` lives in `TurnResult.error.code`, and 409 is what it would map to
+      // if it ever did, because a turn a restart terminated is `worker_busy`'s class of conflict.
+      credential_required: 422,
+      credential_expired: 422,
+      credential_forbidden: 403,
+      insecure_transport: 403,
+      restarted: 409,
     });
     expect(Object.keys(ERROR_STATUS).sort()).toEqual([...OMNI_ERROR_CODES].sort());
     for (const code of OMNI_ERROR_CODES) {

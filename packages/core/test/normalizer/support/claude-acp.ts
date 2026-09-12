@@ -111,6 +111,25 @@ export function claudeAcpDescriptor(): RuntimeDescriptor {
       "elicitation_multi_question",
       "park_timeout_action",
     ],
+    /**
+     * M3-WP1's credential contract, transcribed from `known.ts` — where every field is a
+     * MEASUREMENT taken on this machine on 2026-09-12, not a reading of a document.
+     *
+     * `reload: "file"` is the one that matters and it is the one that was measured: with the
+     * process live and a turn already completed, the credential file was overwritten with
+     * `{"garbage":true}` and the NEXT `session/prompt` failed in 88 ms with
+     * `-32000 Authentication required`. `loginRequiredSignal: "prompt_-32000"` comes from the same
+     * run's three-way control: with no file, with a garbage file and with a valid one,
+     * `initialize.authMethods` is `[]` and `session/new` SUCCEEDS in all three.
+     */
+    credentials: {
+      homeEnv: "CLAUDE_CONFIG_DIR",
+      files: [".credentials.json"],
+      tokenEnv: "CLAUDE_CODE_OAUTH_TOKEN",
+      apiKeyEnv: "ANTHROPIC_API_KEY",
+      reload: "file",
+      loginRequiredSignal: "prompt_-32000",
+    },
   });
 }
 

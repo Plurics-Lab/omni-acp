@@ -251,6 +251,41 @@ export interface WorkerSnapshot {
   /** KEY NAMES ONLY. An env VALUE never reaches a snapshot, a log line or an HTTP body (DESIGN §8). */
   readonly envKeys?: readonly string[];
   readonly patchMode?: "off" | "on_write" | "always";
+
+  // ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md) ────────────────────────────────────
+  //
+  // OPTIONAL on the same terms as M2's rows above, and for the same reason: a `WorkerSnapshot` is
+  // built in `worker.ts`, in `rehydrated.ts`, in `boot-recovery.ts` and in a dozen test doubles.
+  // Absent reads as "this daemon has no credential layer wired", which is M2 exactly.
+
+  /**
+   * WHICH credential this worker is running on — NAME, METHOD and FINGERPRINT, and nothing else.
+   *
+   * `null` is `inherit`: the worker took the daemon's own environment, which is M2's behaviour and
+   * `credentials.allowInherit`'s default. A snapshot is served to every client that can see the
+   * worker, so the only thing here that identifies the credential is a sha256 prefix.
+   */
+  readonly credential?: {
+    readonly name: string | null;
+    readonly method: "files" | "token" | "apiKey" | "inherit" | "none";
+    readonly fingerprint: string | null;
+  } | null;
+  /**
+   * true ⇒ the LINK was re-pointed at a different credential but this PROCESS has not picked it
+   * up — a `reload:"restart"` agent whose swap landed mid-turn (`applied: "on-next-start"`).
+   *
+   * It is the field that stops `credential.fingerprint` being a lie: the fingerprint says what the
+   * worker will use, `stale` says whether it is using it yet.
+   */
+  readonly credentialStale?: boolean;
+  /**
+   * This worker's isolated home (`<dataDir>/homes/<workerId>`), or null for `home:"shared"`.
+   *
+   * E7 is why it is on the snapshot at all: the agent's session files live in there
+   * (claude `projects/`, codex `thread_history`), so a hibernate, a wake and a restart must all
+   * reuse the SAME directory, and an operator debugging a resume needs to be able to find it.
+   */
+  readonly home?: string | null;
 }
 
 export interface CloseResult {

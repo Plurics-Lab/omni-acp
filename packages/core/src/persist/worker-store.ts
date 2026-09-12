@@ -41,6 +41,9 @@ type M2Row = Pick<
   | "env"
   | "watchdog"
   | "patchMode"
+  // ── M3-WP1, on the same terms: persisted BECAUSE OF THE WAKE PATH ───────────
+  | "credentialName"
+  | "homeMode"
 >;
 
 const M2_KEYS = [
@@ -53,6 +56,8 @@ const M2_KEYS = [
   "env",
   "watchdog",
   "patchMode",
+  "credentialName",
+  "homeMode",
 ] as const satisfies readonly (keyof M2Row)[];
 
 /**

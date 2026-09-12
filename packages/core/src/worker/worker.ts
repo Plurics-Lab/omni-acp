@@ -56,6 +56,14 @@ import {
   type TokenId,
   type Watchdog,
   type WatchdogSignal,
+  // ── M3-WP1's seam and shapes ───────────────────────────────────────────────
+  RestartRequestBody,
+  SetCredentialBody,
+  type CredentialApplied,
+  type CredentialBinding,
+  type CredentialEventPayload,
+  type RestartResult,
+  type WorkerCredentialBinding,
   type OrphanRecord,
   type ResumeReport,
   type RuntimeDescriptor,
@@ -217,6 +225,20 @@ export interface CreateWorkerDeps {
    * which is M1.
    */
   readonly alertOnUnpoliced?: readonly string[];
+  /**
+   * M3-WP1's ONE seam, and it exists so that this file never touches `node:fs`.
+   *
+   * The worker has to know THREE things about its credential and no more: what it is running on
+   * (for the snapshot), whether a swap needs a new process (the descriptor's measured `reload`),
+   * and how to re-point the link. Every path decision — which `dataDir`, which token owns the
+   * name, symlink or hardlink or copy — belongs to the daemon, which is the only layer that holds
+   * a `dataDir` at all.
+   *
+   * ABSENT ⇒ M2 exactly: `WorkerSnapshot.credential` is absent, `setCredential` answers
+   * `bad_request` naming M3-WP1 (D29's honest "not implemented yet"), and `restart` still works —
+   * replacing a process needs no credential layer.
+   */
+  readonly credentials?: WorkerCredentialBinding;
 }
 
 /**
@@ -663,6 +685,35 @@ export class Worker implements WorkerHandle {
   #hibernatePromise: Promise<WorkerSnapshot> | null = null;
   /** Single-flight: five racing prompts on a hibernated worker are ONE npx cold start (§15.3). */
   #wakePromise: Promise<WorkerSnapshot> | null = null;
+  /**
+   * M3-WP1. Set SYNCHRONOUSLY before the first `await` of a restart, on `#hibernating`'s exact
+   * reasoning: between "we decided to replace the process" and "the state says starting" a
+   * `prompt()` must already see busy, or it would be admitted onto a link that is being closed.
+   */
+  #restarting = false;
+  /** Single-flight, for `#wakePromise`'s reason: two racing restarts are ONE new process. */
+  #restartPromise: Promise<RestartResult> | null = null;
+  /**
+   * M3-WP1. What this worker is running on, or null for `inherit` (M2's behaviour).
+   *
+   * Seeded from the injected binding at construction and re-read on every `relink`, so the
+   * snapshot never has to ask the filesystem.
+   */
+  #credential: CredentialBinding | null = null;
+  /**
+   * true ⇒ the LINK has moved but THIS process has not picked it up (a `reload:"restart"` agent
+   * whose swap landed mid-turn). It is what stops `credential.fingerprint` being a lie: the
+   * fingerprint says what the worker WILL use, this says whether it is using it yet.
+   */
+  #credentialStale = false;
+  /**
+   * A credential swap that could not take effect now, waiting for this turn to end.
+   *
+   * `setCredential({apply:"auto"})` on a `reload:"restart"` agent mid-turn answers
+   * `on-next-start` rather than interrupting a turn the caller did not ask to interrupt — and
+   * then it has to actually happen, which is what this flag and the hook in `#setState` are.
+   */
+  #pendingCredentialRestart = false;
   #resolveClosed!: (r: CloseResult) => void;
   readonly closed: Promise<CloseResult>;
 
@@ -682,6 +733,10 @@ export class Worker implements WorkerHandle {
     this.closed = new Promise<CloseResult>((resolve) => {
       this.#resolveClosed = resolve;
     });
+    // M3-WP1. Read ONCE at construction: the daemon resolved the credential and built the home
+    // before this object existed, and re-reading it per snapshot would make a property access a
+    // filesystem call.
+    this.#credential = deps.credentials?.current() ?? null;
     if (row === null) return;
 
     const s = row.snapshot;
@@ -701,6 +756,11 @@ export class Worker implements WorkerHandle {
     this.#wakeFailures = s.wakeFailures;
     this.#resume = s.resume;
     this.#orphan = s.orphan;
+    // M3-WP1: the row's credential view is a RECORD of what the worker ran on, and the injected
+    // binding below immediately overwrites it with what it will run on now. Both are read, in
+    // that order, so a rehydrated worker with no credential layer wired still reports the row's
+    // answer instead of losing it.
+    this.#credentialStale = s.credentialStale ?? false;
 
     if (this.#state !== "closed") return;
     // §15.6 level 3: `DELETE` after a restart returns the PERSISTED body byte-for-byte. Pre-
@@ -777,6 +837,24 @@ export class Worker implements WorkerHandle {
       // client cannot tell apart and does not need to: neither will ever cancel a turn. When one
       // IS armed, `armedAt` is the deadline it will actually fire at, never a re-derivation.
       watchdog: watchdogViewOf(this.#deps.watchdog, this.#watchdogArmedAt),
+      // ── M3-WP1 ─────────────────────────────────────────────────────────────
+      //
+      // Present only when a credential layer is wired, for the reason every other optional row
+      // here is: an M2 `toEqual` over a snapshot must not grow a key, and absent has always meant
+      // "this daemon inherits its environment". NAME, METHOD and FINGERPRINT only — a snapshot is
+      // served to every client that can see the worker.
+      ...(this.#credential === null
+        ? {}
+        : {
+            credential: {
+              name: this.#credential.name,
+              method: this.#credential.method,
+              fingerprint: this.#credential.fingerprint,
+            },
+            home: this.#credential.home,
+          }),
+      // Present only when TRUE, on `policyBlinded`'s precedent.
+      ...(this.#credentialStale ? { credentialStale: true } : {}),
     };
   }
 
@@ -827,12 +905,16 @@ export class Worker implements WorkerHandle {
     if (this.#state === "closed") {
       throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
     }
-    if (this.#state !== "ready" || this.#hibernating) {
+    if (this.#state !== "ready" || this.#hibernating || this.#restarting) {
       // §15.2: `#hibernating` is the half-open window in which the state still reads `ready` but
-      // the process is already being reclaimed. "Busy" is the honest answer for it.
+      // the process is already being reclaimed. "Busy" is the honest answer for it — and M3-WP1's
+      // `#restarting` is the identical window for the identical reason, which is why it is the
+      // same condition rather than a second check somewhere else.
       throw new OmniError(
         "worker_busy",
-        `worker ${this.#deps.workerId} is ${this.#hibernating ? "hibernating" : this.#state}`,
+        `worker ${this.#deps.workerId} is ${
+          this.#hibernating ? "hibernating" : this.#restarting ? "restarting" : this.#state
+        }`,
       );
     }
 
@@ -1317,6 +1399,462 @@ export class Worker implements WorkerHandle {
       ...(this.#crashed ? { crashed: true } : {}),
     });
     throw error;
+  }
+
+  // ── M3-WP1: restart, and the credential swap (docs/M3-WP1-CREDENTIALS.md) ──
+
+  /**
+   * Replace the PROCESS while keeping the WORKER: same id, same lease, same home, same session
+   * pointer, `generation + 1`.
+   *
+   * It is M1's reclaim + wake path with exactly TWO exceptions, and they are the whole diff:
+   *
+   *  1. the lease is KEPT. A hibernate releases it because a holder cannot control a worker with
+   *     no process and a lease held across a 30-minute sleep silently becomes permanent (§15.2
+   *     step 3). A restart is a five-second gap the holder ASKED for; releasing it would hand the
+   *     worker to whichever peer polled first, mid-rotation.
+   *  2. the home is KEPT. E7: the agent's own session files live in the home, so a restart that
+   *     rebuilt one would resume into a directory with no history — which is exactly the failure
+   *     `resume` is supposed to prevent.
+   *
+   * Everything else is shared code: `#reclaimProcess`, `#openProcess`, `SessionStrategy.reopen`
+   * and `classifyResume`'s four states.
+   */
+  async restart(body: RestartRequestBody, who: ClientRef): Promise<RestartResult> {
+    this.#deps.lease.assertHolder(who);
+    let parsed: RestartRequestBody;
+    try {
+      parsed = RestartRequestBody.parse(body);
+    } catch (e) {
+      throw OmniError.from(e, "bad_request");
+    }
+    return await this.#restartWith(parsed);
+  }
+
+  /**
+   * The lease-free entry, for the two callers that are not clients: `setCredential`'s own
+   * restart, and the deferred one that fires when a turn ends.
+   *
+   * Deliberately NOT lease-gated, on `cancelInternal`'s exact reasoning: the lease governs
+   * CLIENTS, and a restart the worker decided to do on behalf of a `setCredential` that WAS gated
+   * is not a second client asking.
+   */
+  async #restartWith(o: RestartRequestBody): Promise<RestartResult> {
+    const inflight = this.#restartPromise;
+    if (inflight !== null) return await inflight;
+
+    if (this.#state === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
+    // A wake and a restart are the same operation from `hibernated`: there is no process to
+    // replace, so the honest answer is to start one. It is reported with the wake's own
+    // `ResumeReport`, and `generation` still advances by exactly one.
+    if (this.#state === "starting" || this.#hibernating) {
+      throw new OmniError(
+        "worker_busy",
+        `worker ${this.#deps.workerId} is ${this.#hibernating ? "hibernating" : "starting"}`,
+      );
+    }
+    const live = this.#state === "running" || this.#state === "requires_action";
+    if (live && o.force !== true) {
+      // §restart: running without `force` is a 409. A restart that silently cut a turn short
+      // would make `TurnResult` a coin flip on the caller's timing.
+      throw new OmniError(
+        "worker_busy",
+        `worker ${this.#deps.workerId} is ${this.#state}; pass force:true to restart through a live turn`,
+      );
+    }
+
+    const fresh = o.fresh === true;
+    const wantsResume = o.resume !== false && !fresh;
+    if (wantsResume) {
+      const method = this.#capabilities?.resume.method ?? null;
+      if (method === null || this.#sessionId === null) {
+        // §restart's own 422 row, and it is raised BEFORE the process is reclaimed: an agent that
+        // cannot resume would otherwise lose a healthy session to a restart that then could not
+        // reopen it. `fresh:true` is the caller saying they accept exactly that.
+        throw new OmniError(
+          "not_resumable",
+          method === null
+            ? `worker ${this.#deps.workerId} cannot be restarted with resume: the agent advertises no resume spelling. Pass fresh:true to start a new session instead`
+            : `worker ${this.#deps.workerId} has no session pointer to resume. Pass fresh:true to start a new session instead`,
+        );
+      }
+    }
+
+    // SYNCHRONOUS, before the first await (`#hibernating`'s reason).
+    this.#restarting = true;
+    this.#restartPromise = this.#doRestart(o, { live, fresh });
+    try {
+      return await this.#restartPromise;
+    } finally {
+      this.#restartPromise = null;
+      this.#restarting = false;
+    }
+  }
+
+  async #doRestart(
+    o: RestartRequestBody,
+    ctx: { live: boolean; fresh: boolean },
+  ): Promise<RestartResult> {
+    const startedAt = this.#deps.clock.now();
+    const wasHibernated = this.#state === "hibernated";
+    const terminatedTurn = ctx.live ? this.#currentTurnId : null;
+
+    /**
+     * §19.8's rule, on this path too: every parked request is settled with a REAL answer on the
+     * wire BEFORE the process goes away. An agent blocked on our answer may never read the stdin
+     * EOF, and a log that ends on a `pending` interaction is a log that lies.
+     */
+    await this.#settleInteractions("cancel");
+
+    this.#logger.info("restarting", {
+      reason: o.reason ?? null,
+      force: o.force === true,
+      fresh: ctx.fresh,
+      terminatedTurn,
+    });
+
+    // Timers to zero (§restart), and the seams with them — the same block hibernate runs, for the
+    // same reason (review R15): a watchdog that outlives the process it was watching fires
+    // `cancelInternal` on a link that no longer exists. The next `prompt()` re-arms both, which is
+    // exactly what a wake already relies on.
+    this.#tickTimer?.cancel();
+    this.#tickTimer = null;
+    this.#cancelTimer?.cancel();
+    this.#cancelTimer = null;
+    this.#exitGraceTimer?.cancel();
+    this.#exitGraceTimer = null;
+    this.#disposeSeams();
+
+    /**
+     * THE ENVELOPE THAT TERMINATES THE TURN, and it is the whole of §restart's "不合成 idle".
+     *
+     * It is appended with the terminated turn's `turnId` so `reduceTurn` folds it INTO that turn
+     * — which is what makes `TurnResult.stopReason: null`, `error.code: "restarted"` and the
+     * in-flight tool calls land in `strandedToolCalls`. Synthesizing `state_update{idle}` instead
+     * would have told every reducer, every SSE subscriber and every `GET /turns/{id}` that the
+     * agent finished normally.
+     *
+     * It goes on the log BEFORE the process is reclaimed, so a subscriber learns the cause before
+     * the consequence (§7.3's ordering, and `#doClose`'s).
+     */
+    this.#currentTurnId = null;
+    this.#unpinLease();
+    this.#state = "starting";
+    this.#setState("starting", "restart", {
+      turnId: terminatedTurn,
+      generation: this.#generation,
+      ...(this.#crashed ? { crashed: true } : {}),
+      ...(terminatedTurn === null
+        ? {}
+        : {
+            error: {
+              code: "restarted",
+              message:
+                o.reason === undefined
+                  ? "the worker was restarted while this turn was running"
+                  : `the worker was restarted while this turn was running: ${o.reason}`,
+            },
+          }),
+    });
+
+    // A forced restart skips the cooperative close-out: the caller asked to interrupt, and
+    // draining a turn we are about to abandon only delays the new process. An IDLE restart gets
+    // the courtesy, exactly as a hibernate does.
+    if (!wasHibernated) {
+      if (!ctx.live) await this.#runCloseOut(this.#deps.limits.closeOutMs ?? DEFAULT_CLOSE_OUT_MS);
+      await this.#reclaimProcess({ force: ctx.live });
+    }
+
+    // The credential swap, if one was asked for, lands while NO process is running — which is the
+    // only moment at which a `reload:"restart"` agent can be given a new credential without a
+    // window in which the link points at one file and the process holds another.
+    if (o.credential !== undefined) {
+      await this.#relinkCredential(o.credential);
+      this.#credentialStale = false;
+    }
+
+    const budgetMs =
+      o.timeoutMs ?? this.#deps.limits.wakeTimeoutMs ?? this.#deps.limits.handshakeTimeoutMs;
+    let resume: RestartResult["resume"];
+    try {
+      const link = await this.#openProcess();
+      if (ctx.fresh) {
+        // A NEW session, deliberately: the pointer is replaced and the conversation is gone. It is
+        // only reachable through an explicit `fresh:true`, because losing a session silently is
+        // the trap ruling M1-R7 refuses for every other path.
+        const opened = await this.#openFreshSession(link, budgetMs);
+        this.#capabilities = opened.capabilities;
+        this.#sessionId = opened.sessionId;
+        this.#resume = null;
+        resume = { outcome: "fresh" };
+      } else {
+        const opened = await this.#reopenSession(link, budgetMs);
+        this.#capabilities = opened.capabilities;
+        this.#sessionId = opened.sessionId;
+        this.#resume = opened.resume;
+        resume = opened.resume ?? { outcome: "fresh" };
+      }
+    } catch (e) {
+      return await this.#restartFailed(OmniError.from(e, "agent_error"));
+    }
+
+    this.#seedConfigOptions();
+    this.#generation += 1;
+    this.#wakeFailures = 0;
+    this.#hibernatedAt = null;
+    this.#credentialStale = false;
+    this.#deps.log.setSessionId(this.#sessionId as SessionId);
+    this.#setState("ready", ctx.fresh ? "handshake_ok" : "resumed", {
+      turnId: null,
+      generation: this.#generation,
+      ...(this.#resume === null ? {} : { resume: this.#resume }),
+      ...(this.#crashed ? { crashed: true } : {}),
+    });
+
+    return {
+      generation: this.#generation,
+      pid: this.#proc?.pid ?? null,
+      resume,
+      sessionId: this.#sessionId,
+      terminatedTurn,
+      elapsedMs: this.#deps.clock.now() - startedAt,
+    };
+  }
+
+  /**
+   * §restart's failure half, and it differs from a WAKE's on one deliberate point.
+   *
+   * A failed wake with `rejected_permanent` CLOSES the worker (§15.5): the caller asked for a live
+   * process, there can never be one, and a row that answers 422 forever on every prompt is a row
+   * an operator has to reap by hand. A failed RESTART leaves the worker `hibernated` instead,
+   * which is what §restart asks for — the worker was alive a moment ago, the operator still holds
+   * its lease, and the next prompt gets to try the wake path (and close it there if that fails
+   * too). The pointer is KEPT, because §15.1 invariant 1 requires a `hibernated` worker to have
+   * one; abandoning it here would make the state table false.
+   */
+  async #restartFailed(error: OmniError): Promise<never> {
+    await this.#reclaimProcess({ force: true });
+    const resume = error.resume ?? null;
+    if (resume !== null) this.#resume = resume;
+    this.#wakeFailures += 1;
+    this.#hibernatedAt = this.#deps.clock.iso();
+    this.#setState("hibernated", "wake_retry", {
+      turnId: null,
+      generation: this.#generation,
+      error: error.toBody(),
+      ...(resume === null ? {} : { resume }),
+      ...(this.#crashed ? { crashed: true } : {}),
+    });
+    throw error;
+  }
+
+  /** `SessionStrategy.reopen` inside the replay window — the same call `#doWake` makes. */
+  async #reopenSession(link: AcpLink, budgetMs: number): Promise<SessionOpenResult> {
+    const strategy = this.#deps.session;
+    const sessionId = this.#sessionId;
+    if (strategy === undefined || sessionId === null) {
+      throw new OmniError(
+        "not_resumable",
+        `worker ${this.#deps.workerId} has no session pointer to resume`,
+      );
+    }
+    const controls: SessionReopenOptions["controls"] & { replayCounts(): ReplayCounts } = {
+      replayWindow: () => this.#openReplayWindow(),
+      replayCounts: () => ({ events: this.#replayEvents, dropped: 0 }),
+    };
+    return await this.#withReplayWindow(() =>
+      strategy.reopen(this.#asLinkLike(link), {
+        cwd: this.#deps.cwd,
+        descriptor: this.#runtime(),
+        mcpServers: this.#deps.mcpServers ?? [],
+        ...(this.#deps.clientCapabilities === undefined
+          ? {}
+          : { clientCapabilities: this.#deps.clientCapabilities }),
+        budgetMs,
+        sessionId,
+        capabilities: this.#capabilities,
+        controls,
+      }),
+    );
+  }
+
+  /** `fresh:true`'s half: a brand-new session through the SAME code `start()` uses. */
+  async #openFreshSession(
+    link: AcpLink,
+    budgetMs: number,
+  ): Promise<{ capabilities: AgentCapabilitiesSnapshot; sessionId: SessionId }> {
+    const strategy = this.#deps.session;
+    if (strategy === undefined) {
+      return await runHandshake(link, {
+        cwd: this.#deps.cwd,
+        timeoutMs: budgetMs,
+        clock: this.#deps.clock,
+        ...(this.#deps.clientCapabilities === undefined
+          ? {}
+          : { clientCapabilities: this.#deps.clientCapabilities }),
+      });
+    }
+    return await strategy.open(this.#asLinkLike(link), {
+      cwd: this.#deps.cwd,
+      descriptor: this.#runtime(),
+      mcpServers: this.#deps.mcpServers ?? [],
+      ...(this.#deps.clientCapabilities === undefined
+        ? {}
+        : { clientCapabilities: this.#deps.clientCapabilities }),
+      budgetMs,
+    });
+  }
+
+  /**
+   * Re-point this worker's home at a different stored credential.
+   *
+   * The LINK moves whatever `apply` says, and it moves ATOMICALLY (the manager's `rename`), so
+   * there is no instant at which the home holds a half-written credential. What `apply` decides is
+   * only whether a new PROCESS is started, and the descriptor's MEASURED `reload` is what makes
+   * that decision honest: claude-acp re-reads the file per request (so nothing more is needed) and
+   * codex-acp caches it at startup (so nothing less than a restart works).
+   */
+  async setCredential(body: SetCredentialBody, who: ClientRef): Promise<CredentialApplied> {
+    this.#deps.lease.assertHolder(who);
+    if (this.#state === "closed") {
+      throw new OmniError("worker_closed", `worker ${this.#deps.workerId} is closed`);
+    }
+    let parsed: SetCredentialBody;
+    try {
+      parsed = SetCredentialBody.parse(body);
+    } catch (e) {
+      throw OmniError.from(e, "bad_request");
+    }
+    const binding = this.#deps.credentials;
+    if (binding === undefined) {
+      // D29's honest "not implemented yet" rather than a 500 (the M1 Land precedent S8): a daemon
+      // assembled with no credential layer has nowhere to put a credential.
+      throw new OmniError(
+        "bad_request",
+        "this daemon was built without a credential store (M3-WP1)",
+      );
+    }
+
+    const previous = this.#credential?.fingerprint ?? null;
+    const apply = parsed.apply ?? "auto";
+    const live = this.#state === "running" || this.#state === "requires_action";
+
+    // `restart` is checked BEFORE the link moves: a caller that asked to force a restart through a
+    // live turn and got a 409 must find its credential unchanged, or the refusal is a half-applied
+    // operation wearing an error code.
+    if (apply === "restart" && live) {
+      throw new OmniError(
+        "worker_busy",
+        `worker ${this.#deps.workerId} is ${this.#state}; restart it with force:true to swap the credential mid-turn`,
+      );
+    }
+
+    const next = await this.#relinkCredential(parsed.credential);
+
+    let applied: CredentialApplied["applied"];
+    if (apply === "defer") {
+      applied = "deferred";
+      // The link has moved and the process has not: that IS stale, whatever the reload mode, and
+      // a `reload:"file"` agent clears it on its very next request anyway.
+      this.#credentialStale = binding.reload === "restart";
+    } else if (binding.reload === "file" && apply === "auto") {
+      // MEASURED (claude-acp 0.73.0): the credential file is consulted per request, so the next
+      // prompt already uses the new one and there is nothing to restart.
+      applied = "immediate";
+      this.#credentialStale = false;
+    } else if (live) {
+      // MEASURED (codex-acp 1.8.0): the process cached the credential, so this one will keep using
+      // the old one until it is replaced. We do NOT interrupt a turn the caller did not ask to
+      // interrupt — `apply:"restart"` is how they ask, and it 409s above.
+      applied = "on-next-start";
+      this.#credentialStale = true;
+      this.#pendingCredentialRestart = true;
+    } else {
+      // Idle, and the credential needs a new process: do it now, with `force` irrelevant because
+      // nothing is running.
+      this.#credentialStale = true;
+      await this.#restartWith({ reason: `credential ${parsed.credential}` });
+      applied = "restarted";
+      this.#credentialStale = false;
+    }
+
+    this.#appendCredentialEvent({
+      op: "set",
+      credential: next.name,
+      method: next.method,
+      fingerprint: next.fingerprint,
+      applied,
+      generation: this.#generation,
+      previous,
+    });
+
+    return {
+      credential: { name: next.name, method: next.method, fingerprint: next.fingerprint },
+      applied,
+      generation: this.#generation,
+      previous,
+    };
+  }
+
+  /** The one call site of `WorkerCredentialBinding.relink`, so `#credential` has one writer. */
+  async #relinkCredential(name: string): Promise<CredentialBinding> {
+    const binding = this.#deps.credentials;
+    if (binding === undefined) {
+      throw new OmniError(
+        "bad_request",
+        "this daemon was built without a credential store (M3-WP1)",
+      );
+    }
+    const next = await binding.relink(name);
+    this.#credential = next;
+    return next;
+  }
+
+  /**
+   * The audit envelope, and the reason it exists at all: a credential swap is INVISIBLE in every
+   * other stream. On a `reload:"file"` agent no process restarts and no state changes, so an
+   * operator reading the log would see a turn start answering as somebody else with nothing in
+   * between saying why (DESIGN §8's 审计 row).
+   *
+   * FINGERPRINT ONLY. It never throws, on `#appendCloseError`'s reasoning: a swap that cannot be
+   * audited has still happened, and throwing here would report a failure for an operation that
+   * succeeded.
+   */
+  #appendCredentialEvent(payload: CredentialEventPayload): void {
+    try {
+      this.#deps.log.append({
+        kind: "omni.credential",
+        payloadVersion: 2,
+        turnId: this.#currentTurnId,
+        payload,
+      });
+    } catch (e) {
+      this.#logger.warn("appending an omni.credential envelope failed", { error: String(e) });
+    }
+  }
+
+  /**
+   * `applied: "on-next-start"`'s other half — the restart that was promised has to happen.
+   *
+   * Called from `#setState` on every transition INTO `ready`, which is the first moment a
+   * `reload:"restart"` agent can be replaced without cutting a turn short. It is fire-and-forget
+   * and it swallows its own failure: the worker is already `ready` with a working (if stale)
+   * credential, and turning a deferred rotation into an unhandled rejection would be worse than
+   * leaving `credentialStale: true` on the snapshot for the operator to see.
+   */
+  #drainPendingCredentialRestart(): void {
+    if (!this.#pendingCredentialRestart) return;
+    this.#pendingCredentialRestart = false;
+    void this.#restartWith({ reason: "deferred credential swap" }).then(
+      () => {
+        this.#credentialStale = false;
+      },
+      (e: unknown) => {
+        this.#logger.warn("the deferred credential restart failed", { error: String(e) });
+      },
+    );
   }
 
   /** `#state`, UNNARROWED — for a caller reading it back after an `await` (see `setConfig`). */
@@ -2650,6 +3188,11 @@ export class Worker implements WorkerHandle {
         this.#logger.error("onStateChange listener threw", { error: String(e) });
       }
     }
+
+    // M3-WP1. AFTER the listeners, so the registry has already persisted the row and every
+    // subscriber has already seen `ready` before a deferred rotation replaces the process. It is
+    // a no-op unless a `setCredential` actually deferred one, which is every other transition.
+    if (next === "ready" && !this.#restarting) this.#drainPendingCredentialRestart();
   }
 
   // ── construction ───────────────────────────────────────────────────────────

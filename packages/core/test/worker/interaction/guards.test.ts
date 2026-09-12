@@ -64,7 +64,7 @@ function elicitationPath(sources: readonly { path: string; text: string }[]): {
 }
 
 /**
- * The ONE exemption, and it is a different OBJECT rather than a different opinion.
+ * The exemptions, and each one is a different OBJECT rather than a different opinion.
  *
  * `InteractionAnswerBody` is the daemon's OWN control-plane body — what a human POSTs to
  * `…/interactions/{reqId}` — declared in `@omni-acp/protocol` and containing not one agent byte.
@@ -73,18 +73,32 @@ function elicitationPath(sources: readonly { path: string; text: string }[]): {
  * schema over our own request body strips nothing of the sort.
  *
  * It is parsed inside `Worker.answerInteraction` because §19.6 puts the body SHAPE check AFTER
- * the lease, and that is the one place downstream of it (review finding V10). The exemption names
- * the schema, so it cannot silently widen to "any parse on this line": the planted-violation test
- * below pins that a second parse on the same line is still caught.
+ * the lease, and that is the one place downstream of it (review finding V10).
+ *
+ * M3-WP1 adds TWO MORE OF THE SAME OBJECT, not a widening: `SetCredentialBody` and
+ * `RestartRequestBody` are also the daemon's own control-plane bodies, also declared in
+ * `@omni-acp/protocol`, and also parsed in `worker.ts` — because `WorkerHandle` is reachable
+ * in-process through `registry.get()` and an embedder's typo must be a `bad_request` rather than
+ * a path join over `undefined`. Neither carries an agent byte, and neither is on the elicitation
+ * path in any sense except that it lives in the same 2900-line file.
+ *
+ * EVERY exemption NAMES ITS SCHEMA, so the list cannot silently widen to "any parse on this
+ * line": the planted-violation test below pins that a second parse on the same line is still
+ * caught, and it is run against each of the three.
  */
-const ANSWER_BODY_PARSE = /\bInteractionAnswerBody\s*\.\s*parse\s*\(/;
+const OWN_BODY_PARSES: readonly RegExp[] = [
+  /\bInteractionAnswerBody\s*\.\s*parse\s*\(/,
+  /\bSetCredentialBody\s*\.\s*parse\s*\(/,
+  /\bRestartRequestBody\s*\.\s*parse\s*\(/,
+];
 
 /** A schema parse: `z.object(`, `z.strictObject(`, or any `.parse(` / `.safeParse(` call. */
 function schemaParses(text: string): string[] {
   const hits: string[] = [];
   const lines = text.split("\n");
   for (const [i, line] of lines.entries()) {
-    const rest = line.replace(ANSWER_BODY_PARSE, "");
+    let rest = line;
+    for (const own of OWN_BODY_PARSES) rest = rest.replace(own, "");
     // Comments count too: the guard is byte-wise on purpose. A file that has to WRITE one of
     // these words in prose is a file whose prose belongs somewhere else — the same ruling
     // `policy-never-names-an-option` got (M2-R16, review follow-up 7).
@@ -186,13 +200,14 @@ describe("guard: no-elicitation-schema-parse (§19.3, §27.4)", () => {
     // …and on the exact line the ruling forbids, in a comment as well as in code (byte-wise).
     expect(schemaParses("// a z.object( here would be a violation too")).toHaveLength(1);
 
-    // The ONE exemption is a NAMED schema and nothing wider: our own control-plane answer body
-    // passes, and a second parse on the very same line is still caught. Without this, the
-    // exemption added for review finding V10 would be a hole any parse could be smuggled through.
-    expect(schemaParses("parsed = InteractionAnswerBody.parse(a);")).toEqual([]);
-    expect(
-      schemaParses("InteractionAnswerBody.parse(a); const p = Elicit.parse(params);"),
-    ).toHaveLength(1);
+    // EVERY exemption is a NAMED schema and nothing wider: our own control-plane bodies pass,
+    // and a second parse on the very same line is still caught. Without this, the exemption added
+    // for review finding V10 would be a hole any parse could be smuggled through — and M3-WP1's
+    // two additions are held to the same test rather than being taken on trust.
+    for (const own of ["InteractionAnswerBody", "SetCredentialBody", "RestartRequestBody"]) {
+      expect(schemaParses(`parsed = ${own}.parse(a);`)).toEqual([]);
+      expect(schemaParses(`${own}.parse(a); const p = Elicit.parse(params);`)).toHaveLength(1);
+    }
   });
 });
 

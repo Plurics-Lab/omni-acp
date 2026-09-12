@@ -65,6 +65,16 @@ export function armRetention(o: {
   config: ResolvedDaemonConfig;
   clock: Clock;
   logger: Logger;
+  /**
+   * M3-WP1's HOME sweep, rid[d]en on the SAME timer (§Home 隔离: close + retention 后删除).
+   *
+   * It is the same timer rather than a second one for the reason the timer is rearmed rather than
+   * an interval: two timers over the same worker rows is two answers to "is this worker retired",
+   * and the one that ran second would find a home whose row the first had already dropped.
+   *
+   * Absent ⇒ nothing sweeps homes, which is M2 (there were none).
+   */
+  homes?: (nowMs: number) => Promise<void>;
 }): RetentionTimer {
   let last: RetentionReport | null = null;
   let timer: TimerHandle | null = null;
@@ -87,9 +97,18 @@ export function armRetention(o: {
   };
 
   const arm = (): void => {
-    if (stopped || o.persistence === null) return;
+    // `persistence === null` is the MEMORY driver: there are no rows to sweep — but there may
+    // still be homes, because `home: "isolated"` does not depend on a database. So the timer is
+    // armed whenever either half has work.
+    if (stopped || (o.persistence === null && o.homes === undefined)) return;
     timer = o.clock.setTimer(o.config.eventLog.retentionSweepMs, () => {
       sweepNow();
+      // AFTER the row sweep, deliberately: a worker whose row has just been dropped is a home
+      // nothing can ever read again, and running the home sweep first would leave it for a whole
+      // `retentionSweepMs`. It never throws — `sweepNow`'s rule — and it never blocks the rearm.
+      void o.homes?.(o.clock.now()).catch((e: unknown) => {
+        o.logger.warn("the worker-home retention sweep failed", { error: String(e) });
+      });
       arm();
     });
   };

@@ -70,6 +70,12 @@ export const DEFAULT_V1_PROFILE: RuntimeDescriptor = {
   },
   /** Nothing has been verified against a real agent for a profile that describes no agent. */
   unverified: [],
+  /**
+   * M3-WP1. A runtime we have never seen has no credential contract we may claim, so a worker on
+   * this profile INHERITS the daemon's environment — which is M2's behaviour exactly, and what
+   * `credentials.allowInherit: true` keeps as the default.
+   */
+  credentials: null,
 };
 
 /**
@@ -288,6 +294,34 @@ const CLAUDE_ACP: RuntimeDescriptor = {
     turnMs: 600_000,
   },
   unverified: [...CLAUDE_ACP_UNVERIFIED],
+  /**
+   * M3-WP1's credential contract, and every row is MEASURED on this machine (2026-09-12).
+   *
+   * E1: `CLAUDE_CONFIG_DIR=<dir>` with a `.credentials.json` inside it is sufficient for a
+   * complete turn; the agent then creates `.claude.json`, `projects/`, `sessions/` and `backups/`
+   * in that directory, which is E7's reason a home must be reused across hibernate/wake/restart.
+   *
+   * `reload: "file"` — MEASURED, not assumed. With the process live and a turn already completed,
+   * the credential file was overwritten with `{"garbage":true}` and the NEXT `session/prompt`
+   * failed in 88 ms with `-32000 Authentication required`. So this agent consults the file per
+   * request and a credential swap needs no new process: `setCredential` answers
+   * `applied: "immediate"`. (The experiment is `docs/M3-WP1-CREDENTIALS.md §Real-agent record`,
+   * row R1.)
+   *
+   * `loginRequiredSignal: "prompt_-32000"` — also measured, three ways: with NO credential file,
+   * with a garbage one, and with a valid one. `initialize.authMethods` is `[]` in all three and
+   * `session/new` SUCCEEDS in all three; only `session/prompt` tells them apart. An
+   * `authMethods`-based check would have called an unauthenticated agent healthy.
+   */
+  credentials: {
+    homeEnv: "CLAUDE_CONFIG_DIR",
+    files: [".credentials.json"],
+    /** E5: `claude setup-token` mints a long-lived subscription token read from this variable. */
+    tokenEnv: "CLAUDE_CODE_OAUTH_TOKEN",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    reload: "file",
+    loginRequiredSignal: "prompt_-32000",
+  },
 };
 
 /**
@@ -399,6 +433,36 @@ const CODEX_ACP: RuntimeDescriptor = {
     turnMs: 600_000,
   },
   unverified: [...CODEX_ACP_UNVERIFIED],
+  /**
+   * M3-WP1's credential contract, MEASURED on this machine (2026-09-12).
+   *
+   * E2: `CODEX_HOME=<dir>` with an `auth.json` inside it is sufficient; the agent then creates
+   * `sessions/`, `thread_history_1.sqlite`, `cache/`, `skills/` and a dozen more sqlite files in
+   * that directory — E7 again, and rather more of it than claude produces.
+   *
+   * `reload: "restart"` — MEASURED, with a control. With the process live and a turn already
+   * completed, `auth.json` was overwritten with `{"garbage":true}` and the NEXT `session/prompt`
+   * still answered `end_turn` in 2.06 s: this agent caches the credential in the process. The
+   * control rules out "the file never mattered": the SAME garbage file present from the START
+   * makes `session/new` fail `-32603 "plan type is required for chatgpt authentication"`. So a
+   * credential swap here needs a new process, and `setCredential` answers `applied: "restarted"`
+   * when the worker is idle and `"on-next-start"` when a turn is live.
+   *
+   * `loginRequiredSignal: "session_new"` — measured, and it is the row that CORRECTS E4. E4 read
+   * codex's non-empty `authMethods` as the not-logged-in signal; with a VALID credential and
+   * `NO_BROWSER=1` this agent still answers `authMethods: [api-key]`, so the array says nothing
+   * about the login. What does is `session/new`: `-32000 Authentication required` with no file,
+   * `-32603 "plan type is required…"` with a malformed one, and a session id with a good one.
+   */
+  credentials: {
+    homeEnv: "CODEX_HOME",
+    files: ["auth.json"],
+    /** E5: `codex login --with-access-token` takes the token on stdin; there is no env spelling
+     *  for a SUBSCRIPTION token, so only the api-key variable is declared here. */
+    apiKeyEnv: "CODEX_API_KEY",
+    reload: "restart",
+    loginRequiredSignal: "session_new",
+  },
 };
 
 /**

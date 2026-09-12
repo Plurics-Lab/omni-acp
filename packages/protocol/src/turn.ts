@@ -668,6 +668,41 @@ function fold(turnId: TurnId, envelopes: readonly EventEnvelope[]): Fold {
       if (f.workerId === null) f.workerId = e.workerId;
     }
 
+    /**
+     * M3-WP1's THIRD terminal, and the one reason `reduceTurn` needed a new arm at all.
+     *
+     * `restart({force:true})` interrupts a live turn by replacing the process. §7.3's rule stands
+     * — a dead agent never produces a fabricated `idle`, and we must not fabricate one either —
+     * so the `omni.worker_state{starting, reason:"restart"}` envelope IS the terminal, and the
+     * turn reports `stopReason: null` with `error.code: "restarted"`. Anything else would be a
+     * lie in one direction or the other: `idle` says the agent finished, and leaving the turn
+     * `running` forever says a `prompt()` that already returned is still going.
+     *
+     * `strandedToolCalls` then falls out of the fold below for free, because it is computed for
+     * any TERMINAL turn — which is what §restart asks for: "在飞 tool call 进 strandedToolCalls".
+     */
+    if (
+      e.kind === "omni.worker_state" &&
+      e.payload.state === "starting" &&
+      e.payload.reason === "restart"
+    ) {
+      if (f.startSeq === null) continue; // the restart precedes this turn entirely
+      if (f.workerId !== null && e.workerId !== f.workerId) continue;
+      f.terminal = "closed";
+      f.endSeq = e.seq;
+      f.stopReason = null;
+      if (f.error === null) {
+        f.error =
+          e.payload.error !== undefined
+            ? errorBody(e.payload.error)
+            : {
+                code: "restarted",
+                message: "the worker was restarted while this turn was running",
+              };
+      }
+      break;
+    }
+
     // §7.3: a turn is terminal on `state_update{idle}` for that turnId OR on ANY
     // `omni.worker_state{closed}` — a dead agent never produces a fabricated `idle`, so this
     // is what stops `prompt()` hanging forever.

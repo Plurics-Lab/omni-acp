@@ -28,6 +28,21 @@ export const OMNI_ERROR_CODES = [
   // ── M2 (§5.8.2) ───────────────────────────────────────────────────────────
   "interaction_not_found",
   "interaction_settled",
+  // ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md §线上协议) ───────────────────────────
+  //
+  // Five, and each buys something no existing code could say. `not_resumable` already means "the
+  // SESSION is gone"; a worker that cannot start because the operator never stored a credential
+  // is a different failure with a different fix, and it must be answered at CREATE rather than on
+  // the first prompt. `forbidden` already covers "not your agent"; a credential belonging to
+  // ANOTHER token is the one 403 whose message must not name the resource. `insecure_transport`
+  // is the only refusal in the repository that is about the CONNECTION rather than the request.
+  // And `restarted` is a TURN error: it never leaves an HTTP status, but `TurnResult.error.code`
+  // is an `OmniErrorCode` and a turn a restart terminated has to say so in that field.
+  "credential_required",
+  "credential_expired",
+  "credential_forbidden",
+  "insecure_transport",
+  "restarted",
 ] as const;
 export type OmniErrorCode = (typeof OMNI_ERROR_CODES)[number];
 
@@ -53,6 +68,16 @@ export const ERROR_STATUS: { readonly [C in OmniErrorCode]: number } = {
   internal: 500,
   interaction_not_found: 404,
   interaction_settled: 409,
+  // M3-WP1. `422` for both credential-absent rows, because the REQUEST is well formed and the
+  // daemon's state is what refuses it — the same reading `not_resumable` has. `403` for the two
+  // boundary rows. `409` for `restarted`: a turn a restart terminated was interrupted by a
+  // conflicting operation, which is exactly `worker_busy`'s class, and it is the status a caller
+  // would get if it ever surfaced on the wire (it does not: it lives in `TurnResult.error`).
+  credential_required: 422,
+  credential_expired: 422,
+  credential_forbidden: 403,
+  insecure_transport: 403,
+  restarted: 409,
 };
 
 /** The agent's JSON-RPC error, passed through verbatim and never reshaped. */

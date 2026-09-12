@@ -256,15 +256,51 @@ describe("resolveWorkerEnv — layering, and what reaches a snapshot", () => {
 
   it("REFUSES to overwrite the descriptor's env — the daemon's injected credentials", () => {
     // DESIGN §5.1: per-worker env 叠加在 daemon 密钥库注入的凭据之后. A client that could
-    // overwrite `ANTHROPIC_API_KEY` could point the agent at its own endpoint with the
-    // operator's token. Refused rather than ignored, for M2-R12's reason.
+    // overwrite a descriptor-supplied variable could point the agent at its own endpoint with the
+    // operator's configuration. Refused rather than ignored, for M2-R12's reason.
+    //
+    // The key moved from `ANTHROPIC_API_KEY` to `AGENT_PROFILE` in M3-WP1, and the reason is that
+    // the RULE THIS TEST IS ABOUT got weaker coverage from the old key rather than stronger:
+    // M3-WP1 put all six credential variables on `ENV_DENY_EXACT`, so `ANTHROPIC_API_KEY` is now
+    // refused one rung EARLIER (the hard deny list, before the ACL and before the descriptor
+    // check) and this assertion would have been testing the deny list instead of the descriptor
+    // rule. `AGENT_PROFILE` is the other descriptor-supplied variable in `DESCRIPTOR` and is on no
+    // list, so it reaches the check this test exists for. The credential key's own, stronger
+    // behaviour is asserted immediately below.
     const e = thrown({
-      request: { ANTHROPIC_API_KEY: "sk-attacker" },
-      allow: ["ANTHROPIC_API_KEY"],
+      request: { AGENT_PROFILE: "attacker" },
+      allow: ["AGENT_PROFILE"],
     });
     expect(e.code).toBe("bad_request");
     expect(e.message).toContain("supplied by the agent descriptor");
-    expect(e.message).not.toContain("sk-attacker");
+    expect(e.message).not.toContain("attacker");
+    expect(resolve({ request: undefined }).env["AGENT_PROFILE"]).toBe("default");
+  });
+
+  it("refuses every M3-WP1 credential variable on the HARD list, ahead of the ACL (DESIGN §8)", () => {
+    // The six that M3-WP1 added. Each is the same CLASS as `HOME`: `ANTHROPIC_API_KEY` and its
+    // three siblings are credentials the daemon's key store holds, and `CLAUDE_CONFIG_DIR` /
+    // `CODEX_HOME` are the whole home-isolation boundary in one variable — a client that could
+    // set one would be pointing the agent at a home the daemon did not build.
+    //
+    // `allow` names the key AND `extraDeny` is empty, which is the strongest form of the
+    // assertion: the hard list wins over the token's own ACL, so nothing shrinks it.
+    for (const key of [
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "CODEX_API_KEY",
+      "CLAUDE_CONFIG_DIR",
+      "CODEX_HOME",
+    ]) {
+      expect(ENV_DENY_EXACT).toContain(key);
+      const e = thrown({ request: { [key]: "sk-attacker" }, allow: [key] });
+      expect(e.code).toBe("bad_request");
+      expect(e.message).toContain("deny list");
+      expect(e.message).not.toContain("sk-attacker");
+    }
+    // And the operator's own descriptor value still reaches the agent, which is the half that
+    // makes the refusal a boundary rather than a blanket ban.
     expect(resolve({ request: undefined }).env["ANTHROPIC_API_KEY"]).toBe("sk-operator");
   });
 

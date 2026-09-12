@@ -274,6 +274,15 @@ export function resolveDescriptor(
     // one is replacing the claim, not adding to it (§18.3 makes the compat suite refuse to
     // assert these rows).
     unverified: overlay.unverified === undefined ? base.unverified : [...overlay.unverified],
+    /**
+     * M3-WP1. BUILTIN-ONLY, and deliberately so: every field of a credential contract is a
+     * MEASUREMENT (which env var relocates the home, whether the agent re-reads the file), and
+     * `RuntimeOverlay` has no spelling for one. An operator who needs a different contract is
+     * describing a different runtime, which is a builtin entry rather than a knob — and a knob
+     * here could silently point a real agent's home at a variable it does not read, which fails
+     * OPEN: the agent would fall back to the daemon's own login.
+     */
+    credentials: base.credentials ?? null,
   };
 
   // §14.6's forbidden shape can be introduced by the overlay, so the check is on the MERGED

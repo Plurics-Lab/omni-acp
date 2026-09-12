@@ -261,6 +261,20 @@ export function createCatalog(config: ResolvedDaemonConfig, o?: CatalogOptions):
     return runtimeId;
   };
 
+  /**
+   * The resolved credential contract for a configured agent, or null.
+   *
+   * It reads the descriptor the way `descriptor(id)` does, from `byId` rather than from the
+   * `AgentDescriptor` handed to `toSpawnSpec` — because the registry passes a COPY with its own
+   * `env` applied (`{...descriptor, env: …}`), and a copy carries no runtime table. The id is what
+   * survives that copy, and `resolve` is the one function that turns an id into a quirk table.
+   */
+  const credentialsOf = (id: string): NonNullable<RuntimeDescriptor["credentials"]> | null => {
+    const agent = byId.get(id);
+    if (agent === undefined) return DEFAULT_V1_PROFILE.credentials ?? null;
+    return resolve(agent, cachedProbe(id)).credentials ?? null;
+  };
+
   const entryFor = (a: AgentDescriptor): AgentCatalogEntry => {
     const probe = cachedProbe(a.id);
     return {
@@ -331,12 +345,47 @@ export function createCatalog(config: ResolvedDaemonConfig, o?: CatalogOptions):
      * `process.env` values are typed `string | undefined`; an undefined entry is dropped rather
      * than stringified into the literal `"undefined"`.
      */
-    toSpawnSpec(d: AgentDescriptor, spawnOpts: { cwd: string }): SpawnSpec {
+    toSpawnSpec(
+      d: AgentDescriptor,
+      spawnOpts: {
+        cwd: string;
+        home?: string | null;
+        credentialEnv?: Readonly<Record<string, string>>;
+      },
+    ): SpawnSpec {
       const env: Record<string, string> = {};
       for (const [key, value] of Object.entries(process.env)) {
         if (value !== undefined) env[key] = value;
       }
       for (const [key, value] of Object.entries(d.env)) env[key] = value;
+
+      /**
+       * ── M3-WP1: the credential layer, composed HERE and nowhere else ─────────────────────────
+       *
+       * `SpawnSpec.env` is documented as COMPLETE — the Supervisor adds nothing and removes
+       * nothing — so this is where the home and the credential variable have to land. A second
+       * composer somewhere else is precisely how the create path and the wake path come to spawn
+       * one worker with two different environments, which is the bug `WorkerRow.env` already
+       * exists to prevent one layer up.
+       *
+       * It goes AFTER the descriptor's own env for a reason worth stating: `descriptor.env` is
+       * trusted operator config, and an operator who pinned `CLAUDE_CONFIG_DIR` there is pinning
+       * the SHARED home — which `home: "isolated"` is a per-worker request to override. The
+       * daemon's own inherited `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are overridden for the same
+       * reason, and that is the whole point of isolation: the agent must not be able to reach the
+       * operator's `~/.claude`.
+       *
+       * A CLIENT can contribute nothing here: all six credential variables are on
+       * `ENV_DENY_EXACT`, so `CreateWorkerRequest.env` is refused BY NAME if it names one.
+       *
+       * Both fields are absent for every M2 caller, so this block is a no-op and the composition
+       * is byte-for-byte what it was.
+       */
+      const credentials = credentialsOf(d.id);
+      if (spawnOpts.home !== undefined && spawnOpts.home !== null && credentials !== null) {
+        env[credentials.homeEnv] = spawnOpts.home;
+      }
+      for (const [key, value] of Object.entries(spawnOpts.credentialEnv ?? {})) env[key] = value;
 
       return {
         command: d.command,

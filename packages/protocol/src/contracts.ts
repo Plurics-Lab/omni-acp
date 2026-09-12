@@ -20,6 +20,16 @@ import type {
 } from "./acp.js";
 import type {
   AgentCatalogEntry,
+  AgentListResponse,
+  CredentialApplied,
+  CredentialCheckBody,
+  CredentialInput,
+  CredentialListResponse,
+  CredentialPutResult,
+  CredentialSummary,
+  RestartRequestBody,
+  RestartResult,
+  SetCredentialBody,
   CreateRunRequest,
   CreateWorkerRequest,
   DaemonInfo,
@@ -79,6 +89,7 @@ import type {
   WorkerId,
 } from "./ids.js";
 import type { LeaseEventPayload, LeaseSnapshot } from "./lease.js";
+import type { LoginState, RuntimeCredentials } from "./runtime.js";
 import type { ResumeHint, ResumeOutcome, ResumeReport } from "./resume.js";
 import type { RuntimeDescriptor } from "./runtime.js";
 import type { TurnStatus, TurnWarning } from "./turn.js";
@@ -418,6 +429,23 @@ export interface WorkerRow {
   readonly env?: Readonly<Record<string, string>> | null;
   readonly watchdog?: { silentMs: number; toolMs: number; cancelTimeoutMs: number };
   readonly patchMode?: "off" | "on_write" | "always";
+  // ── M3-WP1, persisted BECAUSE OF THE WAKE PATH, exactly like the M2 rows above ─────────────
+  /**
+   * The credential NAME this worker was created with, or null for `inherit`.
+   *
+   * A worker that hibernated on a stored credential must WAKE on that credential, and the name is
+   * the only thing that can say which — the binding itself is a resolved path and a fingerprint,
+   * both of which may legitimately have changed while the worker slept (an operator rotated it,
+   * which is the whole feature).
+   */
+  readonly credentialName?: string | null;
+  /**
+   * `"isolated"` ⇒ this worker owns `<dataDir>/homes/<workerId>` and the agent's session files
+   * are in it (E7). A row that lost this would wake the worker with no `homeEnv` set at all, i.e.
+   * into the operator's own `~/.claude`, which is the one directory this work package exists to
+   * keep agents out of.
+   */
+  readonly homeMode?: "isolated" | "shared";
 }
 
 export interface RetentionReport {
@@ -1281,6 +1309,30 @@ export interface WorkerHandle {
    * `createLease` replaces `alwaysGrantedLease` — the kind of thing discovered in production.
    */
   cancelInternal(reason: "watchdog_silent" | "watchdog_tool"): Promise<void>;
+
+  // ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md §worker.setCredential / §worker.restart) ─────────────
+
+  /**
+   * Re-point this worker at a different stored credential, and do whatever the descriptor's
+   * measured `reload` says about it.
+   *
+   * Lease-gated, callable in every state except `closed` (410). The LINK moves atomically
+   * whatever `apply` says; the difference is only whether a new process is started now, after
+   * this turn, or never. One `omni.credential{op:"set"}` envelope per call, carrying a
+   * fingerprint and no secret.
+   */
+  setCredential(body: SetCredentialBody, who: ClientRef): Promise<CredentialApplied>;
+  /**
+   * Replace the PROCESS while keeping the WORKER: same id, same lease, same home, same session
+   * pointer, `generation + 1`.
+   *
+   * It reuses M1's reclaim + wake path with exactly two exceptions (§restart): the lease is KEPT
+   * rather than released, and the home is KEPT rather than rebuilt. `force` is required to
+   * interrupt a live turn, and that turn is terminated by the
+   * `omni.worker_state{starting, reason:"restart"}` envelope — NOT by a synthesized `idle`, which
+   * would tell every reducer the turn ended normally.
+   */
+  restart(body: RestartRequestBody, who: ClientRef): Promise<RestartResult>;
 }
 
 // ── daemon (WP-5 implements; testkit's stubDaemon() produces one) ────────────
@@ -1288,6 +1340,140 @@ export interface WorkerHandle {
 // These live here rather than in @omni-acp/daemon for the DAG reason above: testkit must be
 // able to hand a `Daemon` to daemon's own HTTP tests. `@omni-acp/daemon` re-exports them from
 // `src/types.ts`, which is the import path every consumer uses.
+
+// ── M3-WP1: the credential store and the home manager (daemon implements) ────
+
+/**
+ * The credential store (docs/M3-WP1-CREDENTIALS.md §凭据仓库).
+ *
+ * `<dataDir>/credentials/<tokenId>/<agentId>/<name>/`, directories `0700` and files `0600`, and
+ * the token id in the PATH is the ownership boundary rather than a field somebody has to remember
+ * to compare. Every method takes an `AuthContext` for that reason.
+ *
+ * SECRETS ONLY GO UP. Nothing here returns one: `read` exists for the daemon's own composition
+ * step and is deliberately NOT on the HTTP surface, `get` returns a `CredentialSummary`, and an
+ * admin may `list` every token's credentials and read none of their contents (§凭据仓库).
+ *
+ * It lives in `protocol` for the reason `Daemon` does: `@omni-acp/testkit` must be able to produce
+ * one for the daemon's own route tests, and `testkit -> daemon -> testkit` is not a DAG (§4).
+ */
+export interface CredentialStore {
+  /** This token's credentials; an ADMIN sees every token's, with contents still unreadable. */
+  list(auth: AuthContext): Promise<CredentialListResponse>;
+  /**
+   * `422 credential_required` for a name this token has not stored.
+   *
+   * NEVER a 404 that distinguishes "no such name here" from "somebody else's": the path is built
+   * from `auth.tokenId`, so another token's credential is not reachable at all, and a caller
+   * therefore cannot learn whether one exists. `403 credential_forbidden` is what the CREATE path
+   * answers when a worker request names one, where the distinction is about the request rather
+   * than about the store.
+   */
+  get(auth: AuthContext, agentId: string, name: string): Promise<CredentialSummary>;
+  /**
+   * Create or UPDATE IN PLACE. A repeat `PUT` on a live name rewrites the canonical file every
+   * worker's home already links to, which is why the result carries `workersAffected` and
+   * `restartRequired` rather than a bare summary.
+   *
+   * Refuses `403 insecure_transport` unless the connection is TLS or loopback: this is the one
+   * request body in the repository that carries a plaintext secret.
+   */
+  put(
+    auth: AuthContext,
+    agentId: string,
+    name: string,
+    input: CredentialInput,
+  ): Promise<CredentialPutResult>;
+  /** `409 worker_busy` while `inUseBy > 0`: a live worker's home links to the file. */
+  remove(auth: AuthContext, agentId: string, name: string): Promise<void>;
+  /** The light check by default (file present ⊕ `expiresAt`); `deep` spawns one process. */
+  check(
+    auth: AuthContext,
+    agentId: string,
+    name: string,
+    body: CredentialCheckBody,
+  ): Promise<LoginState>;
+  /**
+   * `GET /v1/agents`'s `login` row: what WOULD happen if this token created a worker for this
+   * agent right now, with no name given. Never rejects — "we could not tell" is `state:"unknown"`,
+   * because the catalogue must not break over one row.
+   */
+  loginFor(auth: AuthContext, agentId: string): Promise<LoginState>;
+}
+
+/** What a credential resolves to for ONE worker, with the secret already on disk. */
+export interface CredentialBinding {
+  readonly name: string | null;
+  readonly method: "files" | "token" | "apiKey" | "inherit" | "none";
+  readonly fingerprint: string | null;
+  /** The worker's home, or null for `home:"shared"` / `inherit`. */
+  readonly home: string | null;
+  /** The env the SPAWN needs — `{[homeEnv]: home}` plus a token/apiKey var. Never logged. */
+  readonly env: Readonly<Record<string, string>>;
+}
+
+/**
+ * The per-worker half of the credential layer, INJECTED into `Worker` so that `worker.ts` never
+ * touches `node:fs` (it holds no dataDir, and every path decision belongs to the daemon).
+ *
+ * `relink` is what `setCredential` calls: it re-points this worker's home at a different
+ * canonical file with an atomic `rename`, and returns what the worker should now report. The
+ * WORKER decides what to do about it — `reload` says whether a new process is needed.
+ */
+export interface WorkerCredentialBinding {
+  /** The descriptor's measured answer: does a swap need a new process? (`RuntimeCredentials`.) */
+  readonly reload: "file" | "restart";
+  current(): CredentialBinding;
+  /** Atomically re-point the home's credential files. Throws `OmniError` and changes nothing. */
+  relink(name: string): Promise<CredentialBinding>;
+}
+
+/**
+ * Per-worker home directories (`<dataDir>/homes/<workerId>`), 0700.
+ *
+ * E7 is the entire reason it is a separate object from the store: the agent's own session files
+ * live in the home (claude `projects/`, codex `thread_history`), so a hibernate, a wake and a
+ * restart must all reuse the SAME directory while the credential inside it may change under them.
+ */
+export interface HomeManager {
+  /** Create (or adopt) `<dataDir>/homes/<workerId>` at 0700 and return its absolute path. */
+  create(workerId: WorkerId): Promise<string>;
+  /**
+   * Point `<home>/<file>` at the store's canonical file, for every name the descriptor declares.
+   *
+   * POSIX: a SYMLINK, so the agent's own token refresh writes through to the one canonical file
+   * every worker reads (E3 — a copy would diverge the moment the agent refreshes). Windows: a
+   * hard link, and a COPY as the last resort, which is reported so nobody believes a copy
+   * refreshes. Replacing an existing link is an atomic `rename` over it.
+   */
+  link(o: {
+    readonly home: string;
+    readonly files: readonly string[];
+    readonly sourceDir: string;
+  }): Promise<{
+    readonly mode: "symlink" | "hardlink" | "copy";
+    readonly files: readonly string[];
+  }>;
+  /** Remove every credential file from a home WITHOUT touching the agent's session files. */
+  unlink(o: { readonly home: string; readonly files: readonly string[] }): Promise<void>;
+  remove(workerId: WorkerId): Promise<void>;
+  /**
+   * The retention sweep: delete the home of every worker that is closed and older than
+   * `credentials.homeRetentionDays`, plus any home whose worker row is gone entirely.
+   */
+  sweep(o: {
+    readonly nowMs: number;
+    readonly retentionDays: number;
+    readonly keep: ReadonlySet<WorkerId>;
+    readonly closedAtMs: ReadonlyMap<WorkerId, number>;
+  }): Promise<{ readonly removed: readonly WorkerId[] }>;
+}
+
+/** What the daemon resolved a `CreateWorkerRequest.credential` to, with its home already built. */
+export interface ResolvedWorkerCredential {
+  readonly binding: CredentialBinding;
+  readonly credentials: RuntimeCredentials | null;
+}
 
 export interface AuthContext {
   readonly tokenId: TokenId;
@@ -1395,14 +1581,46 @@ export interface WorkerRegistry {
   interactions(id: WorkerId, auth: AuthContext): InteractionListResponse;
   /** H24: `200 SetConfigResponse`. */
   setConfig(id: WorkerId, auth: AuthContext, body: SetConfigBody): Promise<SetConfigResponse>;
+
+  // ── M3-WP1 façade rows, same rule: parse -> ONE call -> serialize ──────────
+
+  /** `PUT /v1/workers/{wid}/credential` → `200 CredentialApplied`. Lease-gated; `410` when closed. */
+  setCredential(
+    id: WorkerId,
+    auth: AuthContext,
+    body: SetCredentialBody,
+  ): Promise<CredentialApplied>;
+  /**
+   * `POST /v1/workers/{wid}/restart` → `200 RestartResult`.
+   *
+   * `409 worker_busy` for a live turn without `force`, `422 not_resumable` for an agent that
+   * cannot resume and no `fresh:true`, `423 lease_held` for a non-holder, `410` when closed.
+   */
+  restart(id: WorkerId, auth: AuthContext, body: RestartRequestBody): Promise<RestartResult>;
 }
 
 export interface Catalog {
   list(): readonly AgentCatalogEntry[];
   /** Throws bad_request(`unknown agent "<id>"`). */
   get(id: string): AgentDescriptor;
-  /** Descriptor + cwd -> SpawnSpec. The ONLY producer of SpawnSpec. */
-  toSpawnSpec(d: AgentDescriptor, o: { cwd: string }): SpawnSpec;
+  /**
+   * Descriptor + cwd -> SpawnSpec. The ONLY producer of SpawnSpec.
+   *
+   * M3-WP1 widens the options by two OPTIONAL fields rather than composing the credential
+   * environment somewhere else: `SpawnSpec.env` is documented as complete, and a second composer
+   * is how the wake path comes to spawn an agent with a different environment than the create
+   * path did. `home` becomes `env[credentials.homeEnv]`; `credentialEnv` is the token / apiKey
+   * variable the descriptor declares. Both are absent for every M2 caller, and a two-field
+   * options object is still assignable to the one-field shape every existing double accepts.
+   */
+  toSpawnSpec(
+    d: AgentDescriptor,
+    o: {
+      cwd: string;
+      home?: string | null;
+      credentialEnv?: Readonly<Record<string, string>>;
+    },
+  ): SpawnSpec;
   /** Merged builtin ⊕ config ⊕ cached-probe descriptor. NEVER throws; falls back to the v1 profile. */
   descriptor(id: string): RuntimeDescriptor;
   /** H16. `auth.assertAgent(id)` FIRST, so a forbidden agent 403s before a process exists. */
@@ -1425,6 +1643,13 @@ export interface Daemon {
   readonly url: string | null;
   readonly workers: WorkerRegistry;
   readonly catalog: Catalog;
+  /**
+   * `GET /v1/agents`, and it is a DAEMON method rather than `catalog.list()` because M3-WP1's
+   * `login` row is per TOKEN: the probe is a shared, cached fact about the binary, and "am I
+   * logged in" is a fact about the caller's credential. Reading the store is I/O, which is why it
+   * is async and why the route calls this instead of composing two answers itself.
+   */
+  agents(auth: AuthContext): Promise<AgentListResponse>;
   readonly supervisor: Supervisor;
   /**
    * M2-B (D9). Always present; with no dispatcher wired every verb answers `bad_request` naming
@@ -1440,6 +1665,12 @@ export interface Daemon {
    * wired every verb answers `bad_request` naming M2-B-WP-R — D29's honest "not implemented yet".
    */
   readonly dispatcher: WebhookDispatcher;
+  /**
+   * M3-WP1. Always present, on the `dispatcher` precedent: a `Daemon` that grew and lost a member
+   * between milestones is the shape §5.8.6 forbids. With no credential layer wired every verb
+   * answers `bad_request` naming M3-WP1 — D29's honest "not implemented yet".
+   */
+  readonly credentials: CredentialStore;
 
   /**
    * The in-process entry to everything `AuthContext` gates (D15's library-first path).
@@ -1496,4 +1727,8 @@ export interface DaemonDeps {
   /** M2-B, D9. Absent ⇒ `POST /v1/runs` answers `400 unknown route` (the M1 Land precedent S8). */
   readonly webhooks?: WebhookDispatcher;
   readonly runs?: RunRegistry;
+  /** M3-WP1. Absent ⇒ `createDaemon` builds the real store under `<dataDir>/credentials`. */
+  readonly credentials?: CredentialStore;
+  /** M3-WP1. Absent ⇒ `createDaemon` builds the real manager under `<dataDir>/homes`. */
+  readonly homes?: HomeManager;
 }

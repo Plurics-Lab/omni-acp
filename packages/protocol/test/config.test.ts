@@ -145,6 +145,16 @@ describe("DaemonConfig", () => {
       },
       run: { maxConcurrent: 16, maxDurationMs: 3_600_000, retentionDays: 30 },
       envDeny: [],
+      /**
+       * M3-WP1. Every default here keeps M2's behaviour byte for byte, which is the whole
+       * compatibility argument for the work package: inheritance stays ALLOWED (so a worker with
+       * no stored credential runs on the daemon's environment, exactly as it did), and an
+       * insecure transport stays refused for a credential WRITE only — a request M2 had no way to
+       * make. `homeRetentionDays: 1` is deliberately shorter than `eventLog.retentionDays: 7`: a
+       * home holds the agent's caches and can be large, and an operator who keeps a week of LOGS
+       * has not asked to keep a week of `node_modules`-sized agent state.
+       */
+      credentials: { allowInherit: true, allowInsecureTransport: false, homeRetentionDays: 1 },
     });
   });
 

@@ -69,6 +69,25 @@ describe("GET /v1/agents does not serve credentials (H4, DESIGN §8)", () => {
         // Which quirk table WILL govern a worker created now (§5.1 AgentCatalogEntry): the
         // agent id, then 12 hex characters of the real sha256 over command ⊕ args ⊕ version.
         runtimeId: expect.stringMatching(/^claude@[0-9a-f]{12}$/) as unknown as string,
+        /**
+         * M3-WP1's `login` row: whether THIS TOKEN can log this agent in right now.
+         *
+         * `unknown` here, and that is the honest answer twice over: this agent's command is
+         * `process.execPath` with no builtin profile, so it declares no credential contract at
+         * all — and even for one that did, no credential is stored in this daemon's data dir.
+         *
+         * It is asserted with `toEqual` over the WHOLE entry on purpose, which is what makes this
+         * test the leak guard it claims to be: a future field that carried a secret would have to
+         * be reconciled here rather than being silently served.
+         */
+        login: {
+          state: "unknown",
+          method: "inherit",
+          credential: null,
+          checkedAt: expect.stringMatching(/^\d{4}-/) as unknown as string,
+          deep: false,
+          detail: "this runtime declares no credential contract; a worker inherits the environment",
+        },
       },
     ]);
     // Belt and braces: the secret must not appear ANYWHERE in the response bytes.

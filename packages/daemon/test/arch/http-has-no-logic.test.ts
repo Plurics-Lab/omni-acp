@@ -171,6 +171,9 @@ describe("guard: http-has-no-logic", () => {
       // which is M1's routes split reused unchanged — and every one of them is covered by the
       // same guard, recursively, which is what this list exists to keep true.
       "routes/config.ts",
+      // M3-WP1's seven routes, in the same shape and under the same guard, recursively — which is
+      // what this list exists to keep true.
+      "routes/credentials.ts",
       "routes/index.ts",
       "routes/interactions.ts",
       "routes/lease.ts",

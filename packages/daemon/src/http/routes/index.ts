@@ -4,6 +4,7 @@ import type { Daemon } from "../../types.js";
 import { authMiddleware, authOf } from "../auth-middleware.js";
 import { registerAgentRoutes } from "./agents.js";
 import { registerConfigRoutes } from "./config.js";
+import { registerCredentialRoutes } from "./credentials.js";
 import { registerInteractionRoutes } from "./interactions.js";
 import { registerLeaseRoutes } from "./lease.js";
 import { registerRunRoutes } from "./runs.js";
@@ -51,6 +52,9 @@ export function registerRoutes(app: Hono, daemon: Daemon): Hono {
   registerConfigRoutes(app, daemon);
   registerRunRoutes(app, daemon);
   registerWebhookRoutes(app, daemon);
+  // M3-WP1's seven (§线上协议). Its OWN module beside `workers.ts`, which is the same split M1 cut
+  // and M2 reused: a work package adds routes without editing a frozen file.
+  registerCredentialRoutes(app, daemon);
 
   return app;
 }

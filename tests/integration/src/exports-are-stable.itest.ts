@@ -485,6 +485,16 @@ const EXPECTED: Record<string, readonly string[]> = {
     "ContentBlockLoose",
     "CreateRunRequest",
     "CreateWorkerRequest",
+    // ── M3-WP1's five runtime values (docs/M3-WP1-CREDENTIALS.md §线上协议) ────────────────────
+    //
+    // Four zod schemas and one config block, and every one of them is a WIRE SHAPE — which is why
+    // they are here rather than being local to the daemon: `CredentialInput` is what a client
+    // sends, and `@omni-acp/client` must be able to build one without importing the daemon (D14,
+    // §3.1). There is no `CredentialSummary` / `LoginState` / `RestartResult` in this list because
+    // those are types, and this test walks runtime bindings.
+    "CredentialCheckBody",
+    "CredentialInput",
+    "CredentialsConfig",
     "DaemonConfig",
     "DiffConfig",
     "ENV_DENY_EXACT",
@@ -523,11 +533,13 @@ const EXPECTED: Record<string, readonly string[]> = {
     "PromptRequestBody",
     "RESUME_OUTCOMES",
     "RUN_STATES",
+    "RestartRequestBody",
     "ResumeReplayConfig",
     "RunConfig",
     "RuntimeOverlay",
     "SSE_CONTROL",
     "SetConfigBody",
+    "SetCredentialBody",
     "SupervisorConfig",
     "TokenConfig",
     "TurnConfig",

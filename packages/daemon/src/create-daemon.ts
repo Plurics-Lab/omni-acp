@@ -5,7 +5,9 @@ import {
   OmniError,
   createIdGen,
   isDaemonId,
+  type AgentListResponse,
   type ClientId,
+  type CredentialStore,
   type DaemonId,
   type DeliveryStore,
   type DiffProvider,
@@ -30,6 +32,10 @@ import {
   createWatchdog,
   runUtility,
 } from "@omni-acp/core";
+import { createCredentialLayer } from "./credentials/layer.js";
+import { createCredentialStore } from "./credentials/store.js";
+import { createDeepCheck } from "./credentials/deep-check.js";
+import { createHomeManager } from "./credentials/home.js";
 import type { AddressInfo } from "node:net";
 import type { Hono } from "hono";
 import { createTokenStore } from "./auth.js";
@@ -46,6 +52,20 @@ import { createRunSubsystem } from "./runs.js";
 import { createWorkerRegistry } from "./registry.js";
 import type { BootRecoveryResult } from "./boot-recovery.js";
 import type { AuthContext, Daemon, DaemonDeps, DaemonEvent } from "./types.js";
+
+/**
+ * The worker states that own a PROCESS, and therefore a credential a swap has to reach.
+ *
+ * A `hibernated` worker is deliberately absent: it holds no process, so no credential file is open
+ * and `restartRequired` naming it would be advice an operator cannot act on — its next WAKE
+ * re-reads the store anyway (`assertMayResume` → `ensure()`), which is the stronger guarantee.
+ */
+const LIVE_WORKER_STATES: ReadonlySet<string> = new Set([
+  "starting",
+  "ready",
+  "running",
+  "requires_action",
+]);
 
 /**
  * The slice of `node:http.Server` this file uses. `@hono/node-server`'s `serve()` is typed as a
@@ -146,6 +166,72 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   // M0 wires the fixed auto-DENY responder and nothing else: the first remote-execution surface
   // ships fail-closed (D4/L7, CONTRACTS.md §7.4).
   const responder = deps?.responder ?? createBaselineResponder("deny", clock);
+
+  /**
+   * ── M3-WP1: the credential store, the home manager and the layer over both ──────────────────
+   *
+   * Built here, between the catalog and the registry, because it needs the first and the second
+   * needs it. The `linked` hook is late-bound over `workers` for `CatalogProbeHooks`'s reason: the
+   * store answers `restartRequired` by asking which live workers read a credential, and the
+   * registry resolves credentials at create time. There is no window in which the hook can fire
+   * early — nothing calls `put` during construction.
+   *
+   * An INJECTED store still wins (`deps.credentials`), which is the seam a test drives; the layer
+   * is only composed when the daemon built its own, because a `CredentialStore` double has no
+   * `resolveFor` and the layer is the thing that needs one.
+   */
+  const homes = deps?.homes ?? createHomeManager({ dataDir: resolved.dataDir, logger });
+  let ownedStore: ReturnType<typeof createCredentialStore> | null = null;
+  const credentialStore: CredentialStore =
+    deps?.credentials ??
+    (ownedStore = createCredentialStore({
+      dataDir: resolved.dataDir,
+      config: resolved,
+      catalog,
+      clock,
+      logger,
+      hooks: {
+        /**
+         * Which LIVE workers of this token read `<agentId>/<name>` — read off the fleet's own
+         * snapshots rather than through a new registry method, because a snapshot already carries
+         * `credential.name`, `agentId` and `state`, and the `reload` half is the descriptor's.
+         *
+         * A token that has since been REMOVED from config resolves to no context and therefore to
+         * no workers, which is the fail-closed answer: `restartRequired: []` under-reports rather
+         * than naming workers nobody can control any more.
+         */
+        linked: (tokenId, agentId, name) => {
+          let auth: AuthContext;
+          try {
+            auth = tokens.contextFor(tokenId, null);
+          } catch {
+            return [];
+          }
+          const reload = catalog.descriptor(agentId).credentials?.reload ?? "file";
+          return workers
+            .list(auth)
+            .filter(
+              (w) =>
+                LIVE_WORKER_STATES.has(w.state) &&
+                w.agentId === agentId &&
+                w.ownerTokenId === tokenId &&
+                (w.credential?.name ?? null) === name,
+            )
+            .map((w) => ({ workerId: w.workerId, reload }));
+        },
+        deepCheck: createDeepCheck({ config: resolved, catalog, supervisor, clock, logger }),
+      },
+    }));
+  const credentialLayer =
+    ownedStore === null
+      ? undefined
+      : createCredentialLayer({
+          dataDir: resolved.dataDir,
+          config: resolved,
+          store: ownedStore,
+          homes,
+          logger,
+        });
 
   const listeners: { [K in DaemonEvent["type"]]: Set<(e: DaemonEvent) => void> } = {
     "worker.state": new Set(),
@@ -320,6 +406,9 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     watchdog,
     ...(diff === undefined ? {} : { diff }),
     policyFor,
+    // M3-WP1. Absent ⇒ M2 exactly: no credential resolved, no home built, `PUT …/credential`
+    // answers `bad_request` naming the work package.
+    ...(credentialLayer === undefined ? {} : { credentials: credentialLayer }),
     onBootAdoption: (r) => {
       adoption = r;
     },
@@ -397,7 +486,46 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   };
 
   // The retention sweep, armed last so it cannot race adoption for the same rows (§14.5).
-  const retention = armRetention({ persistence, config: resolved, clock, logger });
+  const retention = armRetention({
+    persistence,
+    config: resolved,
+    clock,
+    logger,
+    /**
+     * M3-WP1's home sweep (§Home 隔离: home 随 worker 记录保留，close + retention 后删除).
+     *
+     * `keep` is every row that still EXISTS — including hibernated ones, which own no process and
+     * may sleep for a month before waking into the session files their home holds (E7) — and
+     * `closedAtMs` is when the closed ones closed. A home whose worker row is gone entirely is
+     * swept immediately, which is what reclaims the homes of workers this very sweep just dropped.
+     *
+     * With the MEMORY driver there are no rows at all, so nothing is kept and every home on disk
+     * is from a boot that is over: correct, and the reason the sweep is not gated on persistence.
+     */
+    ...(credentialLayer === undefined
+      ? {}
+      : {
+          homes: async (nowMs: number) => {
+            const rows = persistence === null ? [] : persistence.workers.list();
+            const keep = new Set<WorkerId>();
+            const closedAtMs = new Map<WorkerId, number>();
+            for (const row of rows) {
+              const id = row.snapshot.workerId;
+              if (row.snapshot.state === "closed") closedAtMs.set(id, row.closedAtMs ?? nowMs);
+              else keep.add(id);
+            }
+            const swept = await credentialLayer.homes.sweep({
+              nowMs,
+              retentionDays: resolved.credentials.homeRetentionDays,
+              keep,
+              closedAtMs,
+            });
+            if (swept.removed.length > 0) {
+              logger.info("removed retired worker homes", { count: swept.removed.length });
+            }
+          },
+        }),
+  });
 
   /**
    * `probe.onStart` (§17.4). The DEFAULT is `"cached"`, which LOADS `<dataDir>/probes/*.json`
@@ -540,6 +668,34 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     },
     get dispatcher(): WebhookDispatcher {
       return notAfterStop(dispatcherFacade);
+    },
+    /**
+     * M3-WP1. ALWAYS present, on `dispatcher`'s precedent — a `Daemon` that grew and lost a member
+     * between milestones is the shape §5.8.6 spends a comment forbidding.
+     *
+     * NOT gated by `notAfterStop`: the store is a directory tree, not a prepared statement, so
+     * nothing here can reach a finalized `node:sqlite` handle. `workers` and `catalog` are ungated
+     * for the same reason (review finding V6's own second option).
+     */
+    credentials: credentialStore,
+
+    /**
+     * `GET /v1/agents` (H4), and it is a DAEMON method from M3-WP1 on rather than a bare
+     * `catalog.list()`.
+     *
+     * The `login` row is per TOKEN: the probe is a shared, cached fact about the binary, and "am I
+     * logged in" is a fact about the CALLER's credential. Composing the two in the route would be
+     * the adapter making a decision (D15 constraint 1); composing them here keeps the route at one
+     * call and puts the I/O where I/O is allowed.
+     *
+     * `loginFor` never rejects, so one unreadable credential cannot break the whole catalogue.
+     */
+    async agents(auth): Promise<AgentListResponse> {
+      const entries = catalog.list();
+      const logins = await Promise.all(entries.map((e) => credentialStore.loginFor(auth, e.id)));
+      return {
+        agents: entries.map((entry, i) => ({ ...entry, login: logins[i] ?? null })),
+      };
     },
 
     authContextFor(tokenId: TokenId, clientId?: ClientId | null): AuthContext {
