@@ -16,6 +16,9 @@ export type { WorkerLease } from "./lease.js";
 // ── M2 (CONTRACTS.md §5.8.10) ───────────────────────────────────────────────
 export type { InteractionRequestHandle } from "./interactions.js";
 export type { RunsChannel } from "./runs.js";
+// ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md) ─────────────────────────────────────
+export type { CredentialsChannel } from "./credentials.js";
+export type { LocalCredentialOptions } from "./local-credential.js";
 
 export { OmniError } from "@omni-acp/protocol";
 export type {
@@ -41,4 +44,11 @@ export type {
   InteractionSnapshot,
   PolicySnapshot,
   RunSnapshot,
+  // ── M3-WP1 ────────────────────────────────────────────────────────────────
+  CredentialApplied,
+  CredentialInput,
+  CredentialPutResult,
+  CredentialSummary,
+  LoginState,
+  RestartResult,
 } from "@omni-acp/protocol";

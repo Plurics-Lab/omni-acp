@@ -5,7 +5,18 @@ import { OmniError, type DaemonConfig } from "@omni-acp/protocol";
 import { USAGE, parseArgs, type ParsedArgs } from "./args.js";
 import {
   answerInteraction,
+  checkCredential,
+  getCredential,
   listAgents,
+  listCredentials,
+  localLoginAgents,
+  putCredential,
+  readLocalCredential,
+  removeCredential,
+  renderCredential,
+  renderCredentialPut,
+  renderCredentials,
+  renderLogin,
   listDeliveries,
   listInteractions,
   listRuns,
@@ -117,7 +128,8 @@ type RemoteCommand = Extract<
       | "interactions-answer"
       | "config"
       | "runs"
-      | "deliveries";
+      | "deliveries"
+      | "credentials";
   }
 >;
 
@@ -189,6 +201,8 @@ async function remote(args: RemoteCommand, env: NodeJS.ProcessEnv, out: CliIo): 
       return print(body, () => renderDeliveries(body));
     }
 
+    if (args.cmd === "credentials") return await credentials(args, target, out, print);
+
     const body = await probeAgentAt(target, args.agent, {
       ...(args.deep === true ? { deep: true } : {}),
       ...(args.force === true ? { force: true } : {}),
@@ -198,6 +212,98 @@ async function remote(args: RemoteCommand, env: NodeJS.ProcessEnv, out: CliIo): 
     write(out.stderr, `omni-acp: ${messageOf(e)}\n`);
     return EXIT_FAILURE;
   }
+}
+
+/**
+ * `omni-acp credentials <op>` — M3-WP1's five (docs/M3-WP1-CREDENTIALS.md §线上协议).
+ *
+ * Each op is `parse → ONE call → print`, the rule every other remote command follows. Two things
+ * here are not conveniences and must not become them:
+ *
+ *  1. `put` reads the secret from STDIN. A secret on an argv is a secret in the shell history, in
+ *     `ps` output and in every process listing on the machine — and `--file <path>` would be the
+ *     file-disclosure primitive the daemon refuses, moved to the client.
+ *  2. NOTHING PRINTED HERE IS A SECRET. `list`, `get` and `check` render a 12-hex fingerprint,
+ *     and `import` prints what it uploaded by fingerprint too. A `--show` flag has nowhere to read
+ *     from: the daemon has no route that returns content (§凭据仓库: secret 只上行).
+ */
+async function credentials(
+  args: Extract<ParsedArgs, { cmd: "credentials" }>,
+  target: ReturnType<typeof targetOf>,
+  out: CliIo,
+  print: (body: unknown, rendered: () => string) => number,
+): Promise<number> {
+  if (args.op === "list") {
+    const body = await listCredentials(target);
+    return print(body, () => renderCredentials(body));
+  }
+
+  if (args.op === "get") {
+    const body = await getCredential(target, args.agent, args.name);
+    return print(body, () => renderCredential(body));
+  }
+
+  if (args.op === "rm") {
+    await removeCredential(target, args.agent, args.name);
+    return print(
+      { removed: `${args.agent}/${args.name}` },
+      () => `removed ${args.agent}/${args.name}`,
+    );
+  }
+
+  if (args.op === "check") {
+    const body = await checkCredential(target, args.agent, args.name, {
+      ...(args.deep === true ? { deep: true } : {}),
+    });
+    return print(body, () => renderLogin(body));
+  }
+
+  if (args.op === "import") {
+    // The read is LOCAL, in the operator's own process: a daemon that read
+    // `~/.claude/.credentials.json` on request would be a daemon that reads any file you can name.
+    const input = await readLocalCredential(args.agent);
+    const body = await putCredential(target, args.agent, args.name, input);
+    return print(body, () => renderCredentialPut(body));
+  }
+
+  // `put`, and the secret comes from stdin. The narrowing is explicit rather than falling out of
+  // the `if` chain: `op` is the discriminant of a four-way union and TypeScript narrows a
+  // MULTI-VALUE arm ("import" | "get" | "rm" | "check") by exclusion only when every other arm has
+  // been eliminated by equality — which the chain above does not do for the last one.
+  if (args.op !== "put") {
+    throw new OmniError("bad_request", `credentials: unhandled operation ${String(args.op)}`);
+  }
+  const secret = (await readStdin(out)).trim();
+  if (secret === "") {
+    throw new OmniError(
+      "bad_request",
+      "credentials put reads the secret from stdin and got nothing; pipe it in " +
+        `(e.g. \`cat token.txt | omni-acp credentials put ${args.agent} --token-value\`)`,
+    );
+  }
+  const input =
+    args.kind === "file"
+      ? ({ kind: "files", files: { [args.file ?? ""]: secret } } as const)
+      : args.kind === "token"
+        ? ({ kind: "token", token: secret } as const)
+        : ({ kind: "apiKey", apiKey: secret } as const);
+  const body = await putCredential(target, args.agent, args.name, input);
+  return print(body, () => renderCredentialPut(body));
+}
+
+/**
+ * The whole of stdin, as a string.
+ *
+ * A TTY is not read at all: `credentials put` with no pipe would otherwise hang waiting for a
+ * secret nobody is typing, which looks exactly like a daemon that is not answering. The message
+ * above names the shape an operator actually types.
+ */
+async function readStdin(out: CliIo): Promise<string> {
+  void out;
+  if (process.stdin.isTTY === true) return "";
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk as Uint8Array));
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
@@ -239,7 +345,8 @@ export async function main(
     args.cmd === "interactions-answer" ||
     args.cmd === "config" ||
     args.cmd === "runs" ||
-    args.cmd === "deliveries"
+    args.cmd === "deliveries" ||
+    args.cmd === "credentials"
   ) {
     return remote(args, env, out);
   }

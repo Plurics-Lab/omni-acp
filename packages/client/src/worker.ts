@@ -6,6 +6,8 @@ import {
   type CloseResult,
   type ConfigOptionView,
   type ContentBlock,
+  type CredentialApplied,
+  type RestartResult,
   type DaemonId,
   type InteractionSnapshot,
   type EventEnvelope,
@@ -155,6 +157,40 @@ export interface Worker {
   readonly config: readonly ConfigOptionView[] | null;
   /** The LAST wake's classification, or null before the first one (CONTRACTS.md §5.7). */
   readonly resume: ResumeReport | null;
+  // ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md) ────────────────────────────────────
+  /**
+   * Re-point this worker at a different stored credential, BY NAME.
+   *
+   * `apply` defaults to `"auto"`, which does what the runtime's MEASURED `reload` says: on
+   * claude-acp the credential file is consulted per request, so the swap is `"immediate"`; on
+   * codex-acp it is cached in the process, so an idle worker is `"restarted"` and a busy one is
+   * `"on-next-start"` — the turn you did not ask to interrupt is not interrupted. `"restart"`
+   * forces it (`409` while a turn is live); `"defer"` moves the link and stops.
+   *
+   * `applied` is what actually happened and not what was asked for, which is the field an
+   * operator rotating credentials across a fleet has to read.
+   */
+  setCredential(
+    credential: string,
+    opts?: { apply?: "auto" | "restart" | "defer" },
+  ): Promise<CredentialApplied>;
+  /**
+   * Replace the PROCESS while keeping the worker: same id, same lease, same home, same session,
+   * `generation + 1`.
+   *
+   * `resume` defaults to true, so the conversation survives. A LIVE turn is `409 worker_busy`
+   * unless `force: true`, and a forced restart terminates that turn with
+   * `TurnResult.error.code: "restarted"` and NO synthesized idle — the in-flight tool calls land
+   * in `strandedToolCalls`.
+   */
+  restart(opts?: {
+    reason?: string;
+    force?: boolean;
+    resume?: boolean;
+    fresh?: boolean;
+    credential?: string;
+    timeoutMs?: number;
+  }): Promise<RestartResult>;
   on<K extends keyof WorkerEventMap>(event: K, cb: WorkerEventMap[K]): () => void;
   readonly closed: Promise<WorkerSnapshot>;
 }
@@ -236,7 +272,14 @@ export function toContentBlocks(input: PromptInput): ContentBlock[] {
  * without it `prompt()` would wait forever for an event that is never coming.
  */
 export function isTurnTerminal(turnId: TurnId, e: EventEnvelope): boolean {
-  if (e.kind === "omni.worker_state") return e.payload.state === "closed";
+  if (e.kind === "omni.worker_state") {
+    // M3-WP1's third terminal, and it MUST be here as well as in `reduceTurn`: a forced restart
+    // replaces the process without closing the worker and without synthesizing an `idle`, so a
+    // `stream()` that only watched for those two would hang on a turn that is already over. The
+    // reducer then reports it as `stopReason: null` with `error.code: "restarted"`.
+    if (e.payload.state === "starting" && e.payload.reason === "restart") return true;
+    return e.payload.state === "closed";
+  }
   if (e.kind !== "acp.session_update" || e.turnId !== turnId) return false;
   const payload = asRecord(e.payload);
   return payload["sessionUpdate"] === "state_update" && payload["state"] === "idle";
@@ -694,6 +737,38 @@ export function createWorkerHandle(transport: Transport, snapshot: WorkerSnapsho
           // still has to be able to make it.
           { timeoutMs: WAKE_REQUEST_TIMEOUT_MS },
         ),
+      );
+    },
+
+    async setCredential(credential, opts): Promise<CredentialApplied> {
+      return await transport.request<CredentialApplied>(
+        "PUT",
+        `/v1/workers/${id}/credential`,
+        {
+          credential,
+          ...(opts?.apply === undefined ? {} : { apply: opts.apply }),
+        },
+        // A swap on a `reload:"restart"` agent replaces the process, which is the wake budget's
+        // ~7 s cold start plus a resume — the same reason `wake()` does not use the default.
+        { timeoutMs: WAKE_REQUEST_TIMEOUT_MS },
+      );
+    },
+
+    async restart(opts): Promise<RestartResult> {
+      return await transport.request<RestartResult>(
+        "POST",
+        `/v1/workers/${id}/restart`,
+        {
+          ...(opts?.reason === undefined ? {} : { reason: opts.reason }),
+          ...(opts?.force === undefined ? {} : { force: opts.force }),
+          ...(opts?.resume === undefined ? {} : { resume: opts.resume }),
+          ...(opts?.fresh === undefined ? {} : { fresh: opts.fresh }),
+          ...(opts?.credential === undefined ? {} : { credential: opts.credential }),
+          ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+        },
+        // Always the wake budget, for `wake()`'s reason: a restart IS a spawn plus a resume, and a
+        // handle that has not watched the state still has to be able to make the call.
+        { timeoutMs: WAKE_REQUEST_TIMEOUT_MS },
       );
     },
 

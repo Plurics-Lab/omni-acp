@@ -46,6 +46,45 @@ export type ParsedArgs =
       token?: string;
       json?: boolean;
     }
+  /**
+   * M3-WP1's five (docs/M3-WP1-CREDENTIALS.md §线上协议), as ONE command with a sub-verb — the
+   * shape `interactions answer` already set, and for its reason: the forms take different
+   * arguments, and a `--import` flag would make `credentials --import` (with no agent) parse.
+   *
+   * `import` and `put` differ in WHERE the secret comes from and nowhere else: `import` reads this
+   * machine's own login (the read is local, because a daemon that read it for you would read any
+   * file you name), `put` takes a value the operator supplies on stdin.
+   */
+  | {
+      cmd: "credentials";
+      op: "list";
+      url?: string;
+      token?: string;
+      json?: boolean;
+    }
+  | {
+      cmd: "credentials";
+      op: "import" | "get" | "rm" | "check";
+      agent: string;
+      name: string;
+      deep?: boolean;
+      url?: string;
+      token?: string;
+      json?: boolean;
+    }
+  | {
+      cmd: "credentials";
+      op: "put";
+      agent: string;
+      name: string;
+      /** `token` / `apiKey` land in the env var the descriptor declares; `file` is its own name. */
+      kind: "token" | "apiKey" | "file";
+      /** For `kind: "file"`, the file NAME the agent reads (e.g. `.credentials.json`). */
+      file?: string;
+      url?: string;
+      token?: string;
+      json?: boolean;
+    }
   | { cmd: "runs"; url?: string; token?: string; json?: boolean }
   | { cmd: "deliveries"; redeliver?: string; url?: string; token?: string; json?: boolean }
   | { cmd: "version" }
@@ -91,6 +130,24 @@ const ANSWER_FLAGS = {
   "--value": "value",
 } as const;
 const DELIVERIES_FLAGS = { ...REMOTE_FLAGS, "--redeliver": "value" } as const;
+/**
+ * `credentials`'s flags.
+ *
+ * There is deliberately NO `--value <secret>` and no `--file <path>`: a secret on an argv is a
+ * secret in the shell history, in `ps` output and in any process listing on the machine, and a
+ * path is the file-disclosure primitive the whole design refuses. `credentials put` reads the
+ * secret from STDIN, which is the one channel that reaches no log.
+ *
+ * `--name` defaults to `default`, which is the name `createAgent({credential})` falls back to.
+ */
+const CREDENTIALS_FLAGS = {
+  ...REMOTE_FLAGS,
+  "--name": "value",
+  "--deep": "boolean",
+  "--token-value": "boolean",
+  "--api-key": "boolean",
+  "--file": "value",
+} as const;
 
 type FlagTable = Readonly<Record<string, "value" | "boolean">>;
 
@@ -189,6 +246,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   if (head === "config") return parseConfig(args);
   if (head === "runs") return parseRuns(args);
   if (head === "deliveries") return parseDeliveries(args);
+  if (head === "credentials") return parseCredentials(args);
   return error(`unknown command "${head}"`);
 }
 
@@ -342,6 +400,74 @@ function parseDeliveries(args: readonly string[]): ParsedArgs {
   };
 }
 
+/**
+ * `omni-acp credentials <op> [<agent>] [options]`.
+ *
+ * The sub-verb is a POSITIONAL, for `interactions answer`'s reason: `list` takes no agent and the
+ * other four require one, so a flag-shaped verb would let `credentials --check` parse with nothing
+ * to check.
+ */
+function parseCredentials(args: readonly string[]): ParsedArgs {
+  const scanned = scan(args, 2, CREDENTIALS_FLAGS);
+  if ("done" in scanned) return scanned.done;
+  const { flags, positional } = scanned;
+  const op = args[1] ?? "";
+  const nameFlag = flags["--name"];
+  const name = typeof nameFlag === "string" ? nameFlag : "default";
+
+  if (op === "list") {
+    const first = positional[0];
+    if (first !== undefined) return error(`unexpected argument "${first}"`);
+    return { cmd: "credentials", op: "list", ...remoteOf(flags) };
+  }
+
+  if (op !== "import" && op !== "put" && op !== "get" && op !== "rm" && op !== "check") {
+    return error(`credentials takes import, put, list, get, rm or check, not "${op}"`);
+  }
+
+  const [agent, extra] = positional;
+  if (agent === undefined) return error(`credentials ${op} needs an agent id`);
+  if (extra !== undefined) return error(`unexpected argument "${extra}"`);
+
+  if (op === "put") {
+    // Exactly one shape, because the three land in three different places: a token and an api key
+    // become the env var the DESCRIPTOR declares, and a file becomes a file the agent reads. A
+    // `put` with none of them named would have to guess, and guessing which variable a credential
+    // is would hand the agent a secret under a name it never reads — a silent auth failure.
+    const file = flags["--file"];
+    const given = [
+      flags["--token-value"] === true,
+      flags["--api-key"] === true,
+      typeof file === "string",
+    ].filter(Boolean).length;
+    if (given === 0) {
+      return error("credentials put needs one of --token-value, --api-key or --file <name>");
+    }
+    if (given > 1) {
+      return error("credentials put takes exactly one of --token-value, --api-key, --file");
+    }
+    return {
+      cmd: "credentials",
+      op: "put",
+      agent,
+      name,
+      ...(typeof file === "string"
+        ? { kind: "file" as const, file }
+        : { kind: flags["--token-value"] === true ? ("token" as const) : ("apiKey" as const) }),
+      ...remoteOf(flags),
+    };
+  }
+
+  return {
+    cmd: "credentials",
+    op,
+    agent,
+    name,
+    ...(flags["--deep"] === true ? { deep: true } : {}),
+    ...remoteOf(flags),
+  };
+}
+
 export const USAGE = `omni-acp — run an ACP worker daemon
 
 Usage:
@@ -354,6 +480,10 @@ Usage:
   omni-acp config <worker> <configId> <value> [options]
   omni-acp runs [options]
   omni-acp deliveries [--redeliver <deliveryId>] [options]
+  omni-acp credentials list [options]
+  omni-acp credentials import <agent> [--name <name>] [options]
+  omni-acp credentials put <agent> --token-value|--api-key|--file <name> [options]
+  omni-acp credentials get|rm|check <agent> [--name <name>] [--deep] [options]
   omni-acp --version
   omni-acp --help
 
@@ -381,4 +511,15 @@ Options for agents, workers and probe (they talk to a running daemon):
   interactions answer --deny           take the offered reject-once option
   interactions answer --value q=v      answer an elicitation question
   deliveries --redeliver <id>          re-send one delivery from the dead-letter queue
+
+  credentials import <agent>           upload THIS machine's own login for that agent
+  credentials put <agent> --token-value|--api-key|--file <name>
+                                       read the secret from STDIN and upload it
+  credentials check <agent> --deep     spawn one process and prove the login works
+
+  credentials --name <name>            which credential (default "default")
+
+A secret is never an argv: \`credentials put\` reads it from stdin, because an argument
+is visible in the shell history and in every process listing on the machine. A stored
+credential is never returned — \`list\`, \`get\` and \`check\` answer a 12-hex fingerprint.
 `;

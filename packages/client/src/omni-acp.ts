@@ -1,6 +1,7 @@
-import { OmniError, type ClientId } from "@omni-acp/protocol";
+import { OmniError, type ClientId, type CredentialInput } from "@omni-acp/protocol";
 import { connectServer, type Server } from "./server.js";
 import { local, type LocalOptions } from "./local.js";
+import { localCredential, type LocalCredentialOptions } from "./local-credential.js";
 
 export interface ConnectOptions {
   readonly url: string;
@@ -40,6 +41,15 @@ const globalFetch: typeof globalThis.fetch = (input, init) => globalThis.fetch(i
 export const OmniACP: {
   connect(opts: ConnectOptions): Promise<Server>;
   local(opts?: LocalOptions): Promise<Server>;
+  /**
+   * M3-WP1. This machine's own login for `agent`, as a `CredentialInput` ready for
+   * `server.credentials.put()`.
+   *
+   * It is on the CLIENT and not on the daemon deliberately: a daemon that read
+   * `~/.claude/.credentials.json` on request would be a daemon that reads any file you can name.
+   * See `local-credential.ts` for the paths and the evidence behind them.
+   */
+  localCredential(agent: string, opts?: LocalCredentialOptions): Promise<CredentialInput>;
 } = {
   // `async` on purpose: a validation failure must arrive as a REJECTION, not as a synchronous
   // throw out of a function whose return type is a promise. The caller writes one `catch`.
@@ -62,5 +72,8 @@ export const OmniACP: {
   },
   local(opts?: LocalOptions): Promise<Server> {
     return local(opts);
+  },
+  localCredential(agent: string, opts?: LocalCredentialOptions): Promise<CredentialInput> {
+    return localCredential(agent, opts);
   },
 };

@@ -1,5 +1,13 @@
 import { OmniError, type AgentListResponse, type ProbeResponse } from "@omni-acp/protocol";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
+  CredentialInput,
+  CredentialListResponse,
+  CredentialPutResult,
+  CredentialSummary,
+  LoginState,
   DeliveryListResponse,
   DeliveryRecord,
   InteractionAnswerResult,
@@ -360,6 +368,172 @@ export function renderRuns(body: RunListResponse): string {
       r.updatedAt,
     ]),
   );
+}
+
+// ── M3-WP1: `omni-acp credentials import|put|list|rm|check` (§线上协议) ────────
+
+/**
+ * The two local logins the CLI knows how to import, and the evidence behind each path.
+ *
+ * It is the same table `@omni-acp/client`'s `localCredential()` carries, and it is DUPLICATED here
+ * rather than imported for §3.1's reason, stated at the top of this file: the DAG runs
+ * `protocol → core → daemon → cli` and the client is a sibling leaf, so importing it would put a
+ * second package in the CLI's runtime closure and `dependency-direction` would fail the build.
+ * Four lines of data is the cheaper half of that trade, and `cli-credentials-table-matches-sdk`
+ * (in `m3-commands.test.ts`) asserts the two tables are the same table rather than two guesses.
+ */
+const LOCAL_LOGINS: Readonly<Record<string, { readonly dir: string; readonly file: string }>> = {
+  "claude-acp": { dir: ".claude", file: ".credentials.json" },
+  "claude-agent-acp": { dir: ".claude", file: ".credentials.json" },
+  "claude-code-acp": { dir: ".claude", file: ".credentials.json" },
+  "codex-acp": { dir: ".codex", file: "auth.json" },
+};
+
+/** The agent ids `credentials import` knows, for the error message and for the SDK-parity test. */
+export function localLoginAgents(): readonly string[] {
+  return Object.keys(LOCAL_LOGINS);
+}
+
+/**
+ * `omni-acp credentials import <agent>` — read THIS MACHINE's login and upload it.
+ *
+ * The read happens HERE, in the operator's own process, for the reason `localCredential()` states:
+ * a daemon that read `~/.claude/.credentials.json` on request would be a daemon that reads any
+ * file you can name. What crosses the wire is a body the operator chose to send.
+ */
+export async function readLocalCredential(
+  agent: string,
+  o?: { home?: string },
+): Promise<CredentialInput> {
+  const known = LOCAL_LOGINS[agent];
+  if (known === undefined) {
+    throw new OmniError(
+      "bad_request",
+      `credentials import knows where ${localLoginAgents().join(", ")} keep their logins, not "${agent}"`,
+    );
+  }
+  const path = join(o?.home ?? homedir(), known.dir, known.file);
+  let content: string;
+  try {
+    content = await readFile(path, "utf8");
+  } catch (e) {
+    throw new OmniError(
+      "credential_required",
+      `no ${agent} login was found at ${path}; log in on this machine first`,
+      { cause: e },
+    );
+  }
+  try {
+    JSON.parse(content);
+  } catch (e) {
+    // FAIL EARLY. A truncated credential uploaded successfully fails later as an authentication
+    // error from the agent, which looks like "your subscription lapsed" and is not.
+    throw new OmniError(
+      "bad_request",
+      `the ${agent} login at ${path} is not valid JSON; it is not a credential this agent reads`,
+      { cause: e },
+    );
+  }
+  return { kind: "files", files: { [known.file]: content } };
+}
+
+export function listCredentials(target: RemoteTarget): Promise<CredentialListResponse> {
+  return call<CredentialListResponse>(target, "GET", "/v1/credentials");
+}
+
+export function getCredential(
+  target: RemoteTarget,
+  agent: string,
+  name: string,
+): Promise<CredentialSummary> {
+  return call<CredentialSummary>(target, "GET", credentialPath(agent, name));
+}
+
+export function putCredential(
+  target: RemoteTarget,
+  agent: string,
+  name: string,
+  input: CredentialInput,
+): Promise<CredentialPutResult> {
+  return call<CredentialPutResult>(target, "PUT", credentialPath(agent, name), input);
+}
+
+export function removeCredential(
+  target: RemoteTarget,
+  agent: string,
+  name: string,
+): Promise<unknown> {
+  return call<unknown>(target, "DELETE", credentialPath(agent, name));
+}
+
+export function checkCredential(
+  target: RemoteTarget,
+  agent: string,
+  name: string,
+  o: { deep?: boolean },
+): Promise<LoginState> {
+  return call<LoginState>(target, "POST", `${credentialPath(agent, name)}/check`, o);
+}
+
+function credentialPath(agent: string, name: string): string {
+  return `/v1/credentials/${encodeURIComponent(agent)}/${encodeURIComponent(name)}`;
+}
+
+/**
+ * THE COLUMNS ARE THE WHOLE POINT: a fingerprint, never a secret.
+ *
+ * `FINGERPRINT` is 12 hex characters of a sha256 — enough for an operator to say "that is the
+ * credential I just uploaded" and useless for authenticating anything. There is deliberately no
+ * column that could carry content, and `credentials get` has no `--show` flag to add one: the
+ * daemon has no route that would answer it (§凭据仓库: secret 只上行).
+ */
+export function renderCredentials(body: CredentialListResponse): string {
+  if (body.credentials.length === 0) return "no credentials stored";
+  return renderTable(
+    ["AGENT", "NAME", "TOKEN", "METHOD", "FINGERPRINT", "EXPIRES", "IN USE"],
+    body.credentials.map((c) => [
+      c.agentId,
+      c.name,
+      c.ownerTokenId,
+      c.method,
+      c.fingerprint,
+      c.expiresAt ?? "-",
+      String(c.inUseBy),
+    ]),
+  );
+}
+
+export function renderCredentialPut(body: CredentialPutResult): string {
+  const restart =
+    body.restartRequired.length === 0
+      ? ""
+      : `\nrestart required: ${body.restartRequired.join(", ")}`;
+  return (
+    `${body.agentId}/${body.name} ${body.method} ${body.fingerprint}` +
+    ` (${String(body.workersAffected)} live worker(s) affected)${restart}`
+  );
+}
+
+export function renderLogin(body: LoginState): string {
+  const bits = [
+    `state: ${body.state}`,
+    body.method === undefined ? null : `method: ${body.method}`,
+    body.credential === undefined || body.credential === null
+      ? null
+      : `credential: ${body.credential}`,
+    body.fingerprint === undefined || body.fingerprint === null
+      ? null
+      : `fingerprint: ${body.fingerprint}`,
+    body.expiresAt === undefined || body.expiresAt === null ? null : `expires: ${body.expiresAt}`,
+    `deep: ${String(body.deep)}`,
+    body.detail === undefined ? null : body.detail,
+  ].filter((b): b is string => b !== null);
+  return bits.join("\n");
+}
+
+/** A `CredentialSummary`, for `credentials get`. Same rule: a fingerprint and no content. */
+export function renderCredential(body: CredentialSummary): string {
+  return renderCredentials({ credentials: [body] });
 }
 
 export function renderDeliveries(body: DeliveryListResponse): string {

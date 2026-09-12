@@ -12,6 +12,7 @@ import {
   type WorkerListResponse,
   type WorkerSnapshot,
 } from "@omni-acp/protocol";
+import { createCredentialsChannel, type CredentialsChannel } from "./credentials.js";
 import { createRunsChannel, type RunsChannel } from "./runs.js";
 import { createTransport, type Transport, type TransportOptions } from "./transport.js";
 import { createWorkerHandle, disposeWorker, type Worker } from "./worker.js";
@@ -75,6 +76,23 @@ export interface CreateAgentOptions {
    * lease-free, which is how a supervisor starts a worker somebody else will drive (D5).
    */
   readonly lease?: "take" | "observe";
+  // ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md) ────────────────────────────────────
+  /**
+   * WHICH stored credential this worker runs on, BY NAME — a client never puts a secret on this
+   * wire, which is the same rule `mcp` follows for a command.
+   *
+   * Omitted ⇒ this token's `default` for this agent, and the inherited environment when it has
+   * none (M2's behaviour). `"none"` ⇒ an EMPTY home, which is how you prove a worker is
+   * unauthenticated rather than quietly borrowing the daemon's own login. `"inherit"` is the
+   * explicit spelling of the fallback.
+   */
+  readonly credential?: string;
+  /**
+   * `"isolated"` (the default) ⇒ this worker gets `<dataDir>/homes/<workerId>` with the credential
+   * LINKED into it, so two workers of one agent never share a session directory. `"shared"` ⇒ no
+   * per-worker home and the daemon's own environment, which is M2.
+   */
+  readonly home?: "isolated" | "shared";
 }
 
 /**
@@ -114,6 +132,16 @@ export interface Server {
    * implementation of the same idea.
    */
   readonly runs: RunsChannel;
+  /**
+   * M3-WP1's credential store, as five calls (§线上协议).
+   *
+   * `put` is the only one that carries a secret, and it only ever goes UP: `get` and `list`
+   * answer summaries whose strongest identifier is a 12-hex-character fingerprint. The daemon
+   * refuses a `put` over a connection that is neither TLS nor loopback (`403
+   * insecure_transport`), which is why `OmniACP.localCredential` reads the machine's own login on
+   * THIS side of the wire and hands you a body rather than a path.
+   */
+  readonly credentials: CredentialsChannel;
   /** Closes local streams. For local(), also stops the embedded daemon. Remote workers survive. */
   close(): Promise<void>;
 }
@@ -145,6 +173,7 @@ export function createServer(
   // remote workers, which outlive the client by design (that is what `attach()` is for).
   const handles = new Set<Worker>();
   const runs = createRunsChannel(transport);
+  const credentials = createCredentialsChannel(transport);
   let closed = false;
 
   const assertOpen = (): void => {
@@ -162,6 +191,7 @@ export function createServer(
     daemonId: me.daemonId,
     me,
     runs,
+    credentials,
 
     async info(): Promise<DaemonInfo> {
       assertOpen();
@@ -200,6 +230,9 @@ export function createServer(
         ...(opts.parkTimeoutAction === undefined
           ? {}
           : { parkTimeoutAction: opts.parkTimeoutAction }),
+        // ── M3-WP1 ──────────────────────────────────────────────────────────
+        ...(opts.credential === undefined ? {} : { credential: opts.credential }),
+        ...(opts.home === undefined ? {} : { home: opts.home }),
       };
 
       // H5 is synchronously ready: the 201 already carries `state:"ready"` and the real
