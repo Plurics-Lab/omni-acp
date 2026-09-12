@@ -196,4 +196,45 @@ prompt 跑通（基线），然后**在进程活着的时候**把凭据文件覆
 
 ### R6 — 真机 compat（`OMNI_COMPAT_CONFIG=agents.local.yaml OMNI_COMPAT_REAL=1`）
 
-见下表；`restart-resumes` 是这一包新增的那一个 case，其余全部是 M1/M2 的 case，用来证明**不退化**。
+`restart-resumes` 是这一包新增的那一个 case，其余全部是 M1/M2 的 case，跑在这里就是为了证明**不退化**。
+
+```
+OMNI_COMPAT_CONFIG=agents.local.yaml OMNI_COMPAT_REAL=1 OMNI_COMPAT_REQUIRE=1 vitest run
+→ 2 files · 56 passed · 10 skipped · 0 failed · 335 s
+```
+
+| agent | passed | skipped | failed | `restart-resumes` |
+|---|---|---|---|---|
+| claude-acp 0.73.0 | **27** | 4 | **0** | **passed**（12.39 s） |
+| codex-acp 1.8.0 | **21** | 6 | **0** | **passed**（15.54 s） |
+
+十个 skip 全部带出处和理由，而且**全部是 M1/M2 已有的语料缺口，没有一个来自这一包**：
+
+| agent | case | source | 理由 |
+|---|---|---|---|
+| claude | `plan-update` | config | 这个 build 没有 todo/plan 工具；两次刻意尝试都没产出 `plan`（语料 05/05b） |
+| claude | `agent-thought` | config | 默认 effort 下不发（语料） |
+| claude | `current-mode-update` | config | `session/set_mode` 回的是 v2 `config_option_update`（语料 08） |
+| claude | `git-patch-from-diff-blocks` | config | v1 `diff` 块是被放宽的片段，从它重建 patch 属于厂商扩展（F19）；D8 的 provider 读磁盘，那一项由 `patch-git` 断言（它 passed） |
+| codex | `permission-deny` | config | codex-acp 1.8.0 在任何模式下（含 read-only、含工作区外路径）都自动批准文件写入，从不发 `request_permission`（2026-09-04 探测） |
+| codex | `elicitation-gated` / `elicitation-answer` / `interaction-park-timeout` | capability | `elicitation` 在这个 runtime 的 `unverified` 里（§17.2） |
+| codex | `permission-hard-rules` / `permission-allow` | capability | `permission` 在这个 runtime 的 `unverified` 里（§17.2） |
+
+`restart-resumes` 在 hermetic 套件里的表现是同一条规则的另一半：9 个 hermetic agent 上是带出处的
+`capability` skip（`"the probe reports no resume spelling for this runtime"`），只有
+`fixture-hybrid`（唯一实现了真 resume 的 fixture）passed。skip 的**来源是 probe 测出来的
+`resumeMethod`**，不是 YAML 里的一句声明 —— 这也是为什么它对一个从没声称过这个能力的 runtime 不是失败。
+
+### R7 — 规范里没能按原文做到的两处
+
+1. **`RuntimeCredentials.loginRequiredSignal` 的枚举多了一个值。** 规范钉的是
+   `"authMethods" | "prompt_-32000"` 两个；实测（R2）证明 codex 在**完全登录**时也回非空
+   `authMethods`，按 E4 那条判断会把每一个健康登录报成 `required`。所以加了第三个值
+   `"session_new"`，`"authMethods"` 保留在枚举里但**没有任何 agent 在用**，理由写在 `runtime.ts`
+   的那一行上。这是规范的**事实前提**被实测推翻，不是设计取舍。
+2. **`home:"shared"` 配 `files` 凭据被拒绝，规范没有这一条。** 规范只说 `home: "isolated" |
+   "shared"`，没说两者与三种凭据形态的组合。file 凭据只能经 home 到达 agent（E1/E2），所以
+   `shared` + `files` 是一个自相矛盾的请求；itest 第一版按规范字面实现（静默回退到继承环境），
+   于是交还了一个**以 daemon 自己的身份认证**的 worker 且什么都不说 —— 正是 M2-R12 对 env key
+   已经拒掉的静默降级。现在是 `bad_request` 并指向 `home:"isolated"`；`token`/`apiKey` 形态在
+   shared home 上照常工作，因为它们落在环境变量里、不需要目录。

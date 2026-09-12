@@ -14,7 +14,8 @@
     "daemon": "omni-acp start --config daemon.example.yaml --print-token",
     "interactive": "node 03-interactive.mjs",
     "run-webhook": "node 04-run-webhook.mjs",
-    "credentials": "node 05-credentials.mjs"
+    "credentials": "node 05-credentials.mjs",
+    "m3-acceptance": "node m3-acceptance.mjs"
   },
   "dependencies": {
     "@omni-acp/cli": "workspace:*",

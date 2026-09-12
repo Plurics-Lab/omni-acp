@@ -142,9 +142,17 @@ try {
   //
   // 换凭据在别的流里是隐形的：`reload:"file"` 的 agent 不重启、状态不变，日志上看就是一个 turn
   // 突然以另一个身份在回答。`omni.credential` 就是那一行，只有 fingerprint，没有 secret。
+  // `events({since:0})` is a LIVE tail: it does not end for an open worker (`stream_end` only
+  // arrives for a closed one), so the loop breaks on the envelope it came for, with a bound so a
+  // daemon that never wrote one cannot hang the example.
+  let scanned = 0;
   for await (const e of second.events({ since: 0 })) {
-    if (e.kind === "omni.credential") console.log(`audit: ${JSON.stringify(e.payload)}`);
-    if (e.seq >= second.snapshot.headSeq) break;
+    scanned += 1;
+    if (e.kind === "omni.credential") {
+      console.log(`audit: ${JSON.stringify(e.payload)}`);
+      break;
+    }
+    if (scanned > 200) break;
   }
 
   await first.close();
