@@ -157,17 +157,45 @@ export function createHomeManager(o: HomeManagerOptions): HomeManager {
     },
 
     /**
+     * Homes on disk that belong to no worker row, snapshotted ONCE at boot.
+     *
+     * THE RACE THIS CLOSES, found by the real-agent acceptance run: a home is created BEFORE the
+     * agent is spawned, and the worker only enters the registry once its handshake has returned —
+     * so for the whole of a ~7 s `npx` cold start there is a home with no row. A sweep that treated
+     * "no row" as "orphan" deleted a LIVE worker's credential link mid-create, and the worker then
+     * failed to authenticate on its next request with nothing in the log connecting the two.
+     *
+     * Taking the set once, before any worker of this boot can be mid-create, makes the distinction
+     * structural rather than a timing guess.
+     */
+    async orphansAtBoot(rows): Promise<ReadonlySet<WorkerId>> {
+      const known = new Set([...rows].map((id) => segment(id)));
+      const orphans = new Set<WorkerId>();
+      try {
+        for (const entry of await readdir(homesRoot(o.dataDir), { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          if (!known.has(entry.name)) orphans.add(entry.name as WorkerId);
+        }
+      } catch {
+        // No homes directory is the normal state of a daemon that has never isolated a home.
+      }
+      if (orphans.size > 0) {
+        logger?.info("worker homes from a previous boot belong to no row", { count: orphans.size });
+      }
+      return orphans;
+    },
+
+    /**
      * The retention sweep (§Home 隔离: home 随 worker 记录保留，close + retention 后删除).
      *
-     * Two rules, and the second one is the one that matters over months: a home whose worker
-     * CLOSED longer ago than `homeRetentionDays` goes, and a home whose worker row is gone
-     * entirely goes immediately. The second is what reclaims the homes of workers the event-log
-     * retention sweep already dropped — without it, `<dataDir>/homes` grows without bound and
-     * nothing in the daemon ever looks at it again.
+     * TWO sources, and neither is "I have not heard of it": a home whose worker CLOSED longer ago
+     * than `homeRetentionDays`, and a home `orphansAtBoot` already established belongs to no row.
+     * Anything else is LEFT ALONE — see `orphansAtBoot` for the create-window race that rule
+     * exists to close.
      *
-     * A home whose worker is in `keep` is NEVER touched, whatever its age, because `keep` is the
-     * set of rows that still exist — including hibernated ones, which own no process and may sleep
-     * for a month before waking into the session files this directory holds.
+     * A home in `keep` is never touched, whatever the other two say: `keep` is every row that still
+     * exists, hibernated ones included, and those may sleep for a month before waking into the
+     * session files the directory holds (E7).
      */
     async sweep(spec): Promise<{ readonly removed: readonly WorkerId[] }> {
       let entries: string[];
@@ -182,17 +210,17 @@ export function createHomeManager(o: HomeManagerOptions): HomeManager {
 
       const cutoff = spec.nowMs - spec.retentionDays * 86_400_000;
       const removed: WorkerId[] = [];
-      // The index is by SEGMENT, because that is what the directory name is: a worker id that
+      // Every index is by SEGMENT, because that is what a directory name is: a worker id that
       // needed hex-encoding would never match a raw comparison.
       const keep = new Set([...spec.keep].map((id) => segment(id)));
       const closedAt = new Map([...spec.closedAtMs].map(([id, ms]) => [segment(id), ms]));
+      const orphans = new Set([...spec.orphans].map((id) => segment(id)));
 
       for (const entry of entries) {
         if (keep.has(entry)) continue;
         const closed = closedAt.get(entry);
-        // A row we have never heard of: the worker record is gone, so nothing can ever read this
-        // home again.
-        if (closed !== undefined && closed > cutoff) continue;
+        const retired = closed !== undefined && closed <= cutoff;
+        if (!retired && !orphans.has(entry)) continue;
         try {
           await rm(join(homesRoot(o.dataDir), entry), { recursive: true, force: true });
           removed.push(entry as WorkerId);

@@ -423,6 +423,32 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   await workers.adopt();
 
   /**
+   * M3-WP1: the worker HOMES that belong to no row, snapshotted here and nowhere else.
+   *
+   * It has to be taken at this exact point — after adoption has settled every abandoned row, and
+   * before `start()` lets a single `POST /v1/workers` in. A home is created BEFORE its agent is
+   * spawned and the worker only enters the registry once its handshake returns, so during a ~7 s
+   * `npx` cold start there is a home with no row; a sweep that read "no row" as "orphan" would
+   * delete a live worker's credential link mid-create. The real-agent acceptance run found exactly
+   * that, and this is the structural fix rather than a grace period.
+   */
+  const homeOrphans =
+    credentialLayer === undefined
+      ? new Set<WorkerId>()
+      : await credentialLayer.homes
+          .orphansAtBoot(
+            new Set(
+              (persistence === null ? [] : persistence.workers.list()).map(
+                (row) => row.snapshot.workerId,
+              ),
+            ),
+          )
+          .catch((e: unknown) => {
+            logger.warn("listing worker homes at boot failed", { error: String(e) });
+            return new Set<WorkerId>();
+          });
+
+  /**
    * ── §24.4's boot order, and every arrow in it is load-bearing ────────────────────────────────
    *
    *     persistence → worker adopt → run recover → delivery requeue → dispatcher.start → listen
@@ -506,10 +532,38 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
       ? {}
       : {
           homes: async (nowMs: number) => {
-            const rows = persistence === null ? [] : persistence.workers.list();
             const keep = new Set<WorkerId>();
             const closedAtMs = new Map<WorkerId, number>();
-            for (const row of rows) {
+
+            /**
+             * THE LIVE FLEET FIRST, and it is not an optimisation.
+             *
+             * Under `eventLog.driver:"memory"` — still the default for `createDaemon()` (ruling
+             * M1-R17) — there are NO rows at all, so a sweep that read only the store would find
+             * an empty `keep` and delete the home of every RUNNING worker: the credential link
+             * and the agent's live session files, out from under a process that is mid-turn.
+             *
+             * Every worker belongs to exactly one token and every configured token can see its
+             * own (D13), so the union over the token table is the whole fleet. A worker whose
+             * token an operator has since REMOVED resolves to no context and is therefore not
+             * kept — which is correct rather than unfortunate: that worker can never be woken or
+             * controlled again either (§15.3 step 2 closes it with `acl_revoked`).
+             */
+            for (const token of resolved.tokens) {
+              try {
+                for (const w of workers.list(tokens.contextFor(token.id, null))) {
+                  if (w.state === "closed") closedAtMs.set(w.workerId, nowMs);
+                  else keep.add(w.workerId);
+                }
+              } catch {
+                // A token that no longer resolves contributes nothing, which is the fail-closed
+                // half: it cannot be used to KEEP a home either.
+              }
+            }
+
+            // …then the persisted rows, which are authoritative about WHEN a closed worker closed
+            // — the live listing only knows that it is closed now.
+            for (const row of persistence === null ? [] : persistence.workers.list()) {
               const id = row.snapshot.workerId;
               if (row.snapshot.state === "closed") closedAtMs.set(id, row.closedAtMs ?? nowMs);
               else keep.add(id);
@@ -519,6 +573,9 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
               retentionDays: resolved.credentials.homeRetentionDays,
               keep,
               closedAtMs,
+              // Snapshotted at boot, never re-derived: see `homeOrphans` above for the create
+              // window that makes "I have not heard of this worker" an unusable signal.
+              orphans: homeOrphans,
             });
             if (swept.removed.length > 0) {
               logger.info("removed retired worker homes", { count: swept.removed.length });

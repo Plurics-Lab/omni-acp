@@ -196,6 +196,7 @@ describe("createHomeManager.sweep — §Home 隔离's retention", () => {
       // every row that is running.
       keep: new Set([W("a"), W("b")]),
       closedAtMs: new Map(),
+      orphans: new Set(),
     });
     expect(swept.removed).toEqual([]);
     expect(await readdir(live)).toEqual([]);
@@ -218,25 +219,92 @@ describe("createHomeManager.sweep — §Home 隔离's retention", () => {
         // files, which is what the retention window is FOR.
         [W("d"), now - 3_600_000],
       ]),
+      orphans: new Set(),
     });
     expect(swept.removed).toEqual([W("c")]);
     expect(await readdir(join(r.dataDir, "homes"))).toEqual([W("d")]);
   });
 
-  it("removes a home whose worker row is GONE ENTIRELY, immediately", async () => {
+  it("removes a home `orphansAtBoot` established belongs to no row", async () => {
     const r = await rig();
     await r.homes.create(W("e"));
-    // This is the rule that matters over months: the event-log retention sweep drops the ROW, and
-    // without this line `<dataDir>/homes` would grow forever with directories nothing in the
-    // daemon ever looks at again.
+    // The rule that matters over months: the event-log retention sweep drops the ROW, and without
+    // this one `<dataDir>/homes` would grow forever with directories nothing in the daemon ever
+    // looks at again.
+    //
+    // It reads `orphans` and NOT "a worker I have not heard of", and the difference is a bug the
+    // real-agent acceptance run found: `orphansAtBoot` is the only moment at which "no row" really
+    // means "no worker" (see the case below).
+    const orphans = await r.homes.orphansAtBoot(new Set());
+    expect([...orphans]).toEqual([W("e")]);
+
     const swept = await r.homes.sweep({
       nowMs: 0,
       retentionDays: 7,
       keep: new Set(),
       closedAtMs: new Map(),
+      orphans,
     });
     expect(swept.removed).toEqual([W("e")]);
     expect(await readdir(join(r.dataDir, "homes"))).toEqual([]);
+  });
+
+  it("LEAVES a home it has merely never heard of — the create window (acceptance finding)", async () => {
+    const r = await rig();
+    /**
+     * THE RACE, and the reason `orphans` is a parameter rather than a derivation.
+     *
+     * A home is created BEFORE the agent is spawned, and the worker only enters the registry once
+     * its handshake returns — so for the whole of a ~7 s `npx` cold start there is a home with no
+     * row, indistinguishable by inspection from an orphan. The first version of this sweep read
+     * "no row" as "orphan" and deleted a LIVE worker's credential link mid-create; the real-agent
+     * acceptance run caught it as a claude-acp worker that authenticated once and then could not,
+     * with nothing in the log connecting the two.
+     *
+     * So a home in NONE of the three sets is left alone. It is either a worker mid-create or a row
+     * this sweep could not read, and deleting a live worker's credential is the one irreversible
+     * mistake available here.
+     */
+    const midCreate = await r.homes.create(W("f"));
+    const swept = await r.homes.sweep({
+      nowMs: 10 * 86_400_000,
+      retentionDays: 0,
+      keep: new Set(),
+      closedAtMs: new Map(),
+      // Taken BEFORE this home existed, which is what `createDaemon` does: adoption first, the
+      // snapshot second, `start()` only after that.
+      orphans: new Set(),
+    });
+    expect(swept.removed).toEqual([]);
+    expect(await readdir(join(r.dataDir, "homes"))).toEqual([W("f")]);
+    expect(await lstat(midCreate)).toBeTruthy();
+  });
+
+  it("orphansAtBoot keeps a home whose row IS known", async () => {
+    const r = await rig();
+    await r.homes.create(W("h"));
+    await r.homes.create(W("i"));
+    // `rows` is every worker row the store holds, live and closed alike: a closed worker's home is
+    // the retention window's business, not the orphan set's.
+    const orphans = await r.homes.orphansAtBoot(new Set([W("h")]));
+    expect([...orphans]).toEqual([W("i")]);
+  });
+
+  it("keeps a home that is in `keep` even when `closedAtMs` says it closed long ago", async () => {
+    const r = await rig();
+    await r.homes.create(W("g"));
+    // The two inputs DISAGREE, which is the shape the daemon's own sweep produces when a row says
+    // `closed` and the live listing has not caught up: `keep` wins, because deleting the home of a
+    // worker that still exists is the one irreversible mistake available here.
+    const swept = await r.homes.sweep({
+      nowMs: 10 * 86_400_000,
+      retentionDays: 0,
+      keep: new Set([W("g")]),
+      closedAtMs: new Map([[W("g"), 0]]),
+      orphans: new Set([W("g")]),
+    });
+    expect(swept.removed).toEqual([]);
+    expect(await readdir(join(r.dataDir, "homes"))).toEqual([W("g")]);
   });
 
   it("answers an empty sweep when no home has ever been made", async () => {
@@ -244,8 +312,16 @@ describe("createHomeManager.sweep — §Home 隔离's retention", () => {
     // A daemon that has never isolated a home has no `homes/` directory, which is the normal state
     // of an M2 config and must not be an error on a timer.
     expect(
-      await r.homes.sweep({ nowMs: 0, retentionDays: 1, keep: new Set(), closedAtMs: new Map() }),
+      await r.homes.sweep({
+        nowMs: 0,
+        retentionDays: 1,
+        keep: new Set(),
+        closedAtMs: new Map(),
+        orphans: new Set(),
+      }),
     ).toEqual({ removed: [] });
+    // …and `orphansAtBoot` answers the empty set rather than throwing on the missing directory.
+    expect([...(await r.homes.orphansAtBoot(new Set()))]).toEqual([]);
   });
 });
 

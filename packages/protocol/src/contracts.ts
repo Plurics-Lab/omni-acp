@@ -1458,14 +1458,33 @@ export interface HomeManager {
   unlink(o: { readonly home: string; readonly files: readonly string[] }): Promise<void>;
   remove(workerId: WorkerId): Promise<void>;
   /**
-   * The retention sweep: delete the home of every worker that is closed and older than
-   * `credentials.homeRetentionDays`, plus any home whose worker row is gone entirely.
+   * Homes on disk that belong to NO worker row — computed ONCE, before any worker of this boot can
+   * exist (`createDaemon`, right after boot adoption).
+   *
+   * It is a separate call rather than a `sweep` flag because of a race that a timing heuristic
+   * cannot close honestly: a home is created BEFORE the agent is spawned, and the worker only
+   * enters the registry once its handshake has returned — so for the whole of a ~7 s `npx` cold
+   * start there is a home with no row, which is indistinguishable from an orphan by inspection.
+   * Snapshotting the orphans once, at a moment when no worker of this boot can be mid-create,
+   * makes the distinction structural.
+   */
+  orphansAtBoot(rows: ReadonlySet<WorkerId>): Promise<ReadonlySet<WorkerId>>;
+  /**
+   * The retention sweep: delete the home of every worker that is CLOSED and older than
+   * `credentials.homeRetentionDays`, plus every home in `orphans`.
+   *
+   * A home in `keep` is never touched, whatever the other two say — including a HIBERNATED
+   * worker's, which owns no process and may sleep for a month before waking into the session files
+   * the directory holds (E7). A home that is in none of the three is LEFT ALONE, which is the
+   * conservative half: it is either a worker mid-create or a row this sweep could not read, and
+   * deleting a live worker's credential link is the one irreversible mistake available here.
    */
   sweep(o: {
     readonly nowMs: number;
     readonly retentionDays: number;
     readonly keep: ReadonlySet<WorkerId>;
     readonly closedAtMs: ReadonlyMap<WorkerId, number>;
+    readonly orphans: ReadonlySet<WorkerId>;
   }): Promise<{ readonly removed: readonly WorkerId[] }>;
 }
 
