@@ -403,6 +403,7 @@ export function localLoginAgents(): readonly string[] {
  */
 export async function readLocalCredential(
   agent: string,
+  /** The home to read from. A PARAMETER so a test never has to touch the developer's own login. */
   o?: { home?: string },
 ): Promise<CredentialInput> {
   const known = LOCAL_LOGINS[agent];

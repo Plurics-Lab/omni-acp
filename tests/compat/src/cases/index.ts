@@ -1,4 +1,5 @@
 import { configOptionCases } from "./config-option.js";
+import { credentialCases } from "./credentials.js";
 import { elicitationCases } from "./elicitation.js";
 import { m1Cases } from "./m1.js";
 import { patchCases } from "./patch.js";
@@ -30,5 +31,8 @@ export function compatCases(): readonly CompatCase[] {
     ...webhookRunCases(),
     ...promptContentCases(),
     ...patchCases(),
+    // M3-WP1's one case. `requires: ["resume"]` is sourced from the PROBE, so an agent that cannot
+    // resume is a printed `capability` skip rather than a failure (§18.3).
+    ...credentialCases(),
   ];
 }

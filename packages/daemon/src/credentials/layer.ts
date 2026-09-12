@@ -156,7 +156,28 @@ export function createCredentialLayer(o: CredentialLayerOptions): CredentialLaye
     homes: o.homes,
 
     async validate(spec): Promise<void> {
-      await resolve({ ...spec, home: null });
+      const binding = await resolve({ ...spec, home: null });
+      /**
+       * `credential: "none"` is REFUSED AT CREATE for a runtime that declares a credential
+       * contract, and that is acceptance 2 literally: a `claude-acp` worker with no credential is
+       * `422 credential_required` when it is created, not when it is first prompted.
+       *
+       * The refusal belongs HERE and not in the store because the two layers answer two different
+       * questions. `"none"` MEANS "an empty home" and the store resolves it faithfully — which is
+       * what makes it usable through `setCredential` to revoke a live worker's credential. What
+       * CREATE adds is the judgement: a worker that can never authenticate is a worker whose first
+       * prompt is a guaranteed `-32000 Authentication required` (claude, measured) or a
+       * `session/new` failure (codex, measured), and answering that before the ~7 s cold start is
+       * the whole point of validating at create.
+       */
+      if (binding.method === "none") {
+        throw new OmniError(
+          "credential_required",
+          `agent ${JSON.stringify(spec.agentId)} needs a credential and this worker asked for "none"; ` +
+            "name a stored credential, or omit it to inherit the daemon's environment",
+          { detail: { agentId: spec.agentId } },
+        );
+      }
     },
 
     async bind(spec): Promise<CredentialBinding> {
@@ -167,7 +188,40 @@ export function createCredentialLayer(o: CredentialLayerOptions): CredentialLaye
       // cannot express, and building a directory nothing reads would be theatre.
       if (contract === null) return await resolve({ ...spec, home: null });
 
+      /**
+       * Resolved TWICE, and the first pass is what stops an `inherit` worker owning a directory.
+       *
+       * The store needs the home path to compose `env[homeEnv]`, so a naive implementation creates
+       * the directory first and then discovers the credential resolved to `inherit` — leaving an
+       * empty `<dataDir>/homes/<wid>` that nothing ever reads and that the retention sweep then
+       * has to reap. The first pass costs one `meta.json` read and tells us which of the two
+       * shapes this is.
+       */
+      const probe = await resolve({ ...spec, home: null });
+      if (probe.method === "inherit") return probe;
+
       const isolated = spec.home !== "shared";
+      if (!isolated && probe.method === "files") {
+        /**
+         * REFUSED, rather than silently inherited.
+         *
+         * A `files` credential can only reach the agent through its HOME — that is what E1 and E2
+         * measure — so `home: "shared"` asks for a credential to be used and for the only channel
+         * that could carry it to be absent. Answering with the daemon's own environment instead
+         * would hand back a worker that is authenticated as SOMEBODY ELSE with nothing saying so,
+         * which is the silent-degradation failure ruling M2-R12 refuses for env keys.
+         *
+         * The token / apiKey shapes are fine on a shared home: they land in an environment
+         * variable and need no directory at all.
+         */
+        throw new OmniError(
+          "bad_request",
+          `credential ${JSON.stringify(probe.name)} is a file credential and can only be given to ` +
+            `agent ${JSON.stringify(spec.agentId)} through an isolated home; use home:"isolated" ` +
+            "or store a token/apiKey credential instead",
+          { detail: { agentId: spec.agentId, credential: probe.name } },
+        );
+      }
       const home = isolated ? await o.homes.create(spec.workerId) : null;
       const binding = await resolve({ ...spec, home });
 
