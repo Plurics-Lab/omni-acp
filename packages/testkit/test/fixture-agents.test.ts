@@ -203,7 +203,9 @@ describe("fixtures/agents/orphan.mjs", () => {
       // WP-2 acceptance 9: `exited` has fired, but the grandchild INHERITED stdout, so the pipe
       // is still open and `stdoutEnded` has NOT. A close path that awaits EOF hangs right here,
       // which is the hang this knob exists to reproduce.
-      expect(agent.child.stdout.readableEnded).toBe(false);
+      // Windows may close the leader's pipe despite a live descendant. Keep the POSIX EOF
+      // assertion, but use liveness and marker growth below as the portable orphan oracle.
+      if (process.platform !== "win32") expect(agent.child.stdout.readableEnded).toBe(false);
       expect(await isAlive(grandchild)).toBe(true);
 
       // ...and the descendant is still writing, so the marker file still grows after the death

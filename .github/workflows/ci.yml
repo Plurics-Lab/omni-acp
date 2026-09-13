@@ -47,7 +47,8 @@ jobs:
 
       # CONTRACTS.md §10.3's macOS multiplier: the timing budgets in the suites read
       # OMNI_TEST_SLOW_FACTOR, so the leg that needs it has to actually set it.
-      - run: pnpm -r test
+      # Report every package's failures, even if an earlier dependency's tests fail.
+      - run: pnpm -r --no-bail test
         env:
           OMNI_TEST_SLOW_FACTOR: ${{ matrix.os == 'macos-latest' && '2' || '1' }}
 
