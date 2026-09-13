@@ -179,7 +179,7 @@ describe("fixtures/agents/orphan.mjs", () => {
     }
   });
 
-  it("ORPHAN_EXIT_AFTER_MS: the leader leaves, the grandchild holds stdout open (the zombie)", async () => {
+  it("ORPHAN_EXIT_AFTER_MS: POSIX keeps the orphan pipe open; Windows reclaims attached children", async () => {
     const dir = mkdtempSync(join(tmpdir(), "omni-zombie-"));
     const marker = join(dir, "marker.txt");
     let grandchild = 0;
@@ -200,12 +200,22 @@ describe("fixtures/agents/orphan.mjs", () => {
 
       expect(await exit).toBe(0); // it left on its own — nobody killed it
 
+      // libuv assigns non-detached Windows children to a kill-on-parent-exit job.
+      // This fixture does not opt out of it, so Windows must reclaim the descendant.
+      if (process.platform === "win32") {
+        expect(await waitGone(grandchild, 3_000)).toBe(true);
+        await expect.poll(() => agent.child.stdout.readableEnded).toBe(true);
+        const settled = statSync(marker).size;
+        expect(settled).toBeGreaterThan(0);
+        await sleep(200);
+        expect(statSync(marker).size).toBe(settled);
+        return;
+      }
+
       // WP-2 acceptance 9: `exited` has fired, but the grandchild INHERITED stdout, so the pipe
       // is still open and `stdoutEnded` has NOT. A close path that awaits EOF hangs right here,
       // which is the hang this knob exists to reproduce.
-      // Windows may close the leader's pipe despite a live descendant. Keep the POSIX EOF
-      // assertion, but use liveness and marker growth below as the portable orphan oracle.
-      if (process.platform !== "win32") expect(agent.child.stdout.readableEnded).toBe(false);
+      expect(agent.child.stdout.readableEnded).toBe(false);
       expect(await isAlive(grandchild)).toBe(true);
 
       // ...and the descendant is still writing, so the marker file still grows after the death

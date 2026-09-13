@@ -46,7 +46,15 @@ the resolved path inside that container.
 Merge the following into the remote daemon's YAML. Replace the placeholder
 digests with SHA-256 hashes of separately generated random bearer tokens; never
 use example values as credentials. The service account must own the management
-directory with mode `0700`.
+directory with mode `0700` on Linux/macOS. Use its physical path (resolve system
+temporary-directory aliases with `realpath` on macOS); symlink ancestors are rejected.
+
+**Temporary Windows limitation:** the daemon does not validate NTFS ACLs and skips
+POSIX ownership/mode-bit checks on Windows. The operator must restrict the store
+with NTFS ACLs so untrusted accounts cannot read its secrets or modify its files.
+Do not use a shared or broadly writable directory. Symlink/junction rejection,
+workspace separation, integrity validation, and API authorization remain enabled.
+This is not equivalent to verified owner-only storage on Linux/macOS.
 
 ```yaml
 mcpManagement:

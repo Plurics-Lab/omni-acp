@@ -6,9 +6,10 @@
 // within 2s. It needs no pid introspection, which is exactly what Windows cannot give us
 // (CONTRACTS.md §6.4, M0-PLAN WP-2 acceptance 5).
 //
-// The grandchild INHERITS this process's stdout, so it also holds the ndJSON pipe open after
-// the leader exits — the "zombie" case where `stdoutEnded` fires long after `exited`, or never
-// (WP-2 acceptance 9). Set ORPHAN_EXIT_AFTER_MS to make the leader leave on its own.
+// On POSIX the grandchild INHERITS stdout and holds the ndJSON pipe open after the leader
+// exits — the "zombie" case (WP-2 acceptance 9). On Windows libuv's job object instead kills
+// this non-detached child when its parent exits, so the pipe closes too.
+// Set ORPHAN_EXIT_AFTER_MS to make the leader leave on its own.
 //
 // Env: MARKER_FILE (required), ORPHAN_INTERVAL_MS (default 100), ORPHAN_EXIT_AFTER_MS (unset),
 //      ORPHAN_SURVIVE_EOF (unset).

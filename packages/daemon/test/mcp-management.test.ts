@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdtemp,
   mkdir,
   readFile,
@@ -83,6 +84,32 @@ function artifact(path = "main.js", content = "console.log('MCP');"): InstallMcp
   };
 }
 describe("MCP management", () => {
+  it("enforces owner-only directory modes on POSIX, leaving Windows ACLs to the operator", async () => {
+    const { store, config, dir } = await setup();
+    await store.close();
+    await chmod(join(dir, "store"), 0o755);
+    if (process.platform === "win32") {
+      stores.push(await createMcpManagement(config));
+    } else {
+      await expect(createMcpManagement(config)).rejects.toThrow(/owner-only/);
+    }
+  });
+  it("enforces private record modes on POSIX, leaving Windows ACLs to the operator", async () => {
+    const { store, admin, config, dir } = await setup();
+    await store.registerPreset(admin, { name: "permissions", server: { command: "node" } });
+    await store.close();
+    delete config.mcpServers.permissions;
+    await chmod(join(dir, "store/presets/permissions.json"), 0o644);
+    if (process.platform === "win32") {
+      const reopened = await createMcpManagement(config);
+      stores.push(reopened);
+      expect(
+        (await reopened.listPresets(admin)).presets.some((p) => p.name === "permissions"),
+      ).toBe(true);
+    } else {
+      await expect(createMcpManagement(config)).rejects.toThrow(/invalid MCP store file/);
+    }
+  });
   it("rejects corrupted persisted manifests and releases failed-start lock", async () => {
     const { store, admin, config, dir } = await setup();
     const installed = await store.install(admin, artifact());

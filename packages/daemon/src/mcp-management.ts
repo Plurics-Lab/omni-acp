@@ -44,6 +44,9 @@ interface InstallationRecord {
   files: { path: string; sha256: string }[];
 }
 const digest = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
+// Windows reports synthetic POSIX mode bits, not NTFS ACLs. Until ACL validation is
+// implemented, operators must restrict the store themselves; all other guards still apply.
+const enforcePosixPermissions = process.platform !== "win32";
 const inside = (root: string, path: string): boolean => {
   const r = relative(root, path);
   return r === "" || (!r.startsWith("..") && !isAbsolute(r));
@@ -79,8 +82,8 @@ export async function createMcpManagement(
     if (
       !stat.isDirectory() ||
       stat.isSymbolicLink() ||
-      (process.getuid && stat.uid !== process.getuid()) ||
-      (stat.mode & 0o077) !== 0
+      (enforcePosixPermissions &&
+        ((process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0))
     ) {
       bad("MCP management directory must be owner-only, owned by the daemon, and not a symlink");
     }
@@ -481,7 +484,7 @@ async function readRecord(path: string): Promise<unknown> {
   if (
     !stat.isFile() ||
     stat.isSymbolicLink() ||
-    (stat.mode & 0o077) !== 0 ||
+    (enforcePosixPermissions && (stat.mode & 0o077) !== 0) ||
     stat.size > 2 * 1024 * 1024 ||
     (await realpath(path)) !== path
   )

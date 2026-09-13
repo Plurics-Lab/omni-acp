@@ -181,7 +181,9 @@ describe("tree kill", () => {
         agent.stdoutEnded.then(() => "ended" as const),
         sleep(slow(EXIT_GRACE_MS + 100)).then(() => "still open" as const),
       ]);
-      expect(ended).toBe("still open");
+      // Non-detached Windows descendants belong to libuv's kill-on-parent-exit job.
+      // Only POSIX reproduces the inherited-pipe zombie; Windows closes the pipe.
+      expect(ended).toBe(isWindows ? "ended" : "still open");
 
       // 3. So the Worker's exitGraceMs elapses and it forces — and that call RETURNS.
       const startedAt = Date.now();
