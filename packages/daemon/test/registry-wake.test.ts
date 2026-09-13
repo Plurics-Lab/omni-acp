@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -255,11 +255,13 @@ describe("the WAKE path reproduces create()'s environment (review findings V2/V8
     // `assertPromptContent` refused with "no cwdRoots": `500 internal` on every path-bearing
     // prompt block, after a restart and only then, for a worker whose create path was fine.
     //
-    // Both spellings fail CLOSED for a cwd under `os.tmpdir()`, which is why the message is what
+    // Both spellings fail CLOSED for a cwd outside homedir(), which is why the message is what
     // separates them: "no cwdRoots" is a MIS-BOUND gate, "cwd is outside cwdRoots" is a gate that
     // is correctly bound to a root this worker is not under.
     const r = rig();
-    r.wake(row());
+    // Windows tmpdir is INSIDE homedir; its parent is outside on every supported runner.
+    const persisted = row({ snapshot: { ...row().snapshot, cwd: resolve(homedir(), "..") } });
+    r.wake(persisted);
     const validate = lastDeps()["validateContent"] as (c: readonly unknown[]) => Promise<void>;
     const thrown = await validate([link(inside)]).then(
       () => null,

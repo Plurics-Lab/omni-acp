@@ -101,7 +101,9 @@ describe("M3-WP1 acceptance 1 — two workers, two homes, ONE canonical credenti
       const home = homeOf(h, worker.id);
       expect(worker.snapshot.home).toBe(home);
       expect((await lstat(home)).isDirectory()).toBe(true);
-      expect(((await lstat(home)).mode & 0o777).toString(8)).toBe("700");
+      // POSIX permissions are not an NTFS ACL assertion.
+      if (process.platform !== "win32")
+        expect(((await lstat(home)).mode & 0o777).toString(8)).toBe("700");
     }
     expect(first.snapshot.home).not.toBe(second.snapshot.home);
 

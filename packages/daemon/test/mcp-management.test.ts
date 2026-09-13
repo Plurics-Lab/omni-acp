@@ -195,7 +195,7 @@ describe("MCP management", () => {
     const meta = await store.registerPreset(admin, { name: "allowed", installationId: one.id });
     expect(meta.installationId).toBe(one.id);
     expect(config.mcpServers.allowed?.command).toBe(process.execPath);
-    expect(config.mcpServers.allowed?.args[0]).toContain(`${one.id}/files/main.js`);
+    expect(config.mcpServers.allowed?.args[0]).toContain(join(one.id, "files", "main.js"));
   });
   it.each(["../escape", "/absolute", "a/../b", "a\\b", "a//b", "a/./b", "CON", "dir/NUL.txt"])(
     "rejects unsafe path %s",

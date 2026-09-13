@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, rm, symlink, writeFile, realpath as fsRealpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { matchRule, toPolicySubject } from "@omni-acp/core";
 import { PolicyRule } from "@omni-acp/protocol";
@@ -123,12 +123,13 @@ describe("toPolicySubject — a file that does not exist yet (a create)", () => 
   });
 
   it("a path whose every ancestor is missing is still an ABSOLUTE, never a throw", async () => {
-    const s = await toPolicySubject(toolCallRequest(["/nope-nothing-here/at/all.txt"]), {
+    const missing = resolve("/nope-nothing-here/at/all.txt");
+    const s = await toPolicySubject(toolCallRequest([missing]), {
       cwd: cwd(),
       agentId: "fixture",
       realpath: () => Promise.reject(new Error("ENOENT")),
     });
-    expect(s.paths).toEqual(["/nope-nothing-here/at/all.txt"]);
+    expect(s.paths).toEqual([missing]);
   });
 });
 

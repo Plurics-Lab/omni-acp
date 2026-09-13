@@ -240,7 +240,7 @@ describe("createGitDiffProvider (§25, D8)", () => {
     const { result } = await oneTurn(git);
     expect(result?.text).toBeNull();
     expect(result?.warnings.map((w) => w.code)).toEqual(["patch_repo_changed"]);
-    expect(result?.warnings[0]?.detail).toMatchObject({ before: TOP });
+    expect(result?.warnings[0]?.detail).toMatchObject({ before: normalizeTopLevel(TOP) });
   });
 
   it("is null when write-tree fails, and when diff-tree fails, each with its own warning", async () => {

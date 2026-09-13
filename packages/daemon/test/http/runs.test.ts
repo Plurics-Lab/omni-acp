@@ -258,7 +258,9 @@ describe("run routes (H25)", () => {
 // ── the subsystem, on both drivers ───────────────────────────────────────────
 
 const dirs: string[] = [];
+const handles: Awaited<ReturnType<typeof openPersistence>>[] = [];
 afterEach(async () => {
+  for (const handle of handles.splice(0)) await handle.close();
   while (dirs.length > 0) {
     const dir = dirs.pop();
     if (dir !== undefined) await rm(dir, { recursive: true, force: true });
@@ -281,6 +283,7 @@ async function subsystem(o: { durable: boolean }): Promise<ReturnType<typeof cre
       clock,
       logger: nullLogger(),
     });
+    handles.push(persistence);
   }
   return createRunSubsystem({
     config: resolved,

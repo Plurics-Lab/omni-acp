@@ -13,8 +13,8 @@ import { scaled, tempRoot, until } from "./support/harness.js";
 /**
  * §15.7's orphan handling, proven against a process that REALLY survived (M1-PLAN §2, WP-F 8).
  *
- * A daemon in a CHILD process with `orphan.mjs`, SIGKILLed; the marker file keeps growing, which
- * is what proves the orphan outlived its daemon rather than the test asserting a fixture.
+ * A daemon in a CHILD process with `orphan.mjs`, SIGKILLed; on POSIX the marker keeps growing,
+ * proving the orphan survived. Windows instead reclaims this non-detached tree via libuv jobs.
  *
  * The RECORD half runs everywhere — including Windows, where `orphansAtStart` must report
  * `{found: 1, reaped: 0, skipped: 1}` rather than silence. Only the REAP half is
@@ -110,6 +110,8 @@ setInterval(() => {}, 1000);
   expect(daemonPid).toBeGreaterThan(0);
   expect(line.pid).toBeGreaterThan(0);
 
+  // Prove the fixture was active before killing its daemon (Windows reclaims it on exit).
+  expect(await until(() => markerSize(marker) > 0, scaled(5_000), 25)).toBe(true);
   child.kill("SIGKILL");
   expect(await waitGone(daemonPid, scaled(10_000))).toBe(true);
 
@@ -175,9 +177,17 @@ function configFor(dataDir: string, cwd: string, token: string, marker: string):
 }
 
 describe("recovery from a previous boot", () => {
-  it("the orphan really survives: the marker file keeps growing after the daemon is SIGKILLed", async () => {
+  it("POSIX orphans survive daemon SIGKILL; Windows reclaims its attached tree", async () => {
     const doomed = await abandonADaemon();
     try {
+      if (WINDOWS) {
+        // libuv's non-detached children are in kill-on-parent-exit job objects.
+        expect(await waitGone(doomed.agentPid, scaled(5_000))).toBe(true);
+        const settled = markerSize(doomed.marker);
+        await new Promise<void>((r) => setTimeout(r, scaled(250)));
+        expect(markerSize(doomed.marker)).toBe(settled);
+        return;
+      }
       // The daemon is gone. If the agent tree went with it, everything below this file asserts is
       // about a situation that never happened — so this is the load-bearing assertion.
       // The grandchild appends every 50 ms, so the file exists within a tick or two of the

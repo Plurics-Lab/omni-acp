@@ -387,6 +387,9 @@ export async function main(
     daemon = await createDaemon(config);
     await daemon.start();
   } catch (e) {
+    // createDaemon opens persistence before start binds. Release it on bind failure too;
+    // otherwise an embedded CLI call leaks the database (and Windows cannot unlink it).
+    await daemon?.stop({ graceful: false }).catch(() => undefined);
     write(out.stderr, `omni-acp: failed to start: ${messageOf(e)}\n`);
     return EXIT_FAILURE;
   }

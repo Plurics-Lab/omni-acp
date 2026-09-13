@@ -286,7 +286,7 @@ describe("createDaemon — a wake re-runs the ACL (H14, §15.7)", () => {
       // The operator narrowed `t` to `other` and reloaded. The agent still EXISTS in the
       // catalog — `catalog.get` throwing already covers a removed agent — so this is the case
       // H14 names and the one nothing else catches.
-      tokens: [{ id: "t", secret: SECRET, role: "admin", agents: ["other"], cwdRoots: ["/"] }],
+      tokens: [{ id: "t", secret: SECRET, role: "admin", agents: ["other"], cwdRoots: [tmpdir()] }],
       rowCwd: (root) => root,
     });
 
@@ -314,7 +314,9 @@ describe("createDaemon — a wake re-runs the ACL (H14, §15.7)", () => {
 
   it("the SAME row wakes when the ACL still allows it — the check is the narrowing, not the path", async () => {
     const { daemon, id } = await adopted({
-      tokens: [{ id: "t", secret: SECRET, role: "admin", agents: ["claude"], cwdRoots: ["/"] }],
+      tokens: [
+        { id: "t", secret: SECRET, role: "admin", agents: ["claude"], cwdRoots: [tmpdir()] },
+      ],
       rowCwd: (root) => root,
     });
 

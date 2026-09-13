@@ -64,8 +64,11 @@ describe("createHomeManager.create", () => {
     const r = await rig();
     const home = await r.homes.create(W("1"));
     expect(home).toBe(homeDir(r.dataDir, W("1")));
-    expect(await mode(home)).toBe("700");
-    expect(await mode(join(r.dataDir, "homes"))).toBe("700");
+    // Windows chmod is advisory and stat.mode does not represent NTFS ACLs.
+    if (process.platform !== "win32") {
+      expect(await mode(home)).toBe("700");
+      expect(await mode(join(r.dataDir, "homes"))).toBe("700");
+    }
 
     // E7: the agent's OWN session files live in here (claude writes `projects/`, codex writes
     // `thread_history_1.sqlite`), so a wake and a restart must reuse the SAME directory. `create`
@@ -75,16 +78,19 @@ describe("createHomeManager.create", () => {
     expect(await readFile(join(home, "session-state"), "utf8")).toBe("the conversation");
   });
 
-  it("restores 0700 on a directory somebody else created at 0755", async () => {
-    const r = await rig();
-    const home = homeDir(r.dataDir, W("2"));
-    await mkdir(home, { recursive: true, mode: 0o755 });
-    await chmod(home, 0o755);
-    // `mkdir`'s mode is not applied to a pre-existing directory, so the `chmod` is the half that
-    // actually bites — and a 0755 home is a credential another local account can read.
-    await r.homes.create(W("2"));
-    expect(await mode(home)).toBe("700");
-  });
+  it.skipIf(process.platform === "win32")(
+    "restores 0700 on a directory somebody else created at 0755",
+    async () => {
+      const r = await rig();
+      const home = homeDir(r.dataDir, W("2"));
+      await mkdir(home, { recursive: true, mode: 0o755 });
+      await chmod(home, 0o755);
+      // `mkdir`'s mode is not applied to a pre-existing directory, so the `chmod` is the half that
+      // actually bites — and a 0755 home is a credential another local account can read.
+      await r.homes.create(W("2"));
+      expect(await mode(home)).toBe("700");
+    },
+  );
 });
 
 describe("createHomeManager.link — a LINK, not a copy (E3)", () => {

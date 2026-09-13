@@ -120,23 +120,27 @@ afterEach(async () => {
 });
 
 describe("createCredentialStore — the modes, and they are asserted on the filesystem", () => {
-  it("writes every directory 0700 and every file 0600", async () => {
-    const r = await rig();
-    await r.store.put(r.a, "claude-acp", "default", {
-      kind: "files",
-      files: { ".credentials.json": claudeCredential(Date.now() + 3_600_000) },
-    });
+  // POSIX-only permission assertions; the functional credential tests still run on Windows.
+  it.skipIf(process.platform === "win32")(
+    "writes every directory 0700 and every file 0600",
+    async () => {
+      const r = await rig();
+      await r.store.put(r.a, "claude-acp", "default", {
+        kind: "files",
+        files: { ".credentials.json": claudeCredential(Date.now() + 3_600_000) },
+      });
 
-    const dir = credentialDir(r.dataDir, "a", "claude-acp", "default");
-    // 0700 all the way down, so another local account cannot even LIST the tree — which is the
-    // posture `ids-file.ts`, `probe-cache.ts` and the data dir itself already take.
-    expect(await mode(join(r.dataDir, "credentials"))).toBe("700");
-    expect(await mode(join(r.dataDir, "credentials", "a"))).toBe("700");
-    expect(await mode(dir)).toBe("700");
-    expect(await mode(filesDir(dir))).toBe("700");
-    expect(await mode(join(filesDir(dir), ".credentials.json"))).toBe("600");
-    expect(await mode(metaPath(dir))).toBe("600");
-  });
+      const dir = credentialDir(r.dataDir, "a", "claude-acp", "default");
+      // 0700 all the way down, so another local account cannot even LIST the tree — which is the
+      // posture `ids-file.ts`, `probe-cache.ts` and the data dir itself already take.
+      expect(await mode(join(r.dataDir, "credentials"))).toBe("700");
+      expect(await mode(join(r.dataDir, "credentials", "a"))).toBe("700");
+      expect(await mode(dir)).toBe("700");
+      expect(await mode(filesDir(dir))).toBe("700");
+      expect(await mode(join(filesDir(dir), ".credentials.json"))).toBe("600");
+      expect(await mode(metaPath(dir))).toBe("600");
+    },
+  );
 
   it("puts a token credential in its own file, at 0600, under the descriptor's variable", async () => {
     const r = await rig();
@@ -151,7 +155,7 @@ describe("createCredentialStore — the modes, and they are asserted on the file
     expect(summary.env).toBe("CLAUDE_CODE_OAUTH_TOKEN");
     expect(summary.files).toEqual([]);
     const dir = credentialDir(r.dataDir, "a", "claude-acp", "oauth");
-    expect(await mode(secretPath(dir))).toBe("600");
+    if (process.platform !== "win32") expect(await mode(secretPath(dir))).toBe("600");
     // And `files/` does NOT exist: a token credential has no file the agent reads, and a leftover
     // one would be the file the agent prefers.
     await expect(lstat(filesDir(dir))).rejects.toThrow();
