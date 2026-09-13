@@ -10,6 +10,7 @@ import { registerLeaseRoutes } from "./lease.js";
 import { registerRunRoutes } from "./runs.js";
 import { registerWebhookRoutes } from "./webhooks.js";
 import { registerWorkerRoutes } from "./workers.js";
+import { registerMcpRoutes } from "./mcp.js";
 
 /**
  * Registers H1-H26 of CONTRACTS.md §2.1, in eight modules.
@@ -55,6 +56,7 @@ export function registerRoutes(app: Hono, daemon: Daemon): Hono {
   // M3-WP1's seven (§线上协议). Its OWN module beside `workers.ts`, which is the same split M1 cut
   // and M2 reused: a work package adds routes without editing a frozen file.
   registerCredentialRoutes(app, daemon);
+  registerMcpRoutes(app, daemon);
 
   return app;
 }

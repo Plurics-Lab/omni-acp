@@ -269,6 +269,9 @@ describe("daemon.authenticate / whoami (H3, H13, acceptance 5)", () => {
       policyCeiling: null,
       policyPresets: "*",
       mcpPresets: [],
+      mcpManage: false,
+      mcpInstall: false,
+      mcpManagementEnabled: false,
       webhooks: false,
     });
     await daemon.stop();

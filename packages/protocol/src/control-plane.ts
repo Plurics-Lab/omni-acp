@@ -342,6 +342,10 @@ export interface PromptAccepted {
 }
 
 export interface WhoAmIResponse {
+  /** Optional for older daemon compatibility; absent means false. */
+  readonly mcpManage?: boolean;
+  readonly mcpInstall?: boolean;
+  readonly mcpManagementEnabled?: boolean;
   readonly tokenId: TokenId;
   readonly role: "user" | "admin";
   readonly daemonId: DaemonId;

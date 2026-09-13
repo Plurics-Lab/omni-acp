@@ -165,6 +165,7 @@ describe("guard: http-has-no-logic", () => {
     expect(sources.map((s) => s.file)).toEqual([
       "app.ts",
       "auth-middleware.ts",
+      "bounded-json.ts",
       "errors.ts",
       "routes/agents.ts",
       // M2's four route modules (H22-H26). Each feature adds its OWN file beside `workers.ts`,
@@ -177,6 +178,7 @@ describe("guard: http-has-no-logic", () => {
       "routes/index.ts",
       "routes/interactions.ts",
       "routes/lease.ts",
+      "routes/mcp.ts",
       "routes/runs.ts",
       "routes/webhooks.ts",
       "routes/workers.ts",

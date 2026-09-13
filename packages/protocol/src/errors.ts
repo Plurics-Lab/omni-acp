@@ -43,6 +43,8 @@ export const OMNI_ERROR_CODES = [
   "credential_forbidden",
   "insecure_transport",
   "restarted",
+  "mcp_not_found",
+  "mcp_conflict",
 ] as const;
 export type OmniErrorCode = (typeof OMNI_ERROR_CODES)[number];
 
@@ -78,6 +80,8 @@ export const ERROR_STATUS: { readonly [C in OmniErrorCode]: number } = {
   credential_forbidden: 403,
   insecure_transport: 403,
   restarted: 409,
+  mcp_not_found: 404,
+  mcp_conflict: 409,
 };
 
 /** The agent's JSON-RPC error, passed through verbatim and never reshaped. */

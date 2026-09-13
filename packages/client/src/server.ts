@@ -13,6 +13,7 @@ import {
   type WorkerSnapshot,
 } from "@omni-acp/protocol";
 import { createCredentialsChannel, type CredentialsChannel } from "./credentials.js";
+import { createMcpChannel, type McpChannel } from "./mcp.js";
 import { createRunsChannel, type RunsChannel } from "./runs.js";
 import { createTransport, type Transport, type TransportOptions } from "./transport.js";
 import { createWorkerHandle, disposeWorker, type Worker } from "./worker.js";
@@ -142,6 +143,8 @@ export interface Server {
    * THIS side of the wire and hands you a body rather than a path.
    */
   readonly credentials: CredentialsChannel;
+  /** Remote MCP registration/installation; mutations require explicit administrative grants. */
+  readonly mcp: McpChannel;
   /** Closes local streams. For local(), also stops the embedded daemon. Remote workers survive. */
   close(): Promise<void>;
 }
@@ -192,6 +195,7 @@ export function createServer(
     me,
     runs,
     credentials,
+    mcp: createMcpChannel(transport, assertOpen),
 
     async info(): Promise<DaemonInfo> {
       assertOpen();

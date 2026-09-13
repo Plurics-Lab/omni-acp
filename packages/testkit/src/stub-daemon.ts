@@ -364,6 +364,30 @@ export function stubDaemon(
         throw new OmniError("bad_request", `stubDaemon: webhooks are not enabled (${id})`);
       },
     },
+    mcp: {
+      assertMutation: () => {
+        throw new OmniError("forbidden", "stubDaemon: MCP management disabled");
+      },
+      listPresets: async () => ({ presets: [] }),
+      getPreset: async () => {
+        throw new OmniError("bad_request", "stubDaemon: no MCP preset");
+      },
+      registerPreset: async () => {
+        throw new OmniError("forbidden", "stubDaemon: MCP management disabled");
+      },
+      removePreset: async () => {
+        throw new OmniError("forbidden", "stubDaemon: MCP management disabled");
+      },
+      listInstallations: async () => {
+        throw new OmniError("forbidden", "stubDaemon: MCP management disabled");
+      },
+      getInstallation: async () => {
+        throw new OmniError("forbidden", "stubDaemon: MCP management disabled");
+      },
+      install: async () => {
+        throw new OmniError("forbidden", "stubDaemon: MCP management disabled");
+      },
+    },
     authContextFor: (tokenId, clientId) => stubAuthContext(tokenId, clientId ?? null),
     authenticate: (headers: Headers) => {
       const header = headers.get(HEADER.auth);

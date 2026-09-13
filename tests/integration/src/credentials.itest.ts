@@ -461,6 +461,8 @@ describe("M3-WP1 acceptance 6 — setCredential, and the cross-token 403", () =>
       policyCeiling: null,
       policyPresets: "*",
       mcpPresets: [],
+      mcpManage: false,
+      mcpInstall: false,
       envAllow: [],
     });
 

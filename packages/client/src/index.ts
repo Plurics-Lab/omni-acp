@@ -18,6 +18,7 @@ export type { InteractionRequestHandle } from "./interactions.js";
 export type { RunsChannel } from "./runs.js";
 // ── M3-WP1 (docs/M3-WP1-CREDENTIALS.md) ─────────────────────────────────────
 export type { CredentialsChannel } from "./credentials.js";
+export type { McpChannel } from "./mcp.js";
 export type { LocalCredentialOptions } from "./local-credential.js";
 
 export { OmniError } from "@omni-acp/protocol";
@@ -51,4 +52,8 @@ export type {
   CredentialSummary,
   LoginState,
   RestartResult,
+  InstallMcpRequest,
+  RegisterMcpPresetRequest,
+  McpInstallationMetadata,
+  McpPresetMetadata,
 } from "@omni-acp/protocol";

@@ -116,6 +116,9 @@ export const TokenConfig = z
     /** FAIL CLOSED: default `[]`, not `"*"` (DESIGN §8's 🔴). An MCP server is arbitrary code on
      *  this machine, so a token gets none until an operator names one. */
     mcpPresets: z.union([z.literal("*"), z.array(z.string())]).default([]),
+    /** Explicit admin capabilities; role alone never grants executable deployment. */
+    mcpManage: z.boolean().default(false),
+    mcpInstall: z.boolean().default(false),
     /** Env var NAMES this token may set per worker, ON TOP of the hard blacklist. Default: none. */
     envAllow: z.array(z.string().min(1)).default([]),
     /**
@@ -674,6 +677,30 @@ export const DaemonConfig = z
     policy: PolicyConfig.prefault({}),
     /** DESIGN §8: the ONLY place a stdio MCP command may appear. */
     mcpServers: z.record(z.string().max(64), McpServerPreset).default({}),
+    mcpManagement: z
+      .object({
+        /** Explicit opt-in; must be outside every token's permitted cwd roots. */
+        directory: z.string().min(1).nullable().default(null),
+        maxUploadBytes: z
+          .number()
+          .int()
+          .positive()
+          .max(64 * 1024 * 1024)
+          .default(16 * 1024 * 1024),
+        maxFiles: z.number().int().positive().max(1024).default(128),
+        maxInstallations: z.number().int().positive().max(1024).default(32),
+        maxPresets: z.number().int().positive().max(4096).default(256),
+        /** Only for a trusted TLS-terminating proxy; never inferred from forwarded headers. */
+        allowInsecureTransport: z.boolean().default(false),
+      })
+      .default(() => ({
+        directory: null,
+        maxUploadBytes: 16 * 1024 * 1024,
+        maxFiles: 128,
+        maxInstallations: 32,
+        maxPresets: 256,
+        allowInsecureTransport: false,
+      })),
     watchdog: WatchdogConfig.prefault({}),
     interaction: InteractionConfig.prefault({}),
     diff: DiffConfig.prefault({}),

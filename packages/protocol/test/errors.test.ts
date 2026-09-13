@@ -11,6 +11,8 @@ describe("ERROR_STATUS", () => {
   it("is total over OMNI_ERROR_CODES at runtime, with §9's exact table", () => {
     expect(ERROR_STATUS).toStrictEqual({
       bad_request: 400,
+      mcp_not_found: 404,
+      mcp_conflict: 409,
       unauthorized: 401,
       forbidden: 403,
       policy_exceeds_ceiling: 403,

@@ -50,6 +50,7 @@ import { createProbeService } from "./probe-service.js";
 import { resolvePolicyForRequest } from "./policy/resolve.js";
 import { createRunSubsystem } from "./runs.js";
 import { createWorkerRegistry } from "./registry.js";
+import { createMcpManagement } from "./mcp-management.js";
 import type { BootRecoveryResult } from "./boot-recovery.js";
 import type { AuthContext, Daemon, DaemonDeps, DaemonEvent } from "./types.js";
 
@@ -96,7 +97,20 @@ interface BoundServer {
  */
 export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Promise<Daemon> {
   const resolved = parseConfig(config);
+  const mcp = await createMcpManagement(resolved, deps?.logger ?? createLogger(resolved.logLevel));
+  try {
+    return await createDaemonWithMcp(resolved, mcp, deps);
+  } catch (error) {
+    await mcp.close();
+    throw error;
+  }
+}
 
+async function createDaemonWithMcp(
+  resolved: ResolvedDaemonConfig,
+  mcp: Awaited<ReturnType<typeof createMcpManagement>>,
+  deps?: DaemonDeps,
+): Promise<Daemon> {
   const clock = deps?.clock ?? systemClock();
   const ids = deps?.ids ?? createIdGen();
   const logger = deps?.logger ?? createLogger(resolved.logLevel);
@@ -680,6 +694,7 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
   };
 
   const daemon: Daemon = {
+    mcp,
     id: daemonId,
     config: resolved,
     info,
@@ -764,7 +779,13 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
     },
 
     whoami(auth): WhoAmIResponse {
+      const mcpToken = tokenRow(resolved, auth.tokenId);
       return {
+        mcpManage:
+          auth.role === "admin" && mcpToken?.role === "admin" && mcpToken.mcpManage === true,
+        mcpInstall:
+          auth.role === "admin" && mcpToken?.role === "admin" && mcpToken.mcpInstall === true,
+        mcpManagementEnabled: resolved.mcpManagement.directory !== null,
         tokenId: auth.tokenId,
         role: auth.role,
         daemonId,
@@ -876,6 +897,7 @@ export async function createDaemon(config: DaemonConfig, deps?: DaemonDeps): Pro
          * somebody else's store is how a test that reuses one file across two daemons breaks.
          */
         retention.stop();
+        await mcp.close();
         // Review finding V6: SET BEFORE the store closes, so no verb on this object can reach a
         // finalized statement. Everything above ran while the daemon was still usable, which is
         // what `closeAll` and the drains need.

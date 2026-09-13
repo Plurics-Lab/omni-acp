@@ -37,6 +37,7 @@ wrong-`.js`-specifier and `exports`-map mistakes that source aliasing hides.
 
 ## Documents
 
+- [Remote MCP installation, registration, and permissions](docs/MCP-MANAGEMENT.md)
 - `docs/DESIGN.md` — v0.8, decisions D1–D15, binding
 - `docs/CONTRACTS.md` — M0 code-level contract: every signature in the repository
 - `docs/M0-PLAN.md` — work packages, ownership map, acceptance script

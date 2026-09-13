@@ -1655,6 +1655,7 @@ export type DaemonEvent =
     };
 
 export interface Daemon {
+  readonly mcp: import("./mcp-management.js").McpManagement;
   readonly id: DaemonId;
   readonly config: ResolvedDaemonConfig;
   readonly info: DaemonInfo;

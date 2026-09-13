@@ -34,6 +34,8 @@ describe("DaemonConfig", () => {
           policyCeiling: null,
           policyPresets: "*",
           mcpPresets: [],
+          mcpManage: false,
+          mcpInstall: false,
           envAllow: [],
         },
       ],
@@ -95,6 +97,14 @@ describe("DaemonConfig", () => {
       // config file still parses, and it parses into exactly this.
       policy: { presets: {}, default: "deny-all" },
       mcpServers: {},
+      mcpManagement: {
+        directory: null,
+        maxUploadBytes: 16 * 1024 * 1024,
+        maxFiles: 128,
+        maxInstallations: 32,
+        maxPresets: 256,
+        allowInsecureTransport: false,
+      },
       watchdog: {
         enabled: true,
         // DESIGN §7's two budgets. `toolMs` is the LARGER because F36 says an open tool call can

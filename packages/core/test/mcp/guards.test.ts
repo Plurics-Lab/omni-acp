@@ -31,13 +31,17 @@ import {
 // job rather than the scanner's.
 const DECLARES = (path: string): boolean => path.startsWith("packages/protocol/src/");
 
-// The modules that RESOLVE a preset: the only three allowed to name the type outside protocol.
+// The modules that RESOLVE a preset, plus the separately privileged management store.
 // Everything else in the repository must not know it exists, because knowing it is the first
 // step to building one.
 const RESOLVES = new Set([
   "packages/core/src/mcp/presets.ts", // reads it from `ResolvedDaemonConfig`
   "packages/core/src/mcp/capabilities.ts", // maps a resolved one onto the wire
   "packages/daemon/src/mcp.ts", // the daemon façade over the two above
+  // Admin-only registration is an explicit control-plane exception. The checks below still
+  // forbid this module from accepting worker/run/prompt bodies and all routes from building
+  // commands. Runtime role + mcpManage gates are covered by daemon/mcp-management.test.ts.
+  "packages/daemon/src/mcp-management.ts",
 ]);
 
 /**
@@ -175,6 +179,18 @@ describe("guard: client-never-sends-a-command — the STRUCTURAL half (§23.1)",
 
   it("no route constructs an McpServerPreset from a request body", () => {
     expect(auditClientNeverSendsACommand(sources)).toEqual([]);
+  });
+
+  it("the privileged management exception still forbids worker/run request bodies", () => {
+    for (const identifier of ["CreateWorkerRequest", "CreateRunRequest", "PromptRequestBody"]) {
+      const planted = sourceFile(
+        "packages/daemon/src/mcp-management.ts",
+        `const preset: McpServerPreset = ${identifier}.parse(input);`,
+      );
+      expect(auditClientNeverSendsACommand([planted]).map((v) => v.rule)).toContain(
+        `preset-meets-${identifier}`,
+      );
+    }
   });
 
   it("fails on a PLANTED violation, in each of its three shapes", () => {

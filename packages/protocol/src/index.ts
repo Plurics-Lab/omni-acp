@@ -37,6 +37,7 @@ export * from "./control-plane.js";
 
 // Config — zod is the source of truth; the TS types are inferred.
 export * from "./config.js";
+export * from "./mcp-management.js";
 
 // The cross-package seam: every interface that crosses a package boundary (CONTRACTS.md §4).
 export * from "./contracts.js";
