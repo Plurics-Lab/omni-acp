@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,7 +24,8 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 async function setup(overrides: Record<string, unknown> = {}) {
-  const dir = await mkdtemp(join(tmpdir(), "omni-mcp-test-"));
+  // macOS temporary roots can have symlink ancestors; the store requires a physical path.
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "omni-mcp-test-")));
   dirs.push(dir);
   await mkdir(join(dir, "work"));
   const config = DaemonConfig.parse({
@@ -221,9 +231,11 @@ describe("MCP management", () => {
   });
   it("rejects symlink and worker-overlapping storage roots", async () => {
     const { config, dir } = await setup();
-    await symlink(join(dir, "store"), join(dir, "linked"));
+    await symlink(join(dir, "store"), join(dir, "linked"), "junction");
     config.mcpManagement.directory = join(dir, "linked");
     await expect(createMcpManagement(config)).rejects.toThrow(/symlink/);
+    config.mcpManagement.directory = join(dir, "linked/nested");
+    await expect(createMcpManagement(config)).rejects.toThrow(/symlink ancestors/);
     config.mcpManagement.directory = join(dir, "work/subdir");
     await expect(createMcpManagement(config)).rejects.toThrow(/cwdRoots/);
   });

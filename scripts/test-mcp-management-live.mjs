@@ -2,7 +2,7 @@
 // Usage: node scripts/test-mcp-management-live.mjs /absolute/path/agents.json
 // Config: {claude:{binary,adapter},codex:{binary,adapter}}; adapter paths are cached JS entrypoints.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -15,7 +15,7 @@ const native = JSON.parse(await readFile(process.argv[2], "utf8"));
 const selected = (process.env.OMNI_MCP_LIVE_AGENTS ?? "claude,codex").split(",");
 if (selected.some((kind) => !["claude", "codex"].includes(kind)))
   throw new Error("Unknown live agent selection");
-const root = await mkdtemp(join(tmpdir(), "omni-mcp-native-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "omni-mcp-native-")));
 const workspace = join(root, "workspace");
 await mkdir(workspace);
 const auditFile = join(root, "probe-audit.jsonl");

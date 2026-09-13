@@ -1,4 +1,4 @@
-import { dirname, join, relative } from "node:path";
+import { dirname, join, normalize, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
@@ -41,12 +41,14 @@ describe("template-literal ids discriminate at compile time", () => {
     const host = ts.createCompilerHost({});
     const original = host.getSourceFile.bind(host);
     const virtual = join(HERE, "types", "__unused-directive.ts");
+    // TypeScript supplies forward slashes even when node:path.join uses Windows separators.
+    const isVirtual = (name: string) => normalize(name) === normalize(virtual);
     host.getSourceFile = (name, ...rest) =>
-      name === virtual
+      isVirtual(name)
         ? ts.createSourceFile(name, source, ts.ScriptTarget.ES2022, true)
         : original(name, ...rest);
-    host.fileExists = (name) => name === virtual || ts.sys.fileExists(name);
-    host.readFile = (name) => (name === virtual ? source : ts.sys.readFile(name));
+    host.fileExists = (name) => isVirtual(name) || ts.sys.fileExists(name);
+    host.readFile = (name) => (isVirtual(name) ? source : ts.sys.readFile(name));
 
     // `noLib` keeps this to one tiny file: the directive check needs no standard library.
     const program = ts.createProgram(
@@ -54,6 +56,7 @@ describe("template-literal ids discriminate at compile time", () => {
       { strict: true, noEmit: true, noLib: true, types: [] },
       host,
     );
+    expect(program.getSourceFile(virtual)?.text).toBe(source);
     const codes = ts.getPreEmitDiagnostics(program).map((d) => d.code);
     expect(codes).toContain(2578); // "Unused '@ts-expect-error' directive."
   });

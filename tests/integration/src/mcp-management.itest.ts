@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,7 +43,7 @@ async function start(config: DaemonConfig) {
 
 describe("managed MCP deployment over real HTTP", () => {
   it("uploads, persists, registers, restricts and executes a real MCP via an ACP worker", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omni-managed-mcp-it-"));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "omni-managed-mcp-it-")));
     roots.push(root);
     const workspace = join(root, "workspace");
     await mkdir(workspace);
